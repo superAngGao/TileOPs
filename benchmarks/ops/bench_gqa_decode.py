@@ -89,10 +89,18 @@ def _flashinfer_gqa_decode_fwd(test, q, k, v):
     return run_fn
 
 
+# GQA decode (non-paged) benchmark parameters.
+#
+# Non-paged KV cache is used for single-request inference (no serving framework).
+# B=1 exclusively — multi-request scenarios use paged KV cache instead.
+# Configs target the three standard head profiles (see bench_gqa.py) with
+# KV cache lengths representing typical chat (4K) and long-context (32K) use.
 _GQA_DECODE_BENCH_PARAMS = [
-    pytest.param(1, 32, 8, 8192, 128, torch.float16, False, id="single-batch-fp16"),
-    pytest.param(4, 32, 4, 4096, 128, torch.bfloat16, False, id="bf16-mid-cache"),
-    pytest.param(8, 64, 16, 8192, 128, torch.float16, False, id="multi-batch-fp16"),
+    # Non-paged decode: B=1, real-model GQA configs
+    pytest.param(1, 32, 8, 4096, 128, torch.float16, False, id="llama8b-chat"),
+    pytest.param(1, 32, 8, 32768, 128, torch.float16, False, id="llama8b-long"),
+    pytest.param(1, 64, 8, 4096, 128, torch.float16, False, id="llama70b"),
+    pytest.param(1, 128, 8, 8192, 128, torch.float16, False, id="llama405b"),
 ]
 
 
