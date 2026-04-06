@@ -74,6 +74,57 @@ WGMMA_CALL_RE = re.compile(
 )
 
 ENABLE_DESC_REWRITE = os.environ.get("DESC_REWRITE", "0") == "1"
+ENABLE_ALIAS = os.environ.get("ALIAS", "0") == "1"
+
+# Path C-2b: alias _2 fragments to _1 storage via #define so per-thread
+# fragment storage halves (each thread is in only one WG branch).
+ALIAS_DECL_RE = re.compile(
+    r"^(\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_]*_1)\[(\d+)\];\s*$",
+    re.M,
+)
+
+
+def alias_rewrite(src: str) -> tuple[str, dict]:
+    stats = {"alias_applied": False, "alias_pairs": 0}
+    if "main_kernel" not in src:
+        return src, stats
+
+    decls_1 = {}
+    for m in ALIAS_DECL_RE.finditer(src):
+        _indent, dtype, name1, size = m.groups()
+        decls_1[name1] = (dtype, int(size))
+
+    out = src
+    aliases = []
+    for name1, (dtype, size) in decls_1.items():
+        name2 = name1[:-2] + "_2"
+        decl_2_re = re.compile(
+            r"^(\s*)" + re.escape(dtype) + r"\s+" + re.escape(name2) +
+            r"\[" + str(size) + r"\];\s*$",
+            re.M,
+        )
+        m2 = decl_2_re.search(out)
+        if m2:
+            out = out[:m2.start()] + out[m2.end():]
+            aliases.append((name1, name2))
+
+    if not aliases:
+        return src, stats
+
+    anchor = 'extern "C" __global__'
+    idx = out.find(anchor)
+    if idx < 0:
+        return src, stats
+
+    define_block = "// POST-PROCESSED: alias _2 fragments to _1 storage\n"
+    for n1, n2 in aliases:
+        define_block += f"#define {n2} {n1}\n"
+    define_block += "\n"
+    out = out[:idx] + define_block + out[idx:]
+
+    stats["alias_applied"] = True
+    stats["alias_pairs"] = len(aliases)
+    return out, stats
 
 WG_ID_DECL = (
     "  // POST-PROCESSED: warp-uniform warpgroup idx via shuffle broadcast\n"
@@ -133,9 +184,12 @@ def patched_cuda_compile(code, target, pass_config=None):
     if ENABLE_DESC_REWRITE:
         patched, dstats = desc_rewrite(patched)
         stats.update(dstats)
+    if ENABLE_ALIAS:
+        patched, astats = alias_rewrite(patched)
+        stats.update(astats)
 
     dump_dir = Path("/tmp")
-    if stats.get("applied") or stats.get("desc_applied"):
+    if stats.get("applied") or stats.get("desc_applied") or stats.get("alias_applied"):
         (dump_dir / "v2_orig_hook.cu").write_text(code)
         (dump_dir / "v2_shfl_hook.cu").write_text(patched)
         print(f"[shfl-hook] applied: {stats}", file=sys.stderr, flush=True)

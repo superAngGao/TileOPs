@@ -961,6 +961,150 @@ else is if we also want to upstream the `T.ws(N)` shfl-broadcast lowering
 fix at the same time (which would benefit any other WS kernel that
 shares v2's branch divergence).
 
+## Path C-2b result: alias _2 fragments to _1 storage (+76 % over Option 1)
+
+The biggest remaining bottleneck after C-1 + Option 1 was the **fragment
+union** problem: ptxas does per-thread register allocation as the union
+of all warpgroups' fragments, even though no single thread ever reads
+both `_1` and `_2` versions. The fix turns out to be a single regex
+post-process — and the impact dwarfs every previous optimization
+combined.
+
+### The insight
+
+Each thread is in exactly one warpgroup at runtime. A WG1 thread enters
+the `if (128 <= tid && tid < 256)` branch and only ever touches `_1`
+fragments; a WG2 thread enters `if (256 <= tid)` and only touches `_2`.
+The two sets are mutually exclusive at the thread level, but ptxas
+allocates separate register/stack slots for both because its register
+allocator does not perform branch-uniform live-range coalescing across
+threadIdx-based predicates.
+
+We can tell the compiler the truth at the C++ level by literally
+aliasing the names — `#define acc_s_2 acc_s_1` etc. — so that there is
+only one underlying storage. ptxas then sees one fragment, not two, and
+the per-thread spill drops correspondingly.
+
+### The fix
+
+A regex post-process in `_bench_ws_shfl.py::alias_rewrite()`:
+
+1. Find every function-scope local declaration of the form
+   `<type> <name>_1[<size>];`
+2. For each, look for a matching `<type> <name>_2[<size>];` declaration
+3. Delete the `_2` declaration and inject `#define <name>_2 <name>_1`
+   right before `extern "C" __global__`
+
+For v2 the regex matches **8 fragment pairs**:
+
+| `_2` name | aliased to | type | bytes saved per thread |
+|---|---|---|---|
+| `acc_o_2` | `acc_o_1` | `float[64]` | 256 |
+| `acc_s_2` | `acc_s_1` | `float[64]` | 256 |
+| `acc_s_cast_2` | `acc_s_cast_1` | `half_t[64]` | 128 |
+| `ls_2`, `sm_2`, `smp_2`, `ss_2`, `ssum_2` | `ls_1, ...` | `float[2]` each | 8 each (40 total) |
+| **Total** | | | **680 B/thread** |
+
+### ptxas summary
+
+| | C-1 + Option 1 (no alias) | + alias | Δ |
+|---|---|---|---|
+| Stack frame | 880 B | **160 B** | **−82 %** |
+| Spill stores | 2948 | 640 | −78 % |
+| Spill loads | 3668 | 800 | −78 % |
+| Registers used | 168 | 168 | unchanged |
+| C7507 ignored set_max_nreg | gone | gone | — |
+| C7518 divergent path WG.DP | present (with shfl: gone) | present (with shfl: gone) | — |
+| C7513 (data dep) | gone | gone | — |
+| **C7512 (insufficient regs for wgmma pipelining)** | absent | **newly visible** | **new bottleneck** |
+
+The 680 B/thread we expected is matched by the 720 B drop in stack
+frame (160 vs 880). The 8 alias pairs together delete five 256-B spill
+slots' worth of stack — almost the entire previous spill.
+
+### Result (3 runs, jitter ±0.3 TFLOPS, all 5 v2 correctness shapes PASS)
+
+Bench shape `B=4 S=2048 H=64 Hkv=4 D=128 non-causal`. **FA3 reference on
+the same shape: 647.3 TFLOPS** (measured via `_bench_fa3_baseline.py`,
+flash_attn_interface.flash_attn_func).
+
+| Configuration | TFLOPS | % of FA3 | Δ vs prev row |
+|---|---|---|---|
+| v2 original (no fixes) | 130.0 | 20.1 % | — |
+| + C-1 (cast reorder) | 140.2 | 21.7 % | +7.8 % |
+| + Option 1 (descriptor body single-store) | 156.8 | 24.2 % | +11.8 % |
+| **+ alias _1/_2 fragments** | **276.9** | **42.8 %** | **+76.6 %** |
+| **+ shfl WG-id broadcast** | **329.4** | **50.9 %** | **+19.0 %** |
+
+So: alias alone is the single biggest improvement to date — bigger than
+all previous fixes combined. With shfl on top we cross the 50 %-of-FA3
+mark for the first time. **From 4.98× behind FA3 down to 1.97× behind.**
+
+Note that **shfl is now contributing reliably +19 %** on top of alias
+(it was within noise before alias). Most likely the WGMMA pipe is
+finally running fast enough that the integer-compare overhead of the
+range-form WG selection branches has become measurable. With both
+alias and shfl applied, all "easy" remaining bottlenecks are visible:
+
+- C7512 says wgmma pipelining is now register-bound. 168 regs used per
+  thread is essentially the H200 maximum at 384 threads/CTA
+  (65536 reg file / 384 threads ≈ 170 regs/thread). Each in-flight
+  wgmma needs dedicated register slots for its accumulator, so to
+  pipeline more wgmmas we need either more regs/thread (lower thread
+  count, e.g. drop block_m to 64 to remove one consumer) or smaller
+  per-wgmma fragments (lower block_n).
+- LSU is no longer the dominant pipe (from 11.6× FA3 down to 0.5× FA3
+  estimated, since spill load bytes dropped from 3380 → 800).
+
+### Why this is a "C-2b" fix and what it isn't
+
+This is *the* fix for the fragment-union problem we predicted in the
+C-2a section. It does not change the kernel structure, does not change
+TileLang lowering, and does not require any C++ patching of TileLang
+templates. It is purely a textual rewrite of the lowered CUDA.
+
+What it isn't: a permanent solution. The real fix is for TileLang's
+register allocator (or codegen) to recognize that fragments declared
+inside or around `T.ws(N)` frames have warpgroup-exclusive live ranges
+and can share storage. The post-process is doing manually what TileLang
+should be doing automatically. There are at least three places to put
+the actual fix:
+
+1. **TileLang `WarpSpecialize` lowering in `src/ir.cc`**: currently the
+   `with T.ws(N):` frame creates an `If` + `Then` + `Attr` frame stack
+   but does not push a `Block` frame. As a result, any
+   `T.alloc_buffer` calls inside the `with` block get attached to the
+   *outer* Kernel block's `alloc_buffers` list rather than to a block
+   inside the if-then-else. Fixing this would let `LowerOpaqueBlock`
+   emit the `Allocate` node *inside* the if-then-else body, where ptxas
+   would see scoped lifetime. This is the cleanest fix.
+
+2. **Per-warpgroup register hint in TileLang's storage scope**: invent
+   a new fragment scope like `local.fragment.ws<N>` that tells the
+   storage rewriter "this fragment is only live in WG N". Storage
+   coalescing can then merge fragments with disjoint WG hints.
+
+3. **Post-process the lowered CUDA** (what we do today): cheap, works,
+   but doesn't propagate to other TileOPs kernels and is fragile to
+   future TileLang codegen changes.
+
+### Productionizing path
+
+Currently the alias rewrite is in `_bench_ws_shfl.py::alias_rewrite()`,
+gated on `ALIAS=1`. To make v2 inherit it on the standard registration
+path, the same three options apply as for path C-2a (in-place common.h
+patch / TileLang codegen change / FFI hook in v2 op). Given how dramatic
+the speedup is, **the right next step is upstreaming option 1 above
+into TileLang's `WarpSpecialize` lowering**. That fix would benefit any
+other WS kernel as well.
+
+### Cross-references
+
+- `_postproc_alias_fragments.py` — standalone repro: `python3 _postproc_alias_fragments.py /tmp/v2_orig_hook.cu`
+- `_bench_ws_shfl.py` (with `ALIAS=1`) — 4-cell ablation harness
+- `_test_alias_correctness.py` — 5-shape correctness validator
+- `_bench_fa3_baseline.py` — FA3 reference TFLOPS measurement
+
 ### Cross-references
 
 - `_postproc_wgmma_desc.py` — standalone repro: prints ptxas comparison
