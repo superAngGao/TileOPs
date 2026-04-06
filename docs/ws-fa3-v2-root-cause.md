@@ -1105,6 +1105,65 @@ other WS kernel as well.
 - `_test_alias_correctness.py` — 5-shape correctness validator
 - `_bench_fa3_baseline.py` — FA3 reference TFLOPS measurement
 
+## Path C-3 partial: block_n=64 buys +20 % over block_n=128
+
+After alias + shfl + Option 1, the visible warning is C7512 (insufficient
+registers for wgmma pipelining). 168 regs/thread is the H200 cap at
+384 threads/CTA (65536 / 384 ≈ 170). Each in-flight wgmma needs
+dedicated accumulator register slots, so the # of pipelined wgmmas is
+register-bound.
+
+The cheapest way to relax that pressure is to **shrink the per-wgmma
+accumulator** by halving `block_n` from 128 to 64.
+
+### Result on the main bench shape (3 runs ±0.3 TFLOPS)
+
+| `block_n` | TFLOPS | % of FA3 | Notes |
+|---|---|---|---|
+| 32 | 253.5 | 39.2 % | Too many K iterations, pipeline overhead dominates |
+| **64** | **396.0** | **61.2 %** | **Sweet spot — registers freed, wgmma pipelines** |
+| 128 | 329.5 | 50.9 % | Register-bound (C7512) |
+| 256 | FAIL | — | smem 294 KB > H200 228 KB limit |
+
+ptxas with block_n=64 is **completely clean**:
+
+| | block_n=128 | block_n=64 | Δ |
+|---|---|---|---|
+| Stack frame | 160 B | **0 B** | gone |
+| Spill stores | 640 B | **0 B** | gone |
+| Spill loads | 800 B | **0 B** | gone |
+| Registers used | 168 | **138** | -30 (under cap) |
+| C7512 (insufficient regs) | present | **gone** | resolved |
+
+All 5 v2 correctness shapes PASS at block_n=64.
+
+### Caveat — block_n=64 is not the path forward to FA3
+
+This is +20 % "for free" but is **not** the right structural answer.
+FA3 uses block_n=128 (or larger) and gets 647 TFLOPS — bigger blocks
+amortize per-wgmma issue overhead better and use the SM register file
+more efficiently. The reason we have to *shrink* the block to gain
+performance is that v2's per-thread register budget is bounded by 384
+threads/CTA, which is itself a consequence of having three warpgroups
+(producer + 2 consumers) all in one main_kernel function.
+
+The fundamental fix is path 3: separate `__device__` functions per
+warpgroup, dispatched at the top of `main_kernel`, so each warpgroup's
+register budget is independent. With FA3-style structural separation we
+should be able to use block_n=128 and reach the 80-100 % of FA3 range.
+For now block_n=64 is a useful empirical data point but should not
+become the production setting if path 3 lands.
+
+Note that the wrong-output diff at non-divisor block_n (96, 48) is
+NOT a kernel bug — those values just don't divide S=2048 cleanly and
+v2 doesn't handle the residual block. Only `block_n ∈ {32, 64, 128}`
+are valid choices for our test shape.
+
+### Cross-reference
+
+- `_bench_block_n.py` — block_n sweep on the main bench shape
+- `_test_block_n64_all.py` — 5-shape correctness + 3x stability at block_n=64
+
 ### Cross-references
 
 - `_postproc_wgmma_desc.py` — standalone repro: prints ptxas comparison
