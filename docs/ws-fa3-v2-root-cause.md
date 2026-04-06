@@ -1264,6 +1264,113 @@ they're fine, scheduler-named-barriers reset implicitly each tile.
   three approaches fail to scope the alloc)
 - `/tmp/v2_best.ncu-rep`, `/tmp/fa3_best.ncu-rep` — ncu reports
 
+## Path 3 (v3): persistent scheduling — structurally working, deadlocks on
+## mbarrier parity carryover
+
+`_test_ws_fa3_v3.py` is a v2 → v3 conversion that wraps the entire
+kernel body (Q load, WG setup, main K/V loop, epilogue, output write)
+in a `T.Persistent` loop bound to the H200's SM count. The launch grid
+goes from `(ceildiv(S, block_m), H, B) = (16, 64, 4) = 4096` CTAs to
+`(NUM_SMS, 1, 1) = (132, 1, 1)`, with each CTA processing
+~`4096 / 132 ≈ 31` tiles in a software loop.
+
+### Status
+
+| `NUM_SMS` | Tiles per CTA | Outcome |
+|---|---|---|
+| **4096** | **1** | **PASS** correctness, **158.6 TFLOPS** (matches v2) |
+| 2048 | 2 | **DEADLOCK** at runtime |
+| 132 | ~31 | **DEADLOCK** at runtime |
+
+NUM_SMS=4096 corresponds to "every CTA does exactly one tile", which
+makes the persistent loop's `waves = ceildiv(4096, 4096) = 1` — a single
+iteration. TileLang strips the unit loop, and the kernel becomes
+structurally identical to v2 plus a wrapper that does nothing. This
+proves the v3 conversion is **structurally correct** — Q load,
+fragment access, mbarrier wait/arrive, epilogue, output write all
+inside the persistent body work correctly.
+
+When NUM_SMS < 4096, each CTA enters the loop body more than once. The
+second iteration deadlocks because **mbarrier parity carries over from
+the first tile**. v2's K/V mbarrier wait pattern is:
+
+```python
+for n_idx in T.Pipelined(loop_range, num_stages=0):
+    with T.ws(0):  # producer
+        T.barrier_wait(k_empty, (n_idx + 1) % 2)
+        ...
+    with T.ws(1):  # consumer
+        T.barrier_wait(k_full, n_idx % 2)
+        ...
+```
+
+The wait parity is keyed off `n_idx` only, with no awareness of the
+outer persistent iteration. After tile 0's `loop_range` iterations, the
+mbarrier hardware parity is `loop_range % 2` (= 0 when loop_range is
+even). On tile 1's iter 0, the producer waits for parity 1 again, but
+the consumer hasn't done the `(loop_range+1)`th arrive that would set
+the parity to 1. Tile 1 iter 0 and v2 iter 0 are NOT in equivalent
+hardware states even when loop_range is even, because the producer's
+"wait for parity 1 at iter 0" depends on initial barrier state being
+"phase 0, parity 0 from init" vs "phase loop_range, parity 0 from
+arrive sequence", and these two states are not interchangeable for
+in-progress phase tracking.
+
+(Empirically v2 works in iter 0 because the consumer's `wait k_full`
+passes immediately on initial parity 0, and then the consumer's
+`barrier_arrive(k_empty)` after softmax unblocks the producer's
+`wait k_empty(1)` for the NEXT iteration. But on tile 1's iter 0 with
+hardware in a non-initial state, this assumption breaks.)
+
+### Fix needed: re-init mbarriers per persistent iter
+
+The cleanest fix is to call `mbarrier.init` at the start of each
+persistent iteration, returning all the K/V mbarriers to phase 0,
+parity 0. Two implementation paths:
+
+1. **Inject re-init via the FFI hook in `_bench_ws_shfl.py`**: find the
+   persistent loop in the lowered CUDA and prepend each iteration with:
+
+   ```cpp
+   if (tl::tl_shuffle_elect<0>()) {
+       k_full[0].init(128);
+       k_empty[0].init(256);
+       v_full[0].init(128);
+       v_empty[0].init(256);
+   }
+   tl::fence_barrier_init();
+   __syncthreads();
+   ```
+
+   This is the same code TileLang generates at kernel start; we just
+   need to also generate it at the top of each persistent iter.
+
+2. **Add a TileLang primitive `T.barrier_reinit(...)`** that lowers to
+   the same Mbarrier::init call and can be invoked from Python source.
+
+Path (1) is the faster experiment. Path (2) is the right upstream fix.
+
+### What the v3 deadlock proves
+
+The conversion to persistent scheduling itself is feasible in TileLang.
+The framework supports persistent loops, ws frames, pipelined inner
+loops, and mbarrier-based async pipelines all nested together, and
+they compile correctly (~15 s build time, same as v2). The only
+missing piece is per-tile barrier state reset.
+
+Once the re-init is in place, v3 should reach somewhere between v2's
+158 TFLOPS (NUM_SMS=4096, single tile per CTA, equivalent to v2) and
+FA3's 647 TFLOPS (NUM_SMS=132, full persistent scheduling). The exact
+gain depends on how much of v2's runtime is currently spent on
+per-tile setup vs steady-state computation.
+
+### Cross-references
+
+- `_test_ws_fa3_v3.py` — v3 source (NUM_SMS configurable via V3_NUM_SMS env var)
+- `_test_v3_build_only.py` — v3 build + correctness + bench harness
+- `_test_persistent_minimal.py` — minimal persistent + ws + pipelined
+  smoke test (compiles fine in 4.7 s, no deadlock)
+
 ### Cross-references
 
 - `_postproc_wgmma_desc.py` — standalone repro: prints ptxas comparison
