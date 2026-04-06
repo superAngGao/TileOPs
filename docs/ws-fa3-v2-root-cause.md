@@ -437,3 +437,101 @@ Key cross-checks:
 `/tmp/v2_ws_prof.ncu-rep`, `/tmp/fa3_prof.ncu-rep` on the H200 host,
 reproducible via `_ncu_v2.py` / `_ncu_fa3.py` with
 `ncu --set full --nvtx --nvtx-include "<range>/"`.
+
+## Path A result: shfl-broadcast WG selection (C7518 fix)
+
+End-to-end validation of "Next step 1" above. Implemented as a regex
+post-process on the TileLang-generated CUDA, hooked in via a monkey-patch
+of `tilelang_callback_cuda_compile` (so the TileLang adapter, host
+wrapper, TMA descriptors, and launch path stay untouched).
+
+The transform replaces three forms of WG-selection branch:
+
+| Original                                                  | Replacement     | Count |
+|-----------------------------------------------------------|-----------------|-------|
+| `(128 <= ((int)threadIdx.x)) && (((int)threadIdx.x) < 256)` | `(__wg_id == 1)` | 4 |
+| `(256 <= ((int)threadIdx.x))`                             | `(__wg_id == 2)` | 4 |
+| `(((int)threadIdx.x) < 128)`                              | `(__wg_id == 0)` | 3 |
+
+with `int __wg_id = __shfl_sync(0xffffffff, ((int)threadIdx.x) / 128, 0);`
+inserted at the top of `main_kernel`, before any divergent op (so warps
+are still converged at the shuffle point).
+
+The `__shfl_sync` output is the only construct ptxas reliably tags as
+warp-uniform. `((int)tid / 128) == N` does **not** work — confirmed by an
+explicit divide-form post-process; ptxas still treats the result as
+divergent and inserts WG.DP.
+
+### Result on H200 (B=4 S=2048 H=64 Hkv=4 D=128, non-causal)
+
+| Metric                          | Baseline (range branch) | Patched (shfl)        | Δ                        |
+|---------------------------------|-------------------------|-----------------------|--------------------------|
+| Latency                         | 4.227 ± 0.001 ms        | 3.887 ± 0.003 ms      | -8.0 %                   |
+| TFLOPS                          | 130.0                   | 141.4                 | **+11.4 (+8.8 %)**       |
+| Max diff vs torch fp32 ref      | 0.0002                  | 0.0002                | unchanged                |
+| Stack frame                     | 1128 B                  | 1120 B                | -8 B (just `__wg_id`)    |
+| Spill stores / loads            | 3172 / 3380             | 3164 / 3372           | -8 / -8                  |
+| Registers                       | 168                     | 168                   | unchanged                |
+| C7518 (divergent path WG.DP)    | present                 | **gone**              | resolved                 |
+| C7507 (`set_max_nreg` ignored)  | present                 | present               | unchanged                |
+| C7513 (non-WGMMA → wgmma_rs)    | hidden                  | **newly visible**     | exposed by removing 7518 |
+
+Reproduced 3 times, jitter ±0.2 TFLOPS. Reproducer:
+`_bench_ws_shfl.py` — runs ablation in one process via FFI re-registration
+of `tilelang_callback_cuda_compile`.
+
+### What this proves and what it disproves
+
+**Proves**: C7518 is real and costly. Even though removing it does not
+free a single spilled byte (per-thread live set is unchanged), the
+WGMMA pipeline parallelism it had been silently destroying is worth
+~9 % on this shape. The IntraWGOverlap design was effectively a no-op
+before this fix.
+
+**Disproves**: the hypothesis that branch-uniformity analysis would let
+ptxas separate `_1` / `_2` fragment live ranges. Stack frame moved by
+exactly 8 bytes (the new `__wg_id` register itself), which means ptxas'
+per-thread register allocator does not use branch uniformity to prune
+function-scope local arrays — it tracks them at function scope
+regardless of which branches use them. This was a wrong intuition;
+spill is unrelated to C7518 / branch form.
+
+### What still bottlenecks v2 after C7518 is fixed
+
+C7513 is now the visible WGMMA-stalling warning. Its mechanism is
+direct: between `warpgroup_arrive` and `commit_batch` there are non-WGMMA
+instructions (the `F2FP` cast that stages `acc_s` → `acc_s_cast`) that
+write registers consumed by the very next WGMMA (PV `wgmma_rs`). ptxas
+must insert a `warpgroup.wait` to make those writes visible before
+issuing the dependent WGMMA. This collapses QK/PV overlap on the PV
+side, independently of branch divergence.
+
+Both C7513 and the 1120-byte spill point at the same structural fix
+(still item 2 in the next-steps list above, now elevated to highest
+priority): **eliminate the `acc_s_cast` staging buffer** and feed PV
+directly from `acc_s` (cast on the wgmma input). This:
+
+- removes the F2FP → wgmma_rs dependency chain → resolves C7513
+- removes 256 B per warpgroup of fragment storage → should let 168 regs
+  hold the live set without spill → resolves C7507 and the spill
+- aligns with FA3's `MmaPV_is_RS` path
+
+The remaining 3-4× gap to FA3 is expected to come almost entirely from
+this single change. Path A's +9 % is the ceiling of what fixing only
+divergence can buy.
+
+### Productionizing path A
+
+Currently the shfl rewrite lives in a monkey-patch in `_bench_ws_shfl.py`.
+Two options to make v2 inherit it on the regular registration path:
+
+1. Move the FFI override into the v2 op `__init__.py` so any importer of
+   v2 sees the patch. Cheap, but global side effect on the FFI registry.
+2. Fix it properly in TileLang C++: make `WarpSpecialize` lower the WG
+   condition to `__shfl_sync(...) == N` instead of
+   `(N*128 <= tid) && (tid < (N+1)*128)`. Permanent and benefits every
+   WS kernel, but needs a TileLang rebuild.
+
+Recommendation: defer productionizing path A until path C is in. If C
+brings v2 into the FA3 ballpark, we then go back and fix the lowering
+in TileLang the right way.
