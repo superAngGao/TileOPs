@@ -50,6 +50,31 @@ WG_PATTERNS = [
     ),
 ]
 
+# wgmma descriptor by-value rewrite (path C-2a):
+# - inject helper near top
+# - rewrite tl::initialize_wgmma_descriptor<...>(name, ptr) → name = make_wgmma_descriptor_v<...>(ptr)
+WGMMA_DESC_HELPER = r"""
+// POST-PROCESSED: register-resident wgmma descriptor builder.
+template <int __LT = 0, int __LBO = 0, int __SBO = 0, typename __T>
+__device__ __forceinline__ tl::GmmaDescriptor
+make_wgmma_descriptor_v(__T *__addr) {
+    tl::GmmaDescriptor __d;
+    uint64_t __a14 = (cute::cast_smem_ptr_to_uint(__addr) >> 4) & 0x3fffull;
+    __d.desc_ = __a14
+              | (uint64_t(__LBO & 0x3fff) << 16)
+              | (uint64_t(__SBO & 0x3fff) << 32)
+              | ((uint64_t)(__LT & 0x3) << 62);
+    return __d;
+}
+"""
+
+WGMMA_CALL_RE = re.compile(
+    r"tl::initialize_wgmma_descriptor<\s*([^>]+?)\s*>\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(.+?)\s*\)\s*;",
+    re.DOTALL,
+)
+
+ENABLE_DESC_REWRITE = os.environ.get("DESC_REWRITE", "0") == "1"
+
 WG_ID_DECL = (
     "  // POST-PROCESSED: warp-uniform warpgroup idx via shuffle broadcast\n"
     "  int __wg_id = __shfl_sync(0xffffffff, ((int)threadIdx.x) / 128, 0);\n"
@@ -79,15 +104,38 @@ def shfl_transform(src: str) -> tuple[str, dict]:
     return out, stats
 
 
+def desc_rewrite(src: str) -> tuple[str, dict]:
+    """Path C-2a: rewrite wgmma descriptor init to return-by-value."""
+    stats = {"desc_applied": False, "desc_calls": 0}
+    if "initialize_wgmma_descriptor" not in src:
+        return src, stats
+    # Inject helper before the kernel decl.
+    anchor = "extern \"C\" __global__"
+    idx = src.find(anchor)
+    if idx < 0:
+        return src, stats
+    out = src[:idx] + WGMMA_DESC_HELPER + "\n" + src[idx:]
+    out, n = WGMMA_CALL_RE.subn(
+        lambda m: f"{m.group(2).strip()} = make_wgmma_descriptor_v<{m.group(1).strip()}>({m.group(3).strip()});",
+        out,
+    )
+    stats["desc_applied"] = True
+    stats["desc_calls"] = n
+    return out, stats
+
+
 # ---------------------------------------------------------------------------
 # Patched nvcc callback — registered as a TVM FFI global func.
 # ---------------------------------------------------------------------------
 @tvm_ffi.register_global_func("tilelang_callback_cuda_compile", override=True)
 def patched_cuda_compile(code, target, pass_config=None):
     patched, stats = shfl_transform(code)
+    if ENABLE_DESC_REWRITE:
+        patched, dstats = desc_rewrite(patched)
+        stats.update(dstats)
 
     dump_dir = Path("/tmp")
-    if stats.get("applied"):
+    if stats.get("applied") or stats.get("desc_applied"):
         (dump_dir / "v2_orig_hook.cu").write_text(code)
         (dump_dir / "v2_shfl_hook.cu").write_text(patched)
         print(f"[shfl-hook] applied: {stats}", file=sys.stderr, flush=True)
@@ -208,14 +256,50 @@ if __name__ == "__main__":
     shape = (4, 2048, 64, 4, 128, False)
 
     print()
-    print("--- Baseline (no shfl patch) ---")
+    print("--- A: baseline (C-1 source only) ---")
     disable_shfl_hook()
     _ok_a, tflops_a = bench(*shape)
 
+    saved_desc = ENABLE_DESC_REWRITE
+
     print()
-    print("--- Patched (shfl WG-id) ---")
+    print("--- B: + shfl WG-id ---")
+    ENABLE_DESC_REWRITE = False
     enable_shfl_hook()
     _ok_b, tflops_b = bench(*shape)
 
     print()
-    print(f"Speedup: {tflops_b / tflops_a:.3f}x  ({tflops_b - tflops_a:+.1f} TFLOPS)")
+    print("--- C: + desc-by-value (no shfl) ---")
+    ENABLE_DESC_REWRITE = True
+    # Hook detects no WG-range pattern when shfl is off — emulate by
+    # bypassing shfl insertion: temporarily disable hook then a desc-only path.
+    # Simpler: keep shfl_transform a no-op and only run desc_rewrite.
+    # (We'll just call enable_shfl_hook with desc enabled — shfl portion still
+    # runs since the source has the WG-range branches; mark this as "B+desc".)
+    # To get pure C, we need to skip shfl. Quick hack: use a local override.
+    @tvm_ffi.register_global_func("tilelang_callback_cuda_compile", override=True)
+    def desc_only_cb(code, target, pass_config=None):
+        patched, dstats = desc_rewrite(code)
+        print(f"[desc-only] {dstats}", file=sys.stderr, flush=True)
+        target_arch = nvcc.get_target_arch(nvcc.get_target_compute_version(target))
+        opts = ["-std=c++17", "-I" + TILELANG_TEMPLATE_PATH, "-I" + CUTLASS_INCLUDE_DIR]
+        cfg = pass_config or {}
+        extra = cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS, None)
+        if extra:
+            import shlex
+            for f in extra: opts += shlex.split(f) if isinstance(f, str) else [str(f)]
+        if cfg.get(PassConfigKey.TL_ENABLE_FAST_MATH, False): opts.append("--use_fast_math")
+        return nvcc.compile_cuda(patched, "cubin", [f"-arch=sm_{target_arch}"], options=opts)
+    _ok_c, tflops_c = bench(*shape)
+
+    print()
+    print("--- D: + shfl + desc-by-value ---")
+    enable_shfl_hook()  # restores both
+    _ok_d, tflops_d = bench(*shape)
+
+    print()
+    print(f"A baseline (C-1 only):     {tflops_a:.1f} TFLOPS")
+    print(f"B + shfl:                  {tflops_b:.1f} TFLOPS  ({(tflops_b-tflops_a):+.1f}, {tflops_b/tflops_a:.3f}x)")
+    print(f"C + desc-by-value (alone): {tflops_c:.1f} TFLOPS  ({(tflops_c-tflops_a):+.1f}, {tflops_c/tflops_a:.3f}x)")
+    print(f"D + shfl + desc-by-value:  {tflops_d:.1f} TFLOPS  ({(tflops_d-tflops_a):+.1f}, {tflops_d/tflops_a:.3f}x)")
+    ENABLE_DESC_REWRITE = saved_desc

@@ -656,3 +656,255 @@ WGMMA pipelining issue; the spill needs a structurally different attack:
    - Restructure so the fragment's live range is shorter.
 
 Option 1 (PTX inspection) is the next concrete step.
+
+## Path C-2a result: wgmma descriptor by-value (+12.9 % on top of C-1)
+
+End-to-end validation that **the largest single source of spill traffic
+in v2 is not user data — it is TileLang's wgmma descriptor template
+forcing GmmaDescriptor to be stack-resident**.
+
+### SASS-level spill breakdown (after C-1, before C-2a)
+
+Compiled with `-lineinfo`, disassembled via `nvdisasm -c -g`, then
+attributed each LDL/STL to its nearest source-line annotation:
+
+| Source category | LDL | STL | Share of LDL |
+|---|---|---|---|
+| `tl_templates/cuda/common.h` (descriptor bitfield ops) | **260** | 231 | **42.8 %** |
+| `_test_ws_fa3_v2.py` (user code: acc_o, acc_s, acc_s_cast spills) | 198 | 228 | 32.6 % |
+| `cute/arch/mma_sm90_gmma.hpp` (wgmma SASS expansion glue) | 88 | 38 | 14.5 % |
+| `cutlass/arch/barrier.h` (mbarrier ops) | 61 | 42 | 10.0 % |
+| **Total** | **607** | **539** | 100 % |
+
+The static byte counts cross-check with the ptxas summary:
+`23×4 + ... = 3172` for stores, `64×4 + 305×4 + 238×8 = 3380` for loads.
+
+The single biggest line attribution is `common.h:546`
+(`descriptor.bitfield.stride_byte_offset_ = stride_byte_offset`), with
+**151 LDLs** alone — that one bitfield write is generating ~25 % of all
+spill reloads in the kernel.
+
+The user fragment spills are dominated by acc_o (lines 248 and 559 in
+the lowered CUDA — the rescale and epilogue normalize loops respectively
+read all 64 floats sequentially), **not by acc_s_cast as initially
+guessed**. acc_s_cast is fully stack-resident (all 128 of its halves
+stored via STL.S16 in the `[R1+0x1ec..0x2e8]` window) but the dynamic
+load count is small because PV reads it through `wgmma_rs` register
+pointers, not via per-element LDLs.
+
+### The mechanism
+
+`tl::initialize_wgmma_descriptor` in `tl_templates/cuda/common.h:537-547`
+takes the descriptor by reference:
+
+```cpp
+template <int layout_type = 0, int leading_byte_offset = 0,
+          int stride_byte_offset = 0, typename T>
+TL_DEVICE void initialize_wgmma_descriptor(GmmaDescriptor &descriptor,
+                                           T *start_address) {
+  descriptor.bitfield.start_address_ =
+      cute::cast_smem_ptr_to_uint(start_address) >> 4;
+  descriptor.bitfield.layout_type_ = layout_type;
+  descriptor.bitfield.base_offset_ = 0;
+  descriptor.bitfield.leading_byte_offset_ = leading_byte_offset;
+  descriptor.bitfield.stride_byte_offset_ = stride_byte_offset;
+}
+```
+
+The `&descriptor` parameter forces ptxas to treat the caller-side
+`GmmaDescriptor desc_a_1, desc_b_1, ...` locals as address-taken, which
+prevents register promotion. Each of the five bitfield writes becomes a
+partial-word stack RMW. With 18 descriptor variables in v2's main_kernel,
+that's ~250 spill ops attributed to one template function.
+
+`GmmaDescriptor` itself is a CUTLASS union with implicit `uint64_t`
+decay, so the storage is exactly 2 32-bit registers per descriptor when
+register-resident. ptxas's failure to promote it is purely a consequence
+of the by-reference signature.
+
+### The fix
+
+Inject a return-by-value helper at the top of the lowered CUDA, then
+rewrite each `tl::initialize_wgmma_descriptor<L,LBO,SBO>(name, ptr);`
+into `name = make_wgmma_descriptor_v<L,LBO,SBO>(ptr);`:
+
+```cpp
+template <int __LT = 0, int __LBO = 0, int __SBO = 0, typename __T>
+__device__ __forceinline__ tl::GmmaDescriptor
+make_wgmma_descriptor_v(__T *__addr) {
+    tl::GmmaDescriptor __d;
+    uint64_t __a14 = (cute::cast_smem_ptr_to_uint(__addr) >> 4) & 0x3fffull;
+    __d.desc_ = __a14
+              | (uint64_t(__LBO & 0x3fff) << 16)
+              | (uint64_t(__SBO & 0x3fff) << 32)
+              | ((uint64_t)(__LT & 0x3) << 62);
+    return __d;
+}
+```
+
+Three things are different from the original:
+
+1. **No reference parameter** — local `__d` is not address-taken, so
+   ptxas can SSA-promote it.
+2. **Single 64-bit write to `desc_`** (the union's underlying field)
+   instead of five bitfield RMWs. All template constants get
+   constant-folded into the OR expression at compile time.
+3. **`__forceinline__`** so the temporary `__d` becomes an SSA value in
+   the caller after inlining.
+
+The post-process is in `_bench_ws_shfl.py::desc_rewrite()`. For v2 it
+matches **18 call sites**.
+
+### Result on H200 (B=4 S=2048 H=64 Hkv=4 D=128, non-causal)
+
+Four-cell ablation, 3 runs, jitter ±0.3 TFLOPS:
+
+| Configuration | TFLOPS | Δ vs C-1 | Speedup |
+|---|---|---|---|
+| **A**: C-1 source only (committed) | 140.2 | — | 1.000 |
+| **B**: + shfl WG-id (path A) | 141.1 | +0.9 | 1.006 |
+| **C**: + descriptor by-value (path C-2a, no shfl) | **158.2** | **+18.0** | **1.129** |
+| **D**: + shfl + desc by-value | 157.2 | +17.0 | 1.121 |
+
+ptxas summary for C-2a:
+
+| | C-1 only | + desc by-value | Δ |
+|---|---|---|---|
+| Stack frame | 1128 B | **880 B** | **−22 %** |
+| Spill stores | 3172 | 2948 | −7 % |
+| Spill loads | 3380 | **3668** | **+8.5 %** |
+| Registers | 168 | 168 | — |
+
+Correctness: PASS on all 5 v2 test shapes (max diff ≤ 0.002), validated
+via `_test_correctness_descv.py`.
+
+### Why the kernel runs faster despite ~equal total spill bytes
+
+**This is the load-bearing insight from path C-2a.** Naive intuition
+says: if static spill bytes are roughly conserved (6552 → 6616 total
+LDL+STL bytes), TFLOPS should not change. The actual measurement is
++12.9 %.
+
+The reason is **where in the SASS the spill operations land**.
+
+Original v2 (C-1 only): each `wgmma_ss` / `wgmma_rs` issue stalls on the
+LDL→arithmetic→wgmma chain, because the descriptor needs to be loaded
+from stack into a register pair *right at issue time*. The descriptor
+LDL is on the wgmma issue critical path. With 18 descriptors × 8 ki
+unrolls × many loop iters, this is the dominant runtime cost.
+
+After C-2a: descriptors live in registers across their entire lifetime
+(from the assignment to the last wgmma read). wgmmas issue back-to-back
+without stalls. The new spill load traffic is on `acc_o` (the rescale
+and epilogue normalize loops), which is sequential fp32 work with no
+data dependency on wgmma issue. Those LDLs are hidden inside the time
+the WGMMA pipe is busy with previous batches.
+
+**Static spill bytes are not a useful TFLOPS predictor on Hopper. What
+matters is whether the spill operations land on or off the WGMMA issue
+critical path.**
+
+This also explains why we cannot simply chase "minimum stack frame" as
+the goal. The next attack on spill needs to consider WHERE the
+remaining spills land, not just how many bytes they consume.
+
+### Path A retired
+
+Cell B (`+ shfl`) buys only +0.6 % over C-1 alone, and stacking shfl on
+top of C-2a (cell D) actually *hurts* by 1 TFLOPS (157.2 vs 158.2). The
+shfl monkey-patch is no longer on the v2 critical path; `_bench_ws_shfl.py`
+keeps it as a diagnostic-only knob.
+
+The reason C-2a is better than B+C-2a is plausible but not proven:
+shfl rewrites WG-selection branches into `__wg_id == N` checks, which
+adds an extra integer compare per branch. In a workload that already
+has the WGMMA pipe humming (as is the case after C-2a), this minor
+serialization overhead is no longer hidden.
+
+### The remaining bottleneck — fragment union, NOT branch divergence
+
+After C-2a the kernel still has 168 registers used and 880 B of stack
+spill. The remaining spill is the **fragment union** problem:
+
+- Per-warpgroup, the actual live set (per WG1 thread: acc_s_1 + acc_o_1
+  + acc_s_cast_1 + softmax scratch + 3 descriptors + temps) is roughly
+  ~188 registers.
+- But ptxas does per-thread allocation **without** warpgroup awareness.
+  It allocates the union of all branches: 2× acc_s + 2× acc_o + 2×
+  acc_s_cast + 2× softmax scratch + 18 descriptors + temps ≈ 410
+  registers per thread.
+- 410 needed vs 168 available → ~242 registers' worth of state must
+  spill, which matches the ~250 B per-thread spill we observe.
+
+This is **not** a branch-divergence problem. Path A's shfl rewrite
+already proved that fixing the branch predicate does not change ptxas'
+per-thread fragment live range allocation. The two analyses run on
+separate code paths inside ptxas: branch uniformity affects the WGMMA
+pipelining check (C7518), but does not feed into the function-scope
+local allocator.
+
+To force ptxas to recognize that `_1` and `_2` fragments have mutually
+exclusive live ranges, we need to declare them inside the corresponding
+`with T.ws(N):` frames so they have **scoped lifetime** in the lowered
+CUDA — i.e., the lowered code becomes:
+
+```cpp
+if (__wg_id == 1) {
+    float acc_s_1[64];   // declared inside the branch
+    float acc_o_1[64];
+    half  acc_s_cast_1[64];
+    // ... WG1 body ...
+}
+if (__wg_id == 2) {
+    float acc_s_2[64];   // independent declaration
+    // ... WG2 body ...
+}
+```
+
+C++ scope rules then guarantee `acc_s_1` does not exist outside the
+WG1 branch, and ptxas' standard live range analysis (no special
+inter-branch reasoning required) will correctly compute non-overlapping
+live ranges.
+
+TileLang currently does **not** support `T.alloc_fragment` inside a
+`with T.ws(N):` frame — the fragment alloc gets hoisted to the kernel
+top. Lifting this restriction is the right next attack. It requires
+either a TileLang lowering pass change or a careful manual workaround.
+
+### Productionizing C-2a
+
+The current implementation is a regex post-process via the FFI hook on
+`tilelang_callback_cuda_compile`. Three options to make v2 inherit it
+on the standard registration path:
+
+1. **Patch `tl_templates/cuda/common.h` body only** (smallest, untested).
+   Rewrite the existing `initialize_wgmma_descriptor` body to do the
+   single-write `descriptor.desc_ = ...` form, keeping the by-reference
+   signature. ⚠ unverified — ptxas may still keep `descriptor`
+   stack-resident because it's still `&descriptor`. Worth a 15-minute
+   experiment before committing to either of the other options.
+
+2. **Patch TileLang's `codegen_cuda.cc`** to emit
+   `name = tl::make_wgmma_descriptor<...>(ptr);` instead of
+   `tl::initialize_wgmma_descriptor<...>(name, ptr);`, alongside adding
+   the new template to `common.h`. Two-file TileLang upstream PR.
+   Strictly correct, validated by the post-process measurement.
+
+3. **Hook the FFI override into the v2 op `__init__.py`** so any
+   importer of v2 transparently inherits the rewrite. Single Python
+   file change. Global side effect on the FFI registry — affects every
+   kernel built in the same process.
+
+Recommendation: try (1) first since it's a 15-minute experiment with
+high upside. If (1) works, we get a one-line upstream patch. If not,
+fall back to (2). Option (3) is a temporary measure only.
+
+### Cross-references
+
+- `_postproc_wgmma_desc.py` — standalone repro: prints ptxas comparison
+- `_bench_ws_shfl.py` (with `DESC_REWRITE=1`) — 4-cell ablation harness
+- `_test_correctness_descv.py` — runs all 5 correctness shapes with the
+  desc rewrite hook enabled
+- GitHub issue [superAngGao/TileOPs-report-static#9](https://github.com/superAngGao/TileOPs-report-static/issues/9)
+  comments 4192727756 and 4192736668 — same content with the full
+  patching options writeup
