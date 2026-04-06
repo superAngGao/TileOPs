@@ -1164,6 +1164,106 @@ are valid choices for our test shape.
 - `_bench_block_n.py` — block_n sweep on the main bench shape
 - `_test_block_n64_all.py` — 5-shape correctness + 3x stability at block_n=64
 
+## ncu profile of v2 best vs FA3: persistent scheduling is the real gap
+
+After block_n=64, profiled both v2_best (`_ncu_v2_best.py`) and FA3
+(`_ncu_fa3.py`) on the same shape `B=4 S=2048 H=64 Hkv=4 D=128
+non-causal`:
+
+| Metric | v2 best | FA3 | Notes |
+|---|---|---|---|
+| Compute (SM) Throughput | **41.3 %** | **79.4 %** | FA3 keeps SM busy 1.92× more |
+| Memory Throughput | 34.3 % | 48.9 % | proportional difference |
+| DRAM Throughput | 3.31 % | 5.97 % | both well below DRAM limit |
+| L1/TEX Cache Throughput | 35.0 % | 50.7 % | similar ratio |
+| L2 Cache Throughput | 17.2 % | 26.0 % | similar ratio |
+| **Achieved Occupancy** | **18.4 %** | **14.1 %** | **FA3 is LOWER!** |
+| Theoretical Occupancy | 18.75 % | 18.75 % | identical |
+| Block Limit Registers | 1 | 1 | both 1 block/SM |
+| Block Limit Shared Mem | 1 | 1 | both 1 block/SM |
+| Active warps/SM | 11.78 | 9.00 | FA3 uses fewer warps |
+| **Block Size** | (384,1,1) | (384,1,1) | identical |
+| **Grid Size** | **(16, 64, 4) = 4096** | **(132, 1, 1) = 132** | **FA3 uses persistent scheduling** |
+
+### The two big findings
+
+**(1) Occupancy is NOT the bottleneck.** FA3 achieves *lower* occupancy
+than v2 (14.1 % vs 18.4 %), but reaches almost twice the SM compute
+throughput. So the gap is not "v2 needs more warps" — it's "v2's warps
+are stalling on something FA3's aren't."
+
+**(2) FA3 launches 132 CTAs (= the H200 SM count) while v2 launches
+4096.** FA3 uses *persistent tile scheduling*: each SM gets exactly one
+CTA at the start, and that CTA loops over `4096 / 132 ≈ 31` tiles
+internally without exiting. The kernel name even confirms it:
+`StaticPersistentTileScheduler<0>`. v2 launches a fresh CTA per tile,
+which means every tile pays the full setup cost (smem init, mbarrier
+init, TMA descriptor setup, register file init) and the GPU pays the
+full CTA scheduler latency in between.
+
+The 38.5 % long-scoreboard stall in v2 (top stall reason) is largely
+this CTA-startup latency repeated 31 times per SM.
+
+### What about fragment scoping?
+
+I tried three approaches to get `T.alloc_fragment` to be scoped inside
+a `T.ws(N)` frame in the lowered CUDA: bare alloc-in-ws (M1),
+`@T.macro` encapsulation (M2), and explicit `T.block` inside the ws
+frame (M3). All three still hoist the alloc to function scope. The
+hoisting happens in some downstream pass that's not undoable from the
+Python source level. See `_test_path3_alloc_scoping.py`.
+
+This means **fragment scoping is not the path forward** — it's already
+solved by the alias post-process (C-2b). The remaining gap is
+elsewhere.
+
+### Path forward: persistent tile scheduling via T.Persistent
+
+TileLang already has `T.Persistent` (in `tilelang/language/loop.py:90`)
+which constructs a persistent for loop bound to a tile domain. The
+signature is:
+
+```python
+T.Persistent(domain=[tile_x_extent, tile_y_extent, tile_z_extent],
+             wave_size=132,           # = num SMs on H200
+             index=blockIdx.x,        # this CTA's index within wave
+             group_size=8)            # tile grouping for L2 reuse
+```
+
+Each CTA enters the body in a loop, with the iteration variables
+binding to a tile coordinate computed from `(wave_index * 132 + bx)`.
+The loop exits when all tiles are processed.
+
+To convert v2 to persistent: change the launch grid from
+`(ceildiv(S, block_m), H, B)` to `(132, 1, 1)` and wrap the kernel
+body in `for tile_x, tile_y, tile_z in T.Persistent([...]):`.
+
+### Risks
+
+The main correctness risk is mbarrier state across tile boundaries.
+v2's k_full / k_empty / v_full / v_empty mbarriers track parity for
+the K/V pipeline; if they're not reset between tiles, the parity bit
+will be wrong on the second tile and waits will block forever or
+release immediately. Two ways to handle this:
+
+1. Re-initialize mbarriers at the top of each tile (single thread, fast)
+2. Make the parity tracking reset based on tile index (more invasive)
+
+Option 1 is simpler but adds a few hundred ns per tile. Acceptable.
+
+Other risks: smem state from previous tile persists (we need to clear
+acc_o_1 / sm_1 / ls_1 at the start of each tile, which we already do
+in the WG1/WG2 setup blocks), TMA descriptors are per-kernel-launch so
+they're fine, scheduler-named-barriers reset implicitly each tile.
+
+### Cross-references
+
+- `_ncu_v2_best.py` — ncu driver for v2 best config
+- `_ncu_fa3.py` — ncu driver for FA3 reference
+- `_test_path3_alloc_scoping.py` — fragment scoping experiments (all
+  three approaches fail to scope the alloc)
+- `/tmp/v2_best.ncu-rep`, `/tmp/fa3_best.ncu-rep` — ncu reports
+
 ### Cross-references
 
 - `_postproc_wgmma_desc.py` — standalone repro: prints ptxas comparison
