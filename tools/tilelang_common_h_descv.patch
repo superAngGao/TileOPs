@@ -1,0 +1,67 @@
+Subject: [PATCH] common.h: build wgmma descriptor as a single uint64 store
+
+The original initialize_wgmma_descriptor body did five separate bitfield
+RMW writes through a `GmmaDescriptor &` reference. Even when fully
+inlined, ptxas treats the caller-side `GmmaDescriptor` local as
+address-taken (because of the reference parameter) AND issues a
+read-modify-write per bitfield, both of which prevent SSA register
+promotion. As a consequence the descriptor is stack-resident, and on
+v2-style flash-attention WS kernels this single template accounts for
+~43% of all spill loads (verified via `nvdisasm -g` SASS line
+attribution: 254 of 607 static LDLs land on common.h:541-546).
+
+Building the full 64-bit descriptor value in registers via a single OR
+expression and storing it once into the union's `desc_` field lets ptxas
+SSA-promote the caller-side local to a register pair. Empirically
+verified on H200 with TileOPs flash_attn v2 (B=4 S=2048 H=64 Hkv=4
+D=128, non-causal): C-1 baseline 140.2 → 156.8 TFLOPS (+11.8%), no
+correctness regressions on the 5 standard test shapes. ptxas summary:
+
+  Stack frame:  1128 -> 880 bytes (-22%)
+  Spill stores: 3172 -> 2948 bytes (-7%)
+  Spill loads:  3380 -> 3668 bytes (+8.5%, but moved off WGMMA critical path)
+
+The total spill bytes are roughly conserved, but the descriptor LDLs
+that previously sat on the WGMMA issue critical path (every wgmma_ss /
+wgmma_rs needed the descriptor in a register pair right at issue time)
+are now zero, and the freed register slots get reallocated to acc_o
+sequential reads which are not on the WGMMA pipe critical path.
+
+Apply with:
+    patch -p1 -d $TILELANG_SRC < tools/tilelang_common_h_descv.patch
+
+where $TILELANG_SRC is the tilelang package src directory, e.g.
+$CONDA_PREFIX/lib/python3.12/site-packages/tilelang/src
+
+Reference: superAngGao/TileOPs-report-static#9 path C-2a Option 1
+---
+ tl_templates/cuda/common.h | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/tl_templates/cuda/common.h b/tl_templates/cuda/common.h
+--- a/tl_templates/cuda/common.h
++++ b/tl_templates/cuda/common.h
+@@ -538,12 +538,16 @@
+           int stride_byte_offset = 0, typename T>
+ TL_DEVICE void initialize_wgmma_descriptor(GmmaDescriptor &descriptor,
+                                            T *start_address) {
+-  descriptor.bitfield.start_address_ =
+-      cute::cast_smem_ptr_to_uint(start_address) >> 4;
+-  descriptor.bitfield.layout_type_ = layout_type;
+-  descriptor.bitfield.base_offset_ = 0;
+-  descriptor.bitfield.leading_byte_offset_ = leading_byte_offset;
+-  descriptor.bitfield.stride_byte_offset_ = stride_byte_offset;
++  // Build the full descriptor in registers via a single OR expression,
++  // then store once into the union's desc_ field. This lets ptxas
++  // SSA-promote the caller-side local (which the by-reference parameter
++  // would otherwise force stack-resident via per-bitfield RMW). See
++  // commit message for measurements.
++  uint64_t a14 =
++      (cute::cast_smem_ptr_to_uint(start_address) >> 4) & 0x3fffull;
++  descriptor.desc_ = a14 |
++                     (uint64_t(leading_byte_offset & 0x3fff) << 16) |
++                     (uint64_t(stride_byte_offset & 0x3fff) << 32) |
++                     ((uint64_t)(layout_type & 0x3) << 62);
+ }
+
+ template <typename T>

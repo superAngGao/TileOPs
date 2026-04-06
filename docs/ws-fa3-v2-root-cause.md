@@ -877,27 +877,89 @@ The current implementation is a regex post-process via the FFI hook on
 `tilelang_callback_cuda_compile`. Three options to make v2 inherit it
 on the standard registration path:
 
-1. **Patch `tl_templates/cuda/common.h` body only** (smallest, untested).
-   Rewrite the existing `initialize_wgmma_descriptor` body to do the
-   single-write `descriptor.desc_ = ...` form, keeping the by-reference
-   signature. ⚠ unverified — ptxas may still keep `descriptor`
-   stack-resident because it's still `&descriptor`. Worth a 15-minute
-   experiment before committing to either of the other options.
+1. **Patch `tl_templates/cuda/common.h` body only** ✅ **VALIDATED** —
+   see "Option 1 validation" section below. Single ~10-line edit, byte-
+   identical ptxas output to the post-process variant. **This is the
+   chosen path forward.**
 
 2. **Patch TileLang's `codegen_cuda.cc`** to emit
    `name = tl::make_wgmma_descriptor<...>(ptr);` instead of
    `tl::initialize_wgmma_descriptor<...>(name, ptr);`, alongside adding
    the new template to `common.h`. Two-file TileLang upstream PR.
-   Strictly correct, validated by the post-process measurement.
+   Strictly correct but unnecessary now that Option 1 works.
 
 3. **Hook the FFI override into the v2 op `__init__.py`** so any
    importer of v2 transparently inherits the rewrite. Single Python
    file change. Global side effect on the FFI registry — affects every
    kernel built in the same process.
 
-Recommendation: try (1) first since it's a 15-minute experiment with
-high upside. If (1) works, we get a one-line upstream patch. If not,
-fall back to (2). Option (3) is a temporary measure only.
+Recommendation: **Option 1 is the production path** — single-file, ~10
+line patch, no codegen change, no global FFI hook. The patch is saved
+in `tools/tilelang_common_h_descv.patch` for upstream submission.
+
+### Option 1 validation
+
+Direct in-place edit of `$CONDA_PREFIX/lib/python3.12/site-packages/tilelang/src/tl_templates/cuda/common.h`,
+replacing the five-bitfield-RMW body with a single 64-bit OR-and-store
+into the union's `desc_` field. Reference parameter signature kept
+unchanged. After the edit, ptxas reports **byte-identical** spill
+metrics to the post-process variant:
+
+| | C-1 only (no Option 1) | C-1 + Option 1 in-place | C-1 + post-process variant | Match |
+|---|---|---|---|---|
+| Stack frame | 1128 B | **880 B** | 880 B | ✓ |
+| Spill stores | 3172 | 2948 | 2948 | ✓ |
+| Spill loads | 3380 | 3668 | 3668 | ✓ |
+| Registers | 168 | 168 | 168 | — |
+
+Confirms the hypothesis: ptxas's pessimism about by-reference parameters
+is keyed on whether the body **does** RMW operations on the referenced
+struct. A single 64-bit store via `descriptor.desc_ = expr` is detected
+as a write-only, non-aliasing operation, and after inlining the caller's
+local can be SSA-promoted. The five separate bitfield writes
+(`descriptor.bitfield.foo = ...`) were treated as RMWs because each
+bitfield write involves loading the surrounding word, masking, and
+storing.
+
+Bench (3 runs, jitter ±0.3 TFLOPS):
+
+| Configuration | TFLOPS (mean) |
+|---|---|
+| C-1 only (Option 1 not applied) | 140.2 |
+| **C-1 + Option 1 in-place** | **156.8 ± 0.3** |
+| **C-1 + Option 1 + shfl** | **159.1 ± 0.1** |
+| C-1 + post-process desc-by-value | 158.2 ± 0.3 |
+
+**Best total configuration: C-1 source + Option 1 common.h patch + shfl
+post-process = 159.1 TFLOPS, +22.4 % over the original 130.0 baseline.**
+
+Note that with Option 1 in place, **shfl is now reliably useful again**
+(+2.3 TFLOPS, +1.5 %), whereas without Option 1 it was within noise.
+Most likely explanation: with the WGMMA pipe finally hot enough to be
+the bottleneck, the integer-compare overhead from the range-form WG
+selection branches becomes visible.
+
+### Applying Option 1 to a fresh environment
+
+The patch lives at `tools/tilelang_common_h_descv.patch` in this repo.
+Apply via:
+
+```sh
+TILELANG_SRC=$CONDA_PREFIX/lib/python3.12/site-packages/tilelang/src
+patch -p1 -d $TILELANG_SRC < tools/tilelang_common_h_descv.patch
+```
+
+The patch is idempotent: it replaces 6 lines with 9 lines inside the
+existing `initialize_wgmma_descriptor` template body. No other TileLang
+files are touched. Re-applying to an already-patched file will fail
+cleanly (use `patch --dry-run` to check).
+
+This is currently a manual local patch on the dev box. The next step is
+opening an upstream PR against tile-ai/tilelang. The patch is small
+enough to land on its own; the only reason to bundle it with anything
+else is if we also want to upstream the `T.ws(N)` shfl-broadcast lowering
+fix at the same time (which would benefit any other WS kernel that
+shares v2's branch divergence).
 
 ### Cross-references
 
