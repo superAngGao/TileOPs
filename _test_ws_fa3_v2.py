@@ -261,11 +261,17 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                             T.barrier_arrive(k_empty)
                             softmax_1(acc_s_1, sm_1, smp_1,
                                       ss_1, ssum_1, ls_1)
-                            T.copy(acc_s_1, acc_s_cast_1)
+                            # PV must drain before we overwrite
+                            # acc_s_cast_1 (PV's input registers).
+                            # Swapping cast and wait<0> avoids C7513
+                            # (compiler-inserted WG.DP) and conforms to
+                            # the wgmma spec: do not modify in-flight
+                            # input registers before the matching wait.
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(
                                 acc_o_1, num_regs=64)
                             T.barrier_arrive(v_empty)
+                            T.copy(acc_s_1, acc_s_cast_1)
 
                     # -- WG2 (consumer) --
                     with T.ws(2):
@@ -329,11 +335,13 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                             T.barrier_arrive(k_empty)
                             softmax_2(acc_s_2, sm_2, smp_2,
                                       ss_2, ssum_2, ls_2)
-                            T.copy(acc_s_2, acc_s_cast_2)
+                            # See WG1 above: cast must wait for PV to
+                            # drain (avoid C7513 / wgmma spec violation).
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(
                                 acc_o_2, num_regs=64)
                             T.barrier_arrive(v_empty)
+                            T.copy(acc_s_2, acc_s_cast_2)
 
                 # ===== Epilogue: last PV[N-1] =====
                 with T.ws(0):

@@ -535,3 +535,124 @@ Two options to make v2 inherit it on the regular registration path:
 Recommendation: defer productionizing path A until path C is in. If C
 brings v2 into the FA3 ballpark, we then go back and fix the lowering
 in TileLang the right way.
+
+## Path C-1 result: reorder F2FP cast after wait_wgmma(0)
+
+End-to-end validation that the C7513 warning identifies a real wgmma
+spec violation in v2's source, not just a compiler quirk.
+
+### The bug
+
+In v2's WG1/WG2 consumer steady-state body, the original ordering was:
+
+```python
+T.wait_wgmma(1)                          # QK done (B1 drained)
+softmax(acc_s)
+T.copy(acc_s, acc_s_cast)                # ★ F2FP writes acc_s_cast
+T.wait_wgmma(0)                          # PV (B2) drains here
+T.barrier_arrive(v_empty)
+```
+
+`acc_s_cast` is PV's input register (PV is `wgmma_rs`). PV (B2) was
+committed earlier in the same iteration but is still in flight at the
+point of the cast. NVIDIA WGMMA spec is explicit:
+
+> Until the corresponding `wait_group`, the input registers of in-flight
+> wgmma operations should not be modified by other instructions.
+
+ptxas correctly inserts `WG.DP` (warpgroup dependency barrier) to enforce
+this — it cannot let the F2FP writes proceed before B2 drains, because
+the hardware specification says those registers belong to B2 until then.
+The diagnostic surfaces as C7513 (data dependency between non-WGMMA
+write and in-flight WGMMA input).
+
+### The fix
+
+Swap the order so the cast happens **after** PV drains:
+
+```python
+T.wait_wgmma(1)                          # QK done
+softmax(acc_s)
+T.wait_wgmma(0)                          # PV done — registers free
+T.barrier_arrive(v_empty)
+T.copy(acc_s, acc_s_cast)                # safe to overwrite now
+```
+
+Two call sites (`_test_ws_fa3_v2.py` WG1 line 273 and WG2 line 341).
+Total source diff: ~6 lines (including comments).
+
+### Result on H200 (B=4 S=2048 H=64 Hkv=4 D=128, non-causal)
+
+| Configuration                  | TFLOPS         | C7507 | C7518 | C7513 |
+|-------------------------------|----------------|-------|-------|-------|
+| Baseline (no fixes)            | 130.0          | y     | y     | y     |
+| Path A only (shfl, hack)       | 141.4          | y     | n     | y (newly visible) |
+| **Path C-1 only (cast reorder)** | **139.7 ± 0.05** | **y** | **y** | **n** |
+| C-1 + Path A combined          | 141.1 ± 0.05   | y     | n     | n     |
+
+3 runs, jitter ±0.05 TFLOPS. Correctness: PASS on all 5 v2 test shapes
+(diff ≤ 0.002 vs torch fp32 reference).
+
+### Interpretation: C7518 and C7513 are the same wgmma stalls, two views
+
+The four-cell ablation table reveals a non-obvious fact: **fixing either
+the divergent-path issue (Path A) or the data-dependency issue (C-1)
+yields almost the same speedup, and stacking them adds only ~1 % more**.
+They are not orthogonal bottlenecks.
+
+The mechanism: ptxas inserts a single `WG.DP` per affected wgmma. It
+attributes that barrier to whichever reason it finds first when emitting
+the diagnostic. Removing one reason exposes the other in the warning
+text, but the underlying barrier insertion logic operates on the same
+set of wgmmas. Once both reasons are removed for a given wgmma, the
+barrier is gone — but if either reason still applies, ptxas inserts the
+barrier and reports whichever reason it noticed.
+
+So **Path A and C-1 are alternative fixes for the same set of stalls**,
+not complementary. C-1 wins on every dimension that matters:
+
+1. **Production-quality**: clean source-code change vs. monkey-patched
+   regex post-process on generated CUDA.
+2. **Spec correctness**: it fixes a real WGMMA spec violation. v2's
+   original code happened to produce correct output today only because
+   ptxas was conservatively inserting the barrier on our behalf. Without
+   the barrier (e.g. if a future ptxas got more aggressive), the cast
+   could race with the in-flight wgmma's input read.
+3. **Reviewable**: ~6 lines, two call sites, with a comment explaining
+   why. The reorder cost (losing cast/PV overlap) is at most a few tens
+   of cycles per iteration vs. PV's thousands of cycles — negligible.
+
+### Path A retired
+
+Path A's monkey-patch is no longer needed for production. It remains in
+`_bench_ws_shfl.py` purely as a research/diagnostic tool — it lets us
+ablate the C7518 dimension specifically, which was useful for proving
+the C7518/C7513 equivalence above. The TileLang C++ fix to lower
+`T.ws(N)` to `__shfl_sync(...) == N` is still potentially worth doing
+(it benefits any other WS kernel that hits the spec issue or has
+genuinely different spill characteristics), but is no longer on the v2
+critical path.
+
+### What still bottlenecks v2 after C-1
+
+C7507 remains, and the spill numbers haven't moved at all:
+
+- 1128 B stack frame
+- 3172 spill stores / 3380 spill loads (statically)
+- 148 M dynamic spill loads (from earlier ncu profile)
+- LSU 11.6× FA3's
+
+The remaining 3-4× gap to FA3 (130 → 460-500 TFLOPS) is now attributable
+almost entirely to spill. Path A and C-1 combined buy ~9 % by fixing the
+WGMMA pipelining issue; the spill needs a structurally different attack:
+
+1. **PTX-level inspection** of `main_kernel.ptx` to identify which
+   fragment contributes the most spill traffic — register pressure is
+   not uniform across the fragments.
+2. Possible levers if the worst offender is identified:
+   - Move that fragment to shared memory (loses some async, gains regs).
+   - Reduce `block_n` from 128 → 64 (halves all fragment sizes; may also
+     halve TFLOPS — needs measurement).
+   - Restructure so the fragment's live range is shorter.
+
+Option 1 (PTX inspection) is the next concrete step.
