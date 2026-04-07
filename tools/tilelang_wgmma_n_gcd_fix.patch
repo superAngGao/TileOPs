@@ -1,0 +1,20 @@
+diff --git a/python/tilelang/intrinsics/wgmma_macro_generator.py b/python/tilelang/intrinsics/wgmma_macro_generator.py
+--- a/python/tilelang/intrinsics/wgmma_macro_generator.py
++++ b/python/tilelang/intrinsics/wgmma_macro_generator.py
+@@
+     def _initialize_wgmma_prefix(self, n_dim: int = 16):
+-        inst_m, inst_n = 64, gcd(self.warp_col_tiles, 256)
++        # Hopper wgmma fp16/bf16 supports any N in {8, 16, ..., 256} step 8.
++        # Original `gcd(warp_col_tiles, 256)` is overly conservative: e.g. for
++        # warp_col_tiles=176 it picks inst_n=16 (11 wgmma per call) instead of
++        # 176 (1 wgmma per call). Patched to use warp_col_tiles directly when
++        # it is a valid wgmma N.
++        wct = int(self.warp_col_tiles)
++        if wct % 8 == 0 and 8 <= wct <= 256:
++            inst_n = wct
++        else:
++            inst_n = gcd(wct, 256)
++        inst_m = 64
+         assert inst_n % 8 == 0, (
+             f"inst_n must be a multiple of 8, got {inst_n} (block_col_warps={self.block_col_warps}, warp_col_tiles={self.warp_col_tiles})"
+         )
