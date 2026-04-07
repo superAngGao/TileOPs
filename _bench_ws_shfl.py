@@ -85,6 +85,14 @@ ALIAS_DECL_RE = re.compile(
 
 
 def alias_rewrite(src: str) -> tuple[str, dict]:
+    """DIAGNOSTIC ONLY (post-ablation, see superAngGao/TileOPs-report-static#9
+    comment 4197515908). After the per-WG self-contained body restructure
+    in _test_ws_fa3_v2.py, this rewrite is no longer needed: ptxas can
+    prove `_1` and `_2` fragment live ranges are disjoint structurally
+    via the if/elseif/else chain. Disabling this (`ALIAS=0`) on b128
+    leaves stack:0, spill:0, and TFLOPS within noise of the enabled state
+    (521.7 vs 523.4). Kept here only for ablation diagnostics.
+    Toggle with `ALIAS=1`."""
     stats = {"alias_applied": False, "alias_pairs": 0}
     if "main_kernel" not in src:
         return src, stats
@@ -155,8 +163,116 @@ def shfl_transform(src: str) -> tuple[str, dict]:
     return out, stats
 
 
+# ---------------------------------------------------------------------------
+# Path C-4: convert three independent `if (__wg_id == N)` blocks into a
+# single if/elseif/else chain so ptxas can identify warpgroup branches as
+# mutually exclusive. This is the prerequisite for ptxas honoring our
+# `setmaxnreg.dec/inc` instructions (otherwise C7507 fires because ptxas
+# unions all three branch live sets).
+# ---------------------------------------------------------------------------
+_PAT_WG_IF = re.compile(r'\bif \(__wg_id == ([012])\) \{')
+
+
+def _find_matching_close(src: str, open_idx: int) -> int:
+    """Given src[open_idx] == '{', return index of the matching '}'."""
+    depth = 1
+    j = open_idx + 1
+    n = len(src)
+    while j < n and depth > 0:
+        c = src[j]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        j += 1
+    return j - 1
+
+
+def if_else_chain_rewrite(src: str) -> tuple[str, dict]:
+    """Find runs of `if (__wg_id == 0) {...} if (__wg_id == 1) {...}
+    if (__wg_id == 2) {...}` and rewrite the second/third as
+    `else if (...)` / `else`. Requires shfl_transform to have run first
+    (which introduces the `__wg_id` variable)."""
+    stats = {"if_else_chain_applied": False, "chains_rewritten": 0}
+    if "__wg_id" not in src:
+        return src, stats
+
+    parts = []
+    pos = 0
+    n = len(src)
+    chains = 0
+
+    while pos < n:
+        # Find next `if (__wg_id == 0) {`
+        m0 = _PAT_WG_IF.search(src, pos)
+        if not m0 or m0.group(1) != '0':
+            # Not the start of a triplet — emit everything up through this if
+            # (or to end of file if no more matches).
+            if not m0:
+                parts.append(src[pos:])
+                break
+            # Found `if (__wg_id == N)` for N != 0; just skip past it.
+            parts.append(src[pos:m0.end()])
+            pos = m0.end()
+            continue
+
+        # Got `if (__wg_id == 0) {` at m0. Check whether it's followed
+        # by `if (__wg_id == 1)` then `if (__wg_id == 2)`.
+        c0 = _find_matching_close(src, m0.end() - 1)
+        ws0_end = c0 + 1
+        while ws0_end < n and src[ws0_end] in ' \t\n':
+            ws0_end += 1
+        m1 = _PAT_WG_IF.match(src, ws0_end)
+        if not m1 or m1.group(1) != '1':
+            # Not a triplet — emit body 0 unchanged
+            parts.append(src[pos:c0 + 1])
+            pos = c0 + 1
+            continue
+
+        c1 = _find_matching_close(src, m1.end() - 1)
+        ws1_end = c1 + 1
+        while ws1_end < n and src[ws1_end] in ' \t\n':
+            ws1_end += 1
+        m2 = _PAT_WG_IF.match(src, ws1_end)
+        if not m2 or m2.group(1) != '2':
+            # 0+1 found but no 2 — leave the partial alone (don't half-rewrite)
+            parts.append(src[pos:c0 + 1])
+            pos = c0 + 1
+            continue
+
+        c2 = _find_matching_close(src, m2.end() - 1)
+
+        # Rewrite the triplet:
+        #   - body 0 stays as `if (__wg_id == 0) { ... }`
+        #   - body 1: prepend `else `
+        #   - body 2: replace `if (__wg_id == 2) {` with `else {`
+        parts.append(src[pos:c0 + 1])               # ... if (==0) {body0}
+        parts.append(src[c0 + 1:ws0_end])           #     whitespace
+        parts.append('else ')                       #     else
+        parts.append(src[m1.start():c1 + 1])        #     if (==1) {body1}
+        parts.append(src[c1 + 1:ws1_end])           #     whitespace
+        parts.append('else {')                      #     else {
+        parts.append(src[m2.end():c2 + 1])          #     body2}
+        pos = c2 + 1
+        chains += 1
+
+    if chains == 0:
+        return src, stats
+    stats["if_else_chain_applied"] = True
+    stats["chains_rewritten"] = chains
+    return ''.join(parts), stats
+
+
 def desc_rewrite(src: str) -> tuple[str, dict]:
-    """Path C-2a: rewrite wgmma descriptor init to return-by-value."""
+    """DIAGNOSTIC ONLY (post-ablation, see superAngGao/TileOPs-report-static#9
+    comment 4197515908). Path C-2a originally; the in-place common.h Option 1
+    patch in `tools/tilelang_common_h_descv.patch` provided byte-equivalent
+    output. Both became redundant after the per-WG self-contained body
+    restructure: ptxas can register-promote `GmmaDescriptor` locals via
+    standard SSA analysis when their live range is bounded by a single
+    basic block. Reverting common.h to upstream and disabling this rewrite
+    leaves TFLOPS within noise (521.8 vs 521.7) at v2 b128. Kept here only
+    for ablation diagnostics. Toggle with `DESC_REWRITE=1`."""
     stats = {"desc_applied": False, "desc_calls": 0}
     if "initialize_wgmma_descriptor" not in src:
         return src, stats
@@ -178,18 +294,28 @@ def desc_rewrite(src: str) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 # Patched nvcc callback — registered as a TVM FFI global func.
 # ---------------------------------------------------------------------------
+ENABLE_IF_ELSE_CHAIN = os.environ.get("IF_ELSE_CHAIN", "1") == "1"
+ENABLE_SHFL = os.environ.get("SHFL", "1") == "1"
+
+
 @tvm_ffi.register_global_func("tilelang_callback_cuda_compile", override=True)
 def patched_cuda_compile(code, target, pass_config=None):
-    patched, stats = shfl_transform(code)
+    if ENABLE_SHFL:
+        patched, stats = shfl_transform(code)
+    else:
+        patched, stats = code, {}
     if ENABLE_DESC_REWRITE:
         patched, dstats = desc_rewrite(patched)
         stats.update(dstats)
     if ENABLE_ALIAS:
         patched, astats = alias_rewrite(patched)
         stats.update(astats)
+    if ENABLE_IF_ELSE_CHAIN:
+        patched, cstats = if_else_chain_rewrite(patched)
+        stats.update(cstats)
 
     dump_dir = Path("/tmp")
-    if stats.get("applied") or stats.get("desc_applied") or stats.get("alias_applied"):
+    if stats.get("applied") or stats.get("desc_applied") or stats.get("alias_applied") or stats.get("if_else_chain_applied"):
         (dump_dir / "v2_orig_hook.cu").write_text(code)
         (dump_dir / "v2_shfl_hook.cu").write_text(patched)
         print(f"[shfl-hook] applied: {stats}", file=sys.stderr, flush=True)

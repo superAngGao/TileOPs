@@ -122,38 +122,25 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
 
                 T.sync_threads()  # after Q loads
 
-                with T.ws(1):
-                    # Bootstrap: arrive on own scheduler barrier
-                    # so first bar.sync(1, 256) has 128+128=256
-                    T.call_extern("handle",
-                                  "tl::barrier_arrive_named", 1, 256)
-                    T.clear(acc_o_1)
-                    T.clear(ls_1)
-                    T.fill(sm_1, -T.infinity(accum_dtype))
-                with T.ws(2):
-                    T.clear(acc_o_2)
-                    T.clear(ls_2)
-                    T.fill(sm_2, -T.infinity(accum_dtype))
-
                 # =============================================
-                # Main loop: FA3 IntraWGOverlap with 2-stage KV
+                # FA3-aligned per-warpgroup body layout
                 # =============================================
-                # Each iter:
-                #   Producer: acquire k_empty → load K[n] → commit k_full
-                #             acquire v_empty → load V[n-1] → commit v_full
-                #   Consumer: wait k_full → QK[n] async
-                #             wait v_full → PV[n-1] async
-                #             wait<1> QK → release K (k_empty)
-                #             softmax
-                #             wait<0> PV → release V (v_empty)
+                # Goal (option 2): put the entire per-WG work loop INSIDE
+                # the corresponding `with T.ws(N):` block, so that ptxas
+                # can prove producer/consumer paths are mutually exclusive
+                # and honor `setmaxnreg.dec/inc` (i.e., kill C7507).
+                #
+                # FA3-style register reallocation (setmaxnreg):
+                #   Producer dec:  128 * (168 - 24)  = 18432 regs released
+                #   Consumer inc:  256 * (240 - 168) = 18432 regs claimed
+                # 24/240 are the only numbers that match for 1+2 WG split.
 
-                for n_idx in T.Pipelined(loop_range, num_stages=0):
-
-                    # -- WG0 (producer) --
-                    with T.ws(0):
+                # ===== WG0 (producer) — entire producer life cycle =====
+                with T.ws(0):
+                    T.dec_max_nreg(24)
+                    for n_idx in T.Pipelined(loop_range, num_stages=0):
                         # Acquire K stage: wait for consumers to free it
                         T.barrier_wait(k_empty, (n_idx + 1) % 2)
-                        # Load K[n] into k_smem[n%2]
                         if n_idx % 2 == 0:
                             T.tma_copy(
                                 k[bz, n_idx * block_n:
@@ -167,11 +154,9 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                   head_kv, :],
                                 k_smem_1, barrier=k_full)
                         T.barrier_arrive(k_full)
-
                         # Load V[n-1] into v_smem[(n-1)%2]
                         if n_idx > 0:
-                            T.barrier_wait(
-                                v_empty, n_idx % 2)
+                            T.barrier_wait(v_empty, n_idx % 2)
                             if (n_idx - 1) % 2 == 0:
                                 T.tma_copy(
                                     v[bz,
@@ -187,14 +172,37 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                       head_kv, :],
                                     v_smem_1, barrier=v_full)
                             T.barrier_arrive(v_full)
+                    # Producer epilogue: tail load V[loop_range-1]
+                    T.barrier_wait(v_empty, loop_range % 2)
+                    if (loop_range - 1) % 2 == 0:
+                        T.tma_copy(
+                            v[bz,
+                              (loop_range - 1) * block_n:
+                              loop_range * block_n,
+                              head_kv, :],
+                            v_smem_0, barrier=v_full)
+                    else:
+                        T.tma_copy(
+                            v[bz,
+                              (loop_range - 1) * block_n:
+                              loop_range * block_n,
+                              head_kv, :],
+                            v_smem_1, barrier=v_full)
+                    T.barrier_arrive(v_full)
 
-                    # -- WG1 (consumer) --
-                    with T.ws(1):
-                        # Wait for K[n]
+                # ===== WG1 (consumer 1) — entire consumer 1 life cycle =====
+                with T.ws(1):
+                    T.inc_max_nreg(240)
+                    # Bootstrap: arrive on own scheduler barrier so first
+                    # bar.sync(1, 256) has 128+128=256
+                    T.call_extern("handle",
+                                  "tl::barrier_arrive_named", 1, 256)
+                    T.clear(acc_o_1)
+                    T.clear(ls_1)
+                    T.fill(sm_1, -T.infinity(accum_dtype))
+                    for n_idx in T.Pipelined(loop_range, num_stages=0):
                         T.barrier_wait(k_full, n_idx % 2)
-                        # Scheduler: wait for WG2's prev-iter arrive
                         T.sync_threads(barrier_id=1, arrive_count=256)
-
                         if is_causal:
                             for i, j in T.Parallel(half_m, block_n):
                                 acc_s_1[i, j] = T.if_then_else(
@@ -203,27 +211,22 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                     0, -T.infinity(accum_dtype))
                         else:
                             T.clear(acc_s_1)
-
                         if n_idx == 0:
-                            # Prologue: QK[0] sync from k_smem_0
                             T.wgmma_gemm(
                                 q_shared_1, k_smem_0, acc_s_1,
                                 transpose_B=True,
                                 policy=T.GemmWarpPolicy.FullRow)
-                            # Scheduler: signal WG2 (prologue)
                             T.call_extern("handle",
                                           "tl::barrier_arrive_named",
                                           2, 256)
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(
                                 acc_s_1, num_regs=64)
-                            # Release K stage 0
                             T.barrier_arrive(k_empty)
                             softmax_1(acc_s_1, sm_1, smp_1,
                                       ss_1, ssum_1, ls_1)
                             T.copy(acc_s_1, acc_s_cast_1)
                         else:
-                            # Steady state: QK[n] from k_smem[n%2]
                             if n_idx % 2 == 0:
                                 T.wgmma_gemm(
                                     q_shared_1, k_smem_0, acc_s_1,
@@ -234,11 +237,8 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                     q_shared_1, k_smem_1, acc_s_1,
                                     transpose_B=True,
                                     policy=T.GemmWarpPolicy.FullRow)
-                            # Rescale O while QK runs
                             rescale_1(acc_o_1, ss_1)
-                            # PV[n-1] from v_smem[(n-1)%2]
-                            T.barrier_wait(
-                                v_full, (n_idx - 1) % 2)
+                            T.barrier_wait(v_full, (n_idx - 1) % 2)
                             if (n_idx - 1) % 2 == 0:
                                 T.wgmma_gemm(
                                     acc_s_cast_1, v_smem_0,
@@ -249,35 +249,59 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                     acc_s_cast_1, v_smem_1,
                                     acc_o_1,
                                     policy=T.GemmWarpPolicy.FullRow)
-                            # Scheduler: signal WG2 (arrive on barrier 2)
                             T.call_extern("handle",
                                           "tl::barrier_arrive_named",
                                           2, 256)
-                            # wait<1>: QK done
                             T.wait_wgmma(1)
                             T.warpgroup_fence_operand(
                                 acc_s_1, num_regs=64)
-                            # Early K release
                             T.barrier_arrive(k_empty)
                             softmax_1(acc_s_1, sm_1, smp_1,
                                       ss_1, ssum_1, ls_1)
-                            # PV must drain before we overwrite
-                            # acc_s_cast_1 (PV's input registers).
-                            # Swapping cast and wait<0> avoids C7513
-                            # (compiler-inserted WG.DP) and conforms to
-                            # the wgmma spec: do not modify in-flight
-                            # input registers before the matching wait.
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(
                                 acc_o_1, num_regs=64)
                             T.barrier_arrive(v_empty)
                             T.copy(acc_s_1, acc_s_cast_1)
+                    # Consumer 1 epilogue: rescale + last PV
+                    rescale_1(acc_o_1, ss_1)
+                    T.barrier_wait(v_full, (loop_range - 1) % 2)
+                    if (loop_range - 1) % 2 == 0:
+                        T.wgmma_gemm(
+                            acc_s_cast_1, v_smem_0, acc_o_1,
+                            policy=T.GemmWarpPolicy.FullRow)
+                    else:
+                        T.wgmma_gemm(
+                            acc_s_cast_1, v_smem_1, acc_o_1,
+                            policy=T.GemmWarpPolicy.FullRow)
+                    T.wait_wgmma(0)
+                    T.warpgroup_fence_operand(
+                        acc_o_1, num_regs=64)
+                    # Output write for half 1
+                    for i, j in T.Parallel(half_m, D):
+                        acc_o_1[i, j] /= ls_1[i]
+                    T.copy(acc_o_1, q_shared_1)
+                    T.fence_proxy_async()
+                    T.sync_threads(barrier_id=3, arrive_count=128)
+                    T.copy(q_shared_1,
+                           output[bz, row_base:row_base + half_m,
+                                  by, :])
+                    for i in T.Parallel(half_m):
+                        ls_1[i] = (T.log2(ls_1[i])
+                                   + sm_1[i] * scale)
+                    T.copy(ls_1,
+                           lse[bz, by,
+                               row_base:row_base + half_m])
 
-                    # -- WG2 (consumer) --
-                    with T.ws(2):
+                # ===== WG2 (consumer 2) — entire consumer 2 life cycle =====
+                with T.ws(2):
+                    T.inc_max_nreg(240)
+                    T.clear(acc_o_2)
+                    T.clear(ls_2)
+                    T.fill(sm_2, -T.infinity(accum_dtype))
+                    for n_idx in T.Pipelined(loop_range, num_stages=0):
                         T.barrier_wait(k_full, n_idx % 2)
                         T.sync_threads(barrier_id=2, arrive_count=256)
-
                         if is_causal:
                             for i, j in T.Parallel(half_m, block_n):
                                 acc_s_2[i, j] = T.if_then_else(
@@ -286,7 +310,6 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                     0, -T.infinity(accum_dtype))
                         else:
                             T.clear(acc_s_2)
-
                         if n_idx == 0:
                             T.wgmma_gemm(
                                 q_shared_2, k_smem_0, acc_s_2,
@@ -294,7 +317,7 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                 policy=T.GemmWarpPolicy.FullRow)
                             T.call_extern("handle",
                                           "tl::barrier_arrive_named",
-                                          1, 256)  # signal WG1
+                                          1, 256)
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(
                                 acc_s_2, num_regs=64)
@@ -314,8 +337,7 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                     transpose_B=True,
                                     policy=T.GemmWarpPolicy.FullRow)
                             rescale_2(acc_o_2, ss_2)
-                            T.barrier_wait(
-                                v_full, (n_idx - 1) % 2)
+                            T.barrier_wait(v_full, (n_idx - 1) % 2)
                             if (n_idx - 1) % 2 == 0:
                                 T.wgmma_gemm(
                                     acc_s_cast_2, v_smem_0,
@@ -328,60 +350,21 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                                     policy=T.GemmWarpPolicy.FullRow)
                             T.call_extern("handle",
                                           "tl::barrier_arrive_named",
-                                          1, 256)  # signal WG1
+                                          1, 256)
                             T.wait_wgmma(1)
                             T.warpgroup_fence_operand(
                                 acc_s_2, num_regs=64)
                             T.barrier_arrive(k_empty)
                             softmax_2(acc_s_2, sm_2, smp_2,
                                       ss_2, ssum_2, ls_2)
-                            # See WG1 above: cast must wait for PV to
-                            # drain (avoid C7513 / wgmma spec violation).
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(
                                 acc_o_2, num_regs=64)
                             T.barrier_arrive(v_empty)
                             T.copy(acc_s_2, acc_s_cast_2)
-
-                # ===== Epilogue: last PV[N-1] =====
-                with T.ws(0):
-                    T.barrier_wait(v_empty, loop_range % 2)
-                    if (loop_range - 1) % 2 == 0:
-                        T.tma_copy(
-                            v[bz,
-                              (loop_range - 1) * block_n:
-                              loop_range * block_n,
-                              head_kv, :],
-                            v_smem_0, barrier=v_full)
-                    else:
-                        T.tma_copy(
-                            v[bz,
-                              (loop_range - 1) * block_n:
-                              loop_range * block_n,
-                              head_kv, :],
-                            v_smem_1, barrier=v_full)
-                    T.barrier_arrive(v_full)
-
-                with T.ws(1):
-                    rescale_1(acc_o_1, ss_1)
-                    T.barrier_wait(
-                        v_full, (loop_range - 1) % 2)
-                    if (loop_range - 1) % 2 == 0:
-                        T.wgmma_gemm(
-                            acc_s_cast_1, v_smem_0, acc_o_1,
-                            policy=T.GemmWarpPolicy.FullRow)
-                    else:
-                        T.wgmma_gemm(
-                            acc_s_cast_1, v_smem_1, acc_o_1,
-                            policy=T.GemmWarpPolicy.FullRow)
-                    T.wait_wgmma(0)
-                    T.warpgroup_fence_operand(
-                        acc_o_1, num_regs=64)
-
-                with T.ws(2):
+                    # Consumer 2 epilogue: rescale + last PV
                     rescale_2(acc_o_2, ss_2)
-                    T.barrier_wait(
-                        v_full, (loop_range - 1) % 2)
+                    T.barrier_wait(v_full, (loop_range - 1) % 2)
                     if (loop_range - 1) % 2 == 0:
                         T.wgmma_gemm(
                             acc_s_cast_2, v_smem_0, acc_o_2,
@@ -393,29 +376,7 @@ def build_fa3_v2(B, S, H, Hkv, D, is_causal,
                     T.wait_wgmma(0)
                     T.warpgroup_fence_operand(
                         acc_o_2, num_regs=64)
-
-                # ===== Write output =====
-                with T.ws(1):
-                    for i, j in T.Parallel(half_m, D):
-                        acc_o_1[i, j] /= ls_1[i]
-                    T.copy(acc_o_1, q_shared_1)
-                    # Fence: register->smem writes must be visible to
-                    # async proxy (TMA store reads smem via async proxy)
-                    T.fence_proxy_async()
-                    # WG-local sync so all 128 WG1 threads have finished
-                    # writing q_shared_1 before TMA store reads it
-                    T.sync_threads(barrier_id=3, arrive_count=128)
-                    T.copy(q_shared_1,
-                           output[bz, row_base:row_base + half_m,
-                                  by, :])
-                    for i in T.Parallel(half_m):
-                        ls_1[i] = (T.log2(ls_1[i])
-                                   + sm_1[i] * scale)
-                    T.copy(ls_1,
-                           lse[bz, by,
-                               row_base:row_base + half_m])
-
-                with T.ws(2):
+                    # Output write for half 2
                     for i, j in T.Parallel(half_m, D):
                         acc_o_2[i, j] /= ls_2[i]
                     T.copy(acc_o_2, q_shared_2)
