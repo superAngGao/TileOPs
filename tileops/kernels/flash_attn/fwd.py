@@ -971,11 +971,20 @@ def _gqa_fwd_ws_kernel(batch: int,
                     for n_idx in T.Pipelined(loop_range, num_stages=0):
                         T.barrier_wait(k_full, n_idx % 2)
                         T.sync_threads(barrier_id=1, arrive_count=256)
+                        # Causal mask optimization: when block_m == block_n
+                        # the producer's loop_range cap (ceildiv((bx+1)*bm, bn))
+                        # ensures the LAST iter is the only one overlapping
+                        # the diagonal — all earlier iters are strictly below
+                        # the diagonal and need no mask, just T.clear.
+                        # FA3 does the same split.
                         if is_causal:
-                            for i, j in T.Parallel(half_m, block_n):
-                                acc_s_1[i, j] = T.if_then_else(
-                                    row_base + i >= n_idx * block_n + j,
-                                    0, -T.infinity(accum_dtype))
+                            if n_idx == loop_range - 1:
+                                for i, j in T.Parallel(half_m, block_n):
+                                    acc_s_1[i, j] = T.if_then_else(
+                                        row_base + i >= n_idx * block_n + j,
+                                        0, -T.infinity(accum_dtype))
+                            else:
+                                T.clear(acc_s_1)
                         else:
                             T.clear(acc_s_1)
                         if n_idx == 0:
@@ -1049,12 +1058,17 @@ def _gqa_fwd_ws_kernel(batch: int,
                     for n_idx in T.Pipelined(loop_range, num_stages=0):
                         T.barrier_wait(k_full, n_idx % 2)
                         T.sync_threads(barrier_id=2, arrive_count=256)
+                        # See WG1 comment: only the last iter overlaps the
+                        # diagonal when block_m == block_n.
                         if is_causal:
-                            for i, j in T.Parallel(half_m, block_n):
-                                acc_s_2[i, j] = T.if_then_else(
-                                    row_base + half_m + i
-                                    >= n_idx * block_n + j,
-                                    0, -T.infinity(accum_dtype))
+                            if n_idx == loop_range - 1:
+                                for i, j in T.Parallel(half_m, block_n):
+                                    acc_s_2[i, j] = T.if_then_else(
+                                        row_base + half_m + i
+                                        >= n_idx * block_n + j,
+                                        0, -T.infinity(accum_dtype))
+                            else:
+                                T.clear(acc_s_2)
                         else:
                             T.clear(acc_s_2)
                         if n_idx == 0:
