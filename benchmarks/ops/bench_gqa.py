@@ -9,6 +9,7 @@ from tests.ops.test_gqa import (
     GqaBwdTest,
     GqaFwdTest,
 )
+from tileops.kernels.flash_attn import GqaFwdWsKernel
 from tileops.ops import GroupQueryAttentionBwdOp, GroupQueryAttentionFwdOp
 
 
@@ -121,6 +122,42 @@ def test_gqa_fwd_bench(batch: int, seq_len: int, heads: int, heads_kv: int, dim:
     op = GroupQueryAttentionFwdOp(batch, heads, heads_kv, seq_len, dim, causal, dtype, tune=tune)
     result = bm.profile(op, *inputs)
     BenchmarkReport.record(op, locals(), result, tag="tileops")
+
+    baseline_fn = _baseline_gqa_fwd(test)
+    if baseline_fn is not None:
+        result_bl = bm.profile(baseline_fn, *inputs)
+        BenchmarkReport.record(op, locals(), result_bl, tag="fa3")
+    else:
+        result_bl = bm.profile(_torch_gqa_fwd(test), *inputs)
+        BenchmarkReport.record(op, locals(), result_bl, tag="torch-sdpa")
+
+
+_GQA_FWD_WS_BENCH_PARAMS = [
+    pytest.param(4, 4096, 64, 8, 128, False, torch.float16, False, id="ws-throughput-fp16"),
+    pytest.param(4, 4096, 64, 8, 128, True, torch.float16, False, id="ws-throughput-causal-fp16"),
+]
+
+
+@pytest.mark.parametrize(
+    "batch, seq_len, heads, heads_kv, dim, causal, dtype, tune",
+    _GQA_FWD_WS_BENCH_PARAMS,
+)
+def test_gqa_fwd_ws_bench(batch: int, seq_len: int, heads: int, heads_kv: int, dim: int,
+                          causal: bool, dtype: torch.dtype, tune: bool) -> None:
+    """Benchmark FA3-aligned warp-specialized GQA forward kernel.
+
+    Requires dim=128. Uses default block_m=128 block_n=128 (no autotune
+    since the production baseline was tuned at this config).
+    """
+    test = GqaFwdTest(batch, heads, heads_kv, seq_len, dim, causal, dtype)
+    bm = GqaFwdBenchmark(test)
+    inputs = test.gen_inputs()
+
+    op = GroupQueryAttentionFwdOp(
+        batch, heads, heads_kv, seq_len, dim, causal, dtype,
+        kernel_map={"gqa_fwd_kernel": GqaFwdWsKernel}, tune=tune)
+    result = bm.profile(op, *inputs)
+    BenchmarkReport.record(op, locals(), result, tag="tileops-ws")
 
     baseline_fn = _baseline_gqa_fwd(test)
     if baseline_fn is not None:

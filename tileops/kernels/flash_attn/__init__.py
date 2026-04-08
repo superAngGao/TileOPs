@@ -6,7 +6,13 @@ from .bwd import (
     MhaBwdKernel,
     MhaBwdWgmmaPipelinedKernel,
 )
-from .fwd import GqaFwdKernel, GqaFwdWgmmaPipelinedKernel, MhaFwdKernel, MhaFwdWgmmaPipelinedKernel
+from .fwd import (
+    GqaFwdKernel,
+    GqaFwdWgmmaPipelinedKernel,
+    GqaFwdWsKernel,
+    MhaFwdKernel,
+    MhaFwdWgmmaPipelinedKernel,
+)
 
 __all__ = [
     "FlashAttnBwdPostprocessKernel",
@@ -15,6 +21,7 @@ __all__ = [
     "GqaBwdWgmmaPipelinedKernel",
     "GqaFwdKernel",
     "GqaFwdWgmmaPipelinedKernel",
+    "GqaFwdWsKernel",
     "MhaBwdKernel",
     "MhaBwdWgmmaPipelinedKernel",
     "MhaFwdKernel",

@@ -7,10 +7,16 @@ import tilelang.language as T
 import torch
 
 from tileops.kernels.kernel import Kernel
-from tileops.kernels.online_softmax import make_log2e_scale, make_online_softmax, make_rescale
+from tileops.kernels.online_softmax import (
+    make_log2e_scale,
+    make_online_softmax,
+    make_online_softmax_with_mask_guard,
+    make_rescale,
+)
 
 __all__ = [
-    'MhaFwdKernel', 'MhaFwdWgmmaPipelinedKernel', 'GqaFwdKernel', 'GqaFwdWgmmaPipelinedKernel'
+    'MhaFwdKernel', 'MhaFwdWgmmaPipelinedKernel', 'GqaFwdKernel', 'GqaFwdWgmmaPipelinedKernel',
+    'GqaFwdWsKernel',
 ]
 
 # MHA
@@ -767,3 +773,434 @@ class GqaFwdWgmmaPipelinedKernel(Kernel):
                                                        self.config["block_n"],
                                                        self.config["num_stages"],
                                                        self.config["threads"], q, k, v)
+
+
+# ---------------------------------------------------------------------------
+# GQA Forward: warp-specialized variant (FA3-aligned, Hopper TMA + barriers)
+# 3-WG design: WG0=producer, WG1=consumer(rows 0..half_m), WG2=consumer(rows half_m..block_m)
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=32)
+def _gqa_fwd_ws_kernel(batch: int,
+                       heads: int,
+                       heads_kv: int,
+                       seq_len: int,
+                       dim: int,
+                       is_causal: bool,
+                       dtype: str = "float16") -> Callable:
+    """FA3-aligned warp-specialized GQA forward.
+
+    3-WG design with double-buffered K/V, raw thread-binding (no T.ws blocks),
+    named-barrier ping-pong scheduler between consumer warpgroups.
+
+    Production baseline on H200: 612 TFLOPS / 86% FA3 for
+    B=4 S=4096 H=64 Hkv=8 D=128 fp16 non-causal block_m=128 block_n=128.
+    """
+    if heads % heads_kv != 0:
+        raise ValueError("heads must be divisible by heads_kv")
+    if dim != 128:
+        raise ValueError(
+            f"GqaFwdWsKernel currently requires dim==128, got dim={dim}")
+    scale = make_log2e_scale(dim)
+    groups = heads // heads_kv
+    accum_dtype = "float"
+
+    @tilelang.jit(
+        out_idx=[3, 4],
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        },
+        compile_flags=["-O3", "-DENABLE_BF16"])
+    def _gqa_fwd_ws_func(block_m: int, block_n: int) -> Callable:
+        if block_m % 2 != 0:
+            raise ValueError(f"block_m must be even, got block_m={block_m}")
+        q_shape = (batch, seq_len, heads, dim)
+        kv_shape = (batch, seq_len, heads_kv, dim)
+        half_m = block_m // 2
+        softmax_1 = make_online_softmax_with_mask_guard(
+            scale, accum_dtype, half_m, block_n)
+        softmax_2 = make_online_softmax_with_mask_guard(
+            scale, accum_dtype, half_m, block_n)
+        rescale_1 = make_rescale(half_m, dim)
+        rescale_2 = make_rescale(half_m, dim)
+
+        @T.prim_func
+        def _gqa_fwd_ws_main(
+                q: T.Tensor(q_shape, dtype),  # type: ignore
+                k: T.Tensor(kv_shape, dtype),  # type: ignore
+                v: T.Tensor(kv_shape, dtype),  # type: ignore
+                output: T.Tensor(q_shape, dtype),  # type: ignore
+                lse: T.Tensor([batch, heads, seq_len], accum_dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(seq_len, block_m), heads, batch,
+                    threads=384) as (bx, by, bz):
+                # ---- Shared memory ----
+                q_shared_1 = T.alloc_shared([half_m, dim], dtype)
+                q_shared_2 = T.alloc_shared([half_m, dim], dtype)
+                # Double-buffered K and V
+                k_smem_0 = T.alloc_shared([block_n, dim], dtype)
+                k_smem_1 = T.alloc_shared([block_n, dim], dtype)
+                v_smem_0 = T.alloc_shared([block_n, dim], dtype)
+                v_smem_1 = T.alloc_shared([block_n, dim], dtype)
+
+                # ---- Consumer 1 fragments (rows 0..half_m) ----
+                acc_s_1 = T.alloc_fragment([half_m, block_n], accum_dtype)
+                acc_s_cast_1 = T.alloc_fragment([half_m, block_n], dtype)
+                acc_o_1 = T.alloc_fragment([half_m, dim], accum_dtype)
+                sm_1 = T.alloc_fragment([half_m], accum_dtype)
+                smp_1 = T.alloc_fragment([half_m], accum_dtype)
+                ss_1 = T.alloc_fragment([half_m], accum_dtype)
+                ssum_1 = T.alloc_fragment([half_m], accum_dtype)
+                ls_1 = T.alloc_fragment([half_m], accum_dtype)
+
+                # ---- Consumer 2 fragments (rows half_m..block_m) ----
+                acc_s_2 = T.alloc_fragment([half_m, block_n], accum_dtype)
+                acc_s_cast_2 = T.alloc_fragment([half_m, block_n], dtype)
+                acc_o_2 = T.alloc_fragment([half_m, dim], accum_dtype)
+                sm_2 = T.alloc_fragment([half_m], accum_dtype)
+                smp_2 = T.alloc_fragment([half_m], accum_dtype)
+                ss_2 = T.alloc_fragment([half_m], accum_dtype)
+                ssum_2 = T.alloc_fragment([half_m], accum_dtype)
+                ls_2 = T.alloc_fragment([half_m], accum_dtype)
+
+                # ---- Pipeline barriers (FA3-aligned) ----
+                # K pipeline: producer -> consumer (data ready)
+                k_full = T.alloc_barrier(arrive_count=128)
+                # K pipeline: consumer -> producer (buffer free)
+                # arrive_count=256: both WG1(128) + WG2(128) must arrive
+                k_empty = T.alloc_barrier(arrive_count=256)
+                # V pipeline
+                v_full = T.alloc_barrier(arrive_count=128)
+                v_empty = T.alloc_barrier(arrive_count=256)
+
+                T.annotate_layout({
+                    q_shared_1: tilelang.layout.make_swizzled_layout(q_shared_1),
+                    q_shared_2: tilelang.layout.make_swizzled_layout(q_shared_2),
+                })
+
+                T.sync_threads()  # after barrier init
+
+                head_kv = by // groups
+                row_base = bx * block_m
+                loop_range = (
+                    T.ceildiv((bx + 1) * block_m, block_n)
+                    if is_causal else T.ceildiv(seq_len, block_n))
+
+                T.copy(q[bz, row_base:row_base + half_m, by, :], q_shared_1)
+                T.copy(q[bz, row_base + half_m:row_base + block_m, by, :],
+                       q_shared_2)
+
+                T.sync_threads()  # after Q loads
+
+                # =============================================
+                # FA3-aligned per-warpgroup body layout (THREAD-BIND variant)
+                # =============================================
+                # tx is the raw threadIdx.x. Python if/elif/else lowers via
+                # the TIR parser into nested T.If/T.Then/T.Else, which ptxas
+                # sees as a true if/elseif/else tree (mutually exclusive
+                # branches). No need for shfl_transform / if_else_chain
+                # post-process hacks.
+                #
+                # FA3-style register reallocation (setmaxnreg):
+                #   Producer dec:  128 * (168 - 24)  = 18432 regs released
+                #   Consumer inc:  256 * (240 - 168) = 18432 regs claimed
+                # 24/240 are the only numbers that match for 1+2 WG split.
+                tx = T.get_thread_binding()
+
+                # ===== WG0 (producer, tx < 128) =====
+                if tx < 128:
+                    T.dec_max_nreg(24)
+                    for n_idx in T.Pipelined(loop_range, num_stages=0):
+                        # Acquire K stage: wait for consumers to free it
+                        T.barrier_wait(k_empty, (n_idx + 1) % 2)
+                        if n_idx % 2 == 0:
+                            T.tma_copy(
+                                k[bz, n_idx * block_n:(n_idx + 1) * block_n,
+                                  head_kv, :],
+                                k_smem_0, barrier=k_full)
+                        else:
+                            T.tma_copy(
+                                k[bz, n_idx * block_n:(n_idx + 1) * block_n,
+                                  head_kv, :],
+                                k_smem_1, barrier=k_full)
+                        T.barrier_arrive(k_full)
+                        # Load V[n-1] into v_smem[(n-1)%2]
+                        if n_idx > 0:
+                            T.barrier_wait(v_empty, n_idx % 2)
+                            if (n_idx - 1) % 2 == 0:
+                                T.tma_copy(
+                                    v[bz,
+                                      (n_idx - 1) * block_n:n_idx * block_n,
+                                      head_kv, :],
+                                    v_smem_0, barrier=v_full)
+                            else:
+                                T.tma_copy(
+                                    v[bz,
+                                      (n_idx - 1) * block_n:n_idx * block_n,
+                                      head_kv, :],
+                                    v_smem_1, barrier=v_full)
+                            T.barrier_arrive(v_full)
+                    # Producer epilogue: tail load V[loop_range-1]
+                    T.barrier_wait(v_empty, loop_range % 2)
+                    if (loop_range - 1) % 2 == 0:
+                        T.tma_copy(
+                            v[bz,
+                              (loop_range - 1) * block_n:loop_range * block_n,
+                              head_kv, :],
+                            v_smem_0, barrier=v_full)
+                    else:
+                        T.tma_copy(
+                            v[bz,
+                              (loop_range - 1) * block_n:loop_range * block_n,
+                              head_kv, :],
+                            v_smem_1, barrier=v_full)
+                    T.barrier_arrive(v_full)
+
+                # ===== WG1 (consumer 1, 128 <= tx < 256) =====
+                elif tx < 256:
+                    T.inc_max_nreg(240)
+                    # Bootstrap: arrive on own scheduler barrier so first
+                    # bar.sync(1, 256) has 128+128=256
+                    T.call_extern("handle", "tl::barrier_arrive_named", 1, 256)
+                    T.clear(acc_o_1)
+                    T.clear(ls_1)
+                    T.fill(sm_1, -T.infinity(accum_dtype))
+                    for n_idx in T.Pipelined(loop_range, num_stages=0):
+                        T.barrier_wait(k_full, n_idx % 2)
+                        T.sync_threads(barrier_id=1, arrive_count=256)
+                        if is_causal:
+                            for i, j in T.Parallel(half_m, block_n):
+                                acc_s_1[i, j] = T.if_then_else(
+                                    row_base + i >= n_idx * block_n + j,
+                                    0, -T.infinity(accum_dtype))
+                        else:
+                            T.clear(acc_s_1)
+                        if n_idx == 0:
+                            T.wgmma_gemm(q_shared_1, k_smem_0, acc_s_1,
+                                         transpose_B=True,
+                                         policy=T.GemmWarpPolicy.FullRow)
+                            T.call_extern("handle",
+                                          "tl::barrier_arrive_named", 2, 256)
+                            T.wait_wgmma(0)
+                            T.warpgroup_fence_operand(acc_s_1, num_regs=64)
+                            T.barrier_arrive(k_empty)
+                            softmax_1(acc_s_1, sm_1, smp_1, ss_1, ssum_1, ls_1)
+                            T.copy(acc_s_1, acc_s_cast_1)
+                        else:
+                            if n_idx % 2 == 0:
+                                T.wgmma_gemm(q_shared_1, k_smem_0, acc_s_1,
+                                             transpose_B=True,
+                                             policy=T.GemmWarpPolicy.FullRow)
+                            else:
+                                T.wgmma_gemm(q_shared_1, k_smem_1, acc_s_1,
+                                             transpose_B=True,
+                                             policy=T.GemmWarpPolicy.FullRow)
+                            rescale_1(acc_o_1, ss_1)
+                            T.barrier_wait(v_full, (n_idx - 1) % 2)
+                            if (n_idx - 1) % 2 == 0:
+                                T.wgmma_gemm(acc_s_cast_1, v_smem_0, acc_o_1,
+                                             policy=T.GemmWarpPolicy.FullRow)
+                            else:
+                                T.wgmma_gemm(acc_s_cast_1, v_smem_1, acc_o_1,
+                                             policy=T.GemmWarpPolicy.FullRow)
+                            T.call_extern("handle",
+                                          "tl::barrier_arrive_named", 2, 256)
+                            T.wait_wgmma(1)
+                            T.warpgroup_fence_operand(acc_s_1, num_regs=64)
+                            T.barrier_arrive(k_empty)
+                            softmax_1(acc_s_1, sm_1, smp_1, ss_1, ssum_1, ls_1)
+                            T.wait_wgmma(0)
+                            T.warpgroup_fence_operand(acc_o_1, num_regs=64)
+                            T.barrier_arrive(v_empty)
+                            T.copy(acc_s_1, acc_s_cast_1)
+                    # Consumer 1 epilogue: rescale + last PV
+                    rescale_1(acc_o_1, ss_1)
+                    T.barrier_wait(v_full, (loop_range - 1) % 2)
+                    if (loop_range - 1) % 2 == 0:
+                        T.wgmma_gemm(acc_s_cast_1, v_smem_0, acc_o_1,
+                                     policy=T.GemmWarpPolicy.FullRow)
+                    else:
+                        T.wgmma_gemm(acc_s_cast_1, v_smem_1, acc_o_1,
+                                     policy=T.GemmWarpPolicy.FullRow)
+                    T.wait_wgmma(0)
+                    T.warpgroup_fence_operand(acc_o_1, num_regs=64)
+                    # Output write for half 1
+                    for i, j in T.Parallel(half_m, dim):
+                        acc_o_1[i, j] /= ls_1[i]
+                    T.copy(acc_o_1, q_shared_1)
+                    T.fence_proxy_async()
+                    T.sync_threads(barrier_id=3, arrive_count=128)
+                    T.copy(q_shared_1,
+                           output[bz, row_base:row_base + half_m, by, :])
+                    for i in T.Parallel(half_m):
+                        ls_1[i] = T.log2(ls_1[i]) + sm_1[i] * scale
+                    T.copy(ls_1,
+                           lse[bz, by, row_base:row_base + half_m])
+
+                # ===== WG2 (consumer 2, tx >= 256) =====
+                else:
+                    T.inc_max_nreg(240)
+                    T.clear(acc_o_2)
+                    T.clear(ls_2)
+                    T.fill(sm_2, -T.infinity(accum_dtype))
+                    for n_idx in T.Pipelined(loop_range, num_stages=0):
+                        T.barrier_wait(k_full, n_idx % 2)
+                        T.sync_threads(barrier_id=2, arrive_count=256)
+                        if is_causal:
+                            for i, j in T.Parallel(half_m, block_n):
+                                acc_s_2[i, j] = T.if_then_else(
+                                    row_base + half_m + i
+                                    >= n_idx * block_n + j,
+                                    0, -T.infinity(accum_dtype))
+                        else:
+                            T.clear(acc_s_2)
+                        if n_idx == 0:
+                            T.wgmma_gemm(q_shared_2, k_smem_0, acc_s_2,
+                                         transpose_B=True,
+                                         policy=T.GemmWarpPolicy.FullRow)
+                            T.call_extern("handle",
+                                          "tl::barrier_arrive_named", 1, 256)
+                            T.wait_wgmma(0)
+                            T.warpgroup_fence_operand(acc_s_2, num_regs=64)
+                            T.barrier_arrive(k_empty)
+                            softmax_2(acc_s_2, sm_2, smp_2, ss_2, ssum_2, ls_2)
+                            T.copy(acc_s_2, acc_s_cast_2)
+                        else:
+                            if n_idx % 2 == 0:
+                                T.wgmma_gemm(q_shared_2, k_smem_0, acc_s_2,
+                                             transpose_B=True,
+                                             policy=T.GemmWarpPolicy.FullRow)
+                            else:
+                                T.wgmma_gemm(q_shared_2, k_smem_1, acc_s_2,
+                                             transpose_B=True,
+                                             policy=T.GemmWarpPolicy.FullRow)
+                            rescale_2(acc_o_2, ss_2)
+                            T.barrier_wait(v_full, (n_idx - 1) % 2)
+                            if (n_idx - 1) % 2 == 0:
+                                T.wgmma_gemm(acc_s_cast_2, v_smem_0, acc_o_2,
+                                             policy=T.GemmWarpPolicy.FullRow)
+                            else:
+                                T.wgmma_gemm(acc_s_cast_2, v_smem_1, acc_o_2,
+                                             policy=T.GemmWarpPolicy.FullRow)
+                            T.call_extern("handle",
+                                          "tl::barrier_arrive_named", 1, 256)
+                            T.wait_wgmma(1)
+                            T.warpgroup_fence_operand(acc_s_2, num_regs=64)
+                            T.barrier_arrive(k_empty)
+                            softmax_2(acc_s_2, sm_2, smp_2, ss_2, ssum_2, ls_2)
+                            T.wait_wgmma(0)
+                            T.warpgroup_fence_operand(acc_o_2, num_regs=64)
+                            T.barrier_arrive(v_empty)
+                            T.copy(acc_s_2, acc_s_cast_2)
+                    # Consumer 2 epilogue: rescale + last PV
+                    rescale_2(acc_o_2, ss_2)
+                    T.barrier_wait(v_full, (loop_range - 1) % 2)
+                    if (loop_range - 1) % 2 == 0:
+                        T.wgmma_gemm(acc_s_cast_2, v_smem_0, acc_o_2,
+                                     policy=T.GemmWarpPolicy.FullRow)
+                    else:
+                        T.wgmma_gemm(acc_s_cast_2, v_smem_1, acc_o_2,
+                                     policy=T.GemmWarpPolicy.FullRow)
+                    T.wait_wgmma(0)
+                    T.warpgroup_fence_operand(acc_o_2, num_regs=64)
+                    # Output write for half 2
+                    for i, j in T.Parallel(half_m, dim):
+                        acc_o_2[i, j] /= ls_2[i]
+                    T.copy(acc_o_2, q_shared_2)
+                    T.fence_proxy_async()
+                    T.sync_threads(barrier_id=4, arrive_count=128)
+                    T.copy(q_shared_2,
+                           output[bz, row_base + half_m:row_base + block_m,
+                                  by, :])
+                    for i in T.Parallel(half_m):
+                        ls_2[i] = T.log2(ls_2[i]) + sm_2[i] * scale
+                    T.copy(ls_2,
+                           lse[bz, by,
+                               row_base + half_m:row_base + block_m])
+
+        return _gqa_fwd_ws_main
+
+    return _gqa_fwd_ws_func
+
+
+@torch.library.custom_op("top::gqa_fwd_ws_wrapped_kernel", mutates_args=())
+def _gqa_fwd_ws_wrapped_kernel(
+    batch: int,
+    heads: int,
+    heads_kv: int,
+    seq_len: int,
+    dim: int,
+    is_causal: bool,
+    dtype: str,
+    block_m: int,
+    block_n: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _gqa_fwd_ws_kernel(batch, heads, heads_kv, seq_len, dim, is_causal,
+                              dtype)(block_m, block_n)(q, k, v)
+
+
+@_gqa_fwd_ws_wrapped_kernel.register_fake
+def _(batch: int, heads: int, heads_kv: int,
+      seq_len: int, dim: int, is_causal: bool,
+      dtype: str, block_m: int, block_n: int,
+      *inputs: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, torch.Tensor]:
+    fake_o = torch.empty_like(inputs[0])
+    fake_lse = fake_o.new_empty([batch, heads, seq_len])
+    return fake_o, fake_lse
+
+
+class GqaFwdWsKernel(Kernel):
+    supported_archs: list[int] = [90]
+
+    def __init__(self,
+                 batch: int,
+                 heads: int,
+                 heads_kv: int,
+                 seq_len: int,
+                 dim: int,
+                 is_causal: bool,
+                 dtype: torch.dtype,
+                 config: Optional[dict] = None,
+                 tune: bool = False) -> None:
+        super().__init__()
+        self.batch = batch
+        self.heads = heads
+        if heads % heads_kv != 0:
+            raise ValueError("heads must be divisible by heads_kv")
+        self.heads_kv = heads_kv
+        self.seq_len = seq_len
+        self.dim = dim
+        self.is_causal = is_causal
+        self.dtype = dtype
+
+        self.kernel = _gqa_fwd_ws_kernel(self.batch, self.heads, self.heads_kv, self.seq_len,
+                                          self.dim, self.is_causal, self.dtype_str)
+
+        self.init_config(config, tune)
+
+    @property
+    def default_config(self) -> dict:
+        return {"block_m": 128, "block_n": 128}
+
+    @property
+    def autotune_configs(self) -> list[dict]:
+        block_m = [64, 128]
+        block_n = [64, 128]
+        _configs = list(itertools.product(block_m, block_n))
+        return [{
+            'block_m': c[0],
+            'block_n': c[1],
+        } for c in _configs]
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor,
+                v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return _gqa_fwd_ws_wrapped_kernel(self.batch, self.heads, self.heads_kv, self.seq_len,
+                                           self.dim, self.is_causal, self.dtype_str,
+                                           self.config["block_m"], self.config["block_n"],
+                                           q, k, v)
