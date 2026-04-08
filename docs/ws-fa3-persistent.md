@@ -10,14 +10,27 @@ one-tile-per-CTA grid launch (`grid = (M, H, B)`) to **persistent CTA
 scheduling** (`grid = (NUM_SMS, 1, 1)`). Each CTA processes multiple
 `(B, H, M)` tiles via `T.Persistent`.
 
-The implementation is `_test_ws_fa3_v2_persistent.py`. Performance is
-within run-to-run noise of the per-tile baseline; correctness validated
-across `NUM_SMS ∈ {1, 8, 132}`.
+Final performance (GPU 7 H200 locked, `B=4 S=4096 H=64 Hkv=8 D=128`):
+- **Non-causal**: 576.5 TFLOPS = 93.3% FA3 (`_test_ws_fa3_v2_persistent.py`)
+- **Causal**: 515.8 TFLOPS = **83.8% FA3** (`_test_ws_fa3_v2_persistent_paired_postmask.py`)
 
-The five design choices below are NOT optional — they are the difference
-between "works correctly + perf neutral" and "deadlocks or silently
-corrupts data". v3 / v4 attempted persistent before and failed because
-they got at least one of these wrong.
+Three optimizations compose:
+1. Approach A — per-WG global iteration counters for mbarrier phase
+   parity (the base persistent implementation)
+2. Causal tile pairing — pair `tile_m=k` with `tile_m=M-1-k` into each
+   CTA's stream so every pair has constant total work `M+1` iters,
+   eliminating load imbalance (+9.3% for causal)
+3. **Post-wgmma mask** — move the causal mask from BEFORE wgmma to
+   AFTER wait_wgmma, which restores IntraWGOverlap that the in-loop
+   conditional was accidentally destroying (+49.9% for causal)
+
+Combined, causal goes from 50% FA3 → 84% FA3.
+
+The design choices below are NOT optional — v3 / v4 attempted persistent
+before and failed because they got at least one of them wrong. The
+post-wgmma mask choice in particular was only found after SASS-level
+analysis showed that the in-loop mask was forcing `wgmma.wait_group<0>`
+instead of `wait_group<1>`.
 
 ## Why per-tile parity tracking is wrong
 
@@ -355,52 +368,111 @@ Verified by SASS dump: replacing the mask path with `if False` produces
 optimizes away to nothing, which restores all the wgmma scheduling
 optimizations.
 
-### The fix (TODO)
+### The fix that works: post-wgmma mask
 
-Extract the diagonal block as a separate code path **outside** the K
-loop. The K loop body has no conditional → compiler emits the same
-SASS as non-causal → IntraWGOverlap restored.
+Move the mask from BEFORE `wgmma_gemm` to AFTER `wait_wgmma`. The mask
+still writes `acc_s_1`, but at the post-wait point the wgmma is already
+drained, so the conditional write doesn't conflict with in-flight wgmma
+writes. TileLang's data-flow analysis no longer needs to insert
+conservative `wait_group<0>`, and IntraWGOverlap is restored.
 
 ```python
-# K loop excluding the diagonal block (no mask, no conditional)
-for n_idx in T.Pipelined(loop_range - 1, num_stages=0):
-    T.barrier_wait(k_full, gi_kc % 2)
-    T.sync_threads(barrier_id=1, ...)
-    T.clear(acc_s_1)  # always, no conditional
-    # ... wgmma + softmax + PV (n_idx==0 prologue or n_idx>0 steady) ...
+# ❌ Old (in-loop mask, BEFORE wgmma) — destroys IntraWGOverlap
+if n_idx == loop_range - 1:
+    for i, j in T.Parallel(half_m, block_n):
+        acc_s_1[i, j] = T.if_then_else(...)
+else:
+    T.clear(acc_s_1)
+T.wgmma_gemm(... acc_s_1 ...)
+# ← TileLang inserts wait_group<0> before the next iter's mask write
 
-# Diagonal block (n_idx = loop_range - 1) handled separately
-T.barrier_wait(k_full, gi_kc % 2)
-T.sync_threads(barrier_id=1, ...)
-for i, j in T.Parallel(half_m, block_n):
-    acc_s_1[i, j] = T.if_then_else(...)  # mask
-# ... wgmma + softmax + PV ...
+# ✓ New (post-wgmma mask) — IntraWGOverlap preserved
+T.clear(acc_s_1)
+T.wgmma_gemm(... acc_s_1 ...)
+T.wait_wgmma(0)  # or wait_wgmma(1) for the IntraWGOverlap drain path
+T.warpgroup_fence_operand(acc_s_1, num_regs=64)
+T.barrier_arrive(k_empty)
+if n_idx == loop_range - 1:  # ← still conditional, but AFTER wait
+    for i, j in T.Parallel(half_m, block_n):
+        acc_s_1[i, j] = T.if_then_else(
+            row_base + i >= n_idx * block_n + j,
+            acc_s_1[i, j],                  # keep wgmma result
+            -T.infinity(accum_dtype))       # mask to -inf
+softmax_1(acc_s_1, ...)
 ```
 
-Extra complication: if `loop_range == 1` (causal `tile_m == 0`), the
-diagonal block is also the prologue (no V loaded yet). Need to handle
-both prologue and steady-state paths in the extracted diagonal code,
-or special-case `loop_range == 1`.
+The key insight: `wait_wgmma(0)` (or `wait_wgmma(1)` followed by the
+`warpgroup_fence_operand` which confirms acc_s_1 is register-resident
+and stable) proves to the compiler that the wgmma writes to `acc_s_1`
+have completed. Any subsequent read-modify-write of `acc_s_1` is safe
+and doesn't require extra drains.
 
-Expected impact: causal per-iter goes from 3.48 µs back to 2.19 µs,
-which (using the same total K iter count) brings causal time from
-3.55 ms to ~2.24 ms = ~490 TFLOPS = **~80% FA3**, matching the
-non-causal % FA3.
+**The conditional is still in the code** — the compiler doesn't care
+about the conditional per se. It cares about whether non-wgmma writes
+to wgmma accumulator fragments happen while wgmma is in flight. Move
+them past the drain and the compiler is happy.
 
-### Tile pairing (already implemented in `_paired.py`)
+SASS verification after the fix (same shape as above):
 
-Pair `(tile_m=k, tile_m=M-1-k)` into the same CTA's persistent stream
-so each pair has constant total work `M+1` iters. Eliminates load
-imbalance. Currently gives +8.8% over the unpaired causal persistent.
-Once the SASS root cause above is fixed, pairing's contribution should
-be additive on top of the IntraWGOverlap recovery.
+| Variant | `wait_group<0>` | `wait_group<1>` | IntraWGOverlap |
+|---|---|---|---|
+| Non-causal | 7 | 2 | ✓ |
+| Causal (in-loop mask) | 128 | 0 | ✗ destroyed |
+| **Causal (postmask)** | **7** | **2** | **✓ restored** |
+
+Byte-equivalent pattern to non-causal. The fix reduces per-iter cost
+from 3.48 µs back to 2.19 µs (matching non-causal per-iter cost).
+
+### Tile pairing composes additively with post-mask
+
+Tile pairing is implemented in `_test_ws_fa3_v2_persistent_paired.py`
+(pair `tile_m=k` with `tile_m=M-1-k` so each pair has constant total
+work `M+1` iters). Pairing and post-mask are **additive**:
+- post-mask alone: +49.9% over in-loop-mask baseline
+- tile pairing alone: +9.3%
+- **both combined: +66.9%**
+
+### Final causal performance
+
+GPU 7 H200 locked, `B=4 S=4096 H=64 Hkv=8 D=128 block_n=128`, causal:
+
+| Variant | TFLOPS | vs baseline | % FA3 |
+|---|---|---|---|
+| v2_persistent (in-loop mask, baseline) | 309.0 | — | 50.0% |
+| v2_persistent_paired (pairing only, in-loop mask) | 337.6 | +9.3% | 54.8% |
+| **v2_persistent_postmask (postmask only)** | **463.3** | **+49.9%** | **75.2%** |
+| **v2_persistent_paired_postmask (postmask + pairing)** | **515.8** | **+66.9%** | **83.8%** |
+| FA3 reference | 615.8 | — | 100% |
+
+**84% FA3** matches the original target stated in the project memory.
+The residual ~16% gap is the same long-scoreboard / multicast-TMA gap
+that non-causal also has (non-causal is at 93% FA3 with the same
+residual), not a causal-specific issue.
+
+### The generalizable lesson
+
+**Non-wgmma writes to wgmma accumulator fragments must happen AFTER
+the wgmma drain point, not before.** This applies to:
+- Causal masks
+- Online softmax updates
+- Rescale operations
+- Any element-wise operation on acc_s / acc_o
+
+Placing them inline before the next wgmma issue causes TileLang's
+data-flow analysis to insert conservative `wait_group<0>` drains,
+which destroys the wgmma pipelining that IntraWGOverlap depends on.
+The fix is always the same: move them past the corresponding
+`wait_wgmma` call, even if that means keeping a conditional in source.
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `_test_ws_fa3_v2_threadbind.py` | Production baseline (single-tile, 612 TFLOPS) |
-| `_test_ws_fa3_v2_persistent.py` | **This doc's implementation** (Approach A) |
-| `_test_persistent_gemm_minimal.py` | 1P+2C persistent GEMM, validates parity formula |
-| `_test_ws_fa3_v3.py` | First (failed) persistent attempt — `T.ws()` style |
-| `_test_ws_fa3_v4_persistent.py` | Second (failed) persistent attempt — has wrong drains |
+| File | Purpose | Status |
+|---|---|---|
+| `_test_ws_fa3_v2_threadbind.py` | Production baseline (single-tile, 612 TFLOPS non-causal) | baseline |
+| `_test_ws_fa3_v2_persistent.py` | Approach A: persistent + global gi counters | ✓ 93% FA3 non-causal |
+| `_test_ws_fa3_v2_persistent_paired.py` | + causal tile pairing | causal 55% FA3 (pre-postmask) |
+| **`_test_ws_fa3_v2_persistent_postmask.py`** | + post-wgmma mask | **causal 75% FA3** |
+| **`_test_ws_fa3_v2_persistent_paired_postmask.py`** | + pairing + post-wgmma mask | **causal 84% FA3** |
+| `_test_persistent_gemm_minimal.py` | 1P+2C persistent GEMM, validates parity formula | reference |
+| `_test_ws_fa3_v3.py` | First (failed) persistent attempt — `T.ws()` style | reference only |
+| `_test_ws_fa3_v4_persistent.py` | Second (failed) persistent attempt — wrong drains | reference only |
