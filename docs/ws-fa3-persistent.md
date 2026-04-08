@@ -268,30 +268,132 @@ The persistent kernel is ready as a foundation; further improvements
    takes ~5 minutes to write and ~30 seconds to compile+run; it'll save
    you from hour-long debugging in the full attention kernel.
 
-## Causal mode (NOT yet implemented)
+## Causal mode
 
-The non-causal version above does not handle causal mode. Causal needs
-two extra things:
+Causal is implemented in `_test_ws_fa3_v2_persistent.py` (varying
+`loop_range`) and `_test_ws_fa3_v2_persistent_paired.py` (with tile
+pairing on top). Both pass correctness for `NUM_SMS ∈ {1, 8, 132}` on
+all tested shapes including the `loop_range == 1` edge at `tile_m == 0`.
 
-1. **Diagonal-block-only mask optimization** — only the last
-   (`n_idx == loop_range - 1`) block needs the mask; earlier blocks are
-   strictly below the diagonal. This is already in v4 / fwd.py, just
-   needs porting.
+The other Claude's worry about `loop_range == 1` breaking bar 1/2 carryover
+turned out to be a non-issue: bar 1/2 operations are emitted **per K
+iter regardless of n_idx**, so even at loop_range=1 the bar 1/2 op
+count is symmetric. Approach A's global iteration counters are also
+agnostic to per-tile loop_range variation, so causal "just works" with
+no special-casing.
 
-2. **`loop_range == 1` edge case at `tile_m == 0`** — the consumer's
-   `n_idx == 0` branch skips all V pipeline operations, so a tile with
-   `loop_range == 1` (which causal `tile_m=0` always has) does NOT do
-   any V load / arrive at all. This breaks the per-tile bar 1/2 op
-   count symmetry that the self-correct argument relies on.
+### The real causal slowdown root cause: SASS-level analysis
 
-   Possible fixes: special-case `tile_m == 0`, or convert bar 1/2 from
-   named scheduler to mbarrier with global counter, or always issue
-   one dummy V iteration.
+After getting causal correct (337 TFLOPS, ~55% FA3 with pairing) we
+went deep into NCU + SASS to understand why causal is so much slower
+than non-causal. The root cause is **NOT** load imbalance, **NOT**
+per-tile fixed cost, and **NOT** missing cross-sub-tile pipelining.
 
-3. **Tile pairing** (separate optimization) — pair `(tile_m=k,
-   tile_m=M-1-k)` into the same CTA's persistent stream so each pair
-   has constant total work `M+1` iters. This flattens the causal load
-   imbalance and is what brings causal from ~46% FA3 up to ~85% FA3.
+It's the inline `if n_idx == loop_range - 1` mask conditional in the
+consumer's K loop body, which forces the compiler to **disable
+IntraWGOverlap** by inserting `wgmma.wait_group<0>` after every wgmma
+in causal mode.
+
+#### Per-iter cost comparison (B=4 S=4096 H=64 Hkv=8 D=128, GPU 7, block_n=128)
+
+| Variant | Time | Total K iters / CTA | Per-iter cost |
+|---|---|---|---|
+| Non-causal `v2_persistent` | 4.34 ms | 1984 | **2.19 µs** |
+| Causal `v2_persistent` (real varying loop_range) | 3.55 ms | 1023 | **3.48 µs** |
+| Causal `v2_persistent` FORCED full loop_range=32 | 7.15 ms | 1984 | **3.61 µs** |
+| Causal `v2_persistent` FORCED full + mask path replaced with `if False` | 4.34 ms | 1984 | **2.19 µs** |
+
+Causal per-iter is **1.59× non-causal per-iter**. Replacing the inline
+mask path with `if False` (so mask is dead code) recovers non-causal
+speed exactly. The gap is entirely from the conditional that the
+compiler sees in the K loop, not from the mask compute itself or from
+load imbalance.
+
+#### SASS instruction count
+
+| Variant | `wgmma.wait_group<0>` | `wgmma.wait_group<1>` |
+|---|---|---|
+| Non-causal | **7** | **2** |
+| Causal mask FORCED full | **128** | **0** |
+| Causal mask FORCED full + `if False` | **7** | **2** (byte-identical to non-causal SASS) |
+
+`wgmma.wait_group<1>` is what makes IntraWGOverlap work — it lets PV
+keep running in the wgmma pipeline while the consumer reads QK's
+result. `wgmma.wait_group<0>` drains the pipeline completely.
+
+In non-causal: 7 × wait<0> + 2 × wait<1>. The wait<1>s are the
+IntraWGOverlap pattern (drain QK after issuing PV, leave PV in flight).
+
+In causal: **128 × wait<0>, ZERO wait<1>**. Every single wgmma is
+followed by a complete pipeline drain. **IntraWGOverlap is gone.**
+
+#### Why the compiler does this
+
+```python
+if n_idx == loop_range - 1:
+    for i, j in T.Parallel(half_m, block_n):
+        acc_s_1[i, j] = T.if_then_else(   # ← non-wgmma write to acc_s_1
+            row_base + i >= n_idx * block_n + j,
+            0, -T.infinity(accum_dtype))
+else:
+    T.clear(acc_s_1)
+T.wgmma_gemm(q_shared_1, k_smem_0, acc_s_1, ...)  # ← wgmma writes acc_s_1
+```
+
+The mask path is a **non-wgmma write** to `acc_s_1`. The compiler can't
+prove that this write doesn't conflict with the previous iter's
+in-flight wgmma writes to `acc_s_1`, so it conservatively inserts a
+`wait_group<0>` before the conditional to drain everything.
+
+`T.clear(acc_s_1)` is also a non-wgmma write, but because it's
+unconditional and structurally simple, the compiler can hoist / reorder
+it and only emit the necessary `wait_group<1>` (matching the
+IntraWGOverlap pattern). The conditional defeats this.
+
+Verified by SASS dump: replacing the mask path with `if False` produces
+**byte-identical SASS** to the non-causal kernel. The `if False`
+optimizes away to nothing, which restores all the wgmma scheduling
+optimizations.
+
+### The fix (TODO)
+
+Extract the diagonal block as a separate code path **outside** the K
+loop. The K loop body has no conditional → compiler emits the same
+SASS as non-causal → IntraWGOverlap restored.
+
+```python
+# K loop excluding the diagonal block (no mask, no conditional)
+for n_idx in T.Pipelined(loop_range - 1, num_stages=0):
+    T.barrier_wait(k_full, gi_kc % 2)
+    T.sync_threads(barrier_id=1, ...)
+    T.clear(acc_s_1)  # always, no conditional
+    # ... wgmma + softmax + PV (n_idx==0 prologue or n_idx>0 steady) ...
+
+# Diagonal block (n_idx = loop_range - 1) handled separately
+T.barrier_wait(k_full, gi_kc % 2)
+T.sync_threads(barrier_id=1, ...)
+for i, j in T.Parallel(half_m, block_n):
+    acc_s_1[i, j] = T.if_then_else(...)  # mask
+# ... wgmma + softmax + PV ...
+```
+
+Extra complication: if `loop_range == 1` (causal `tile_m == 0`), the
+diagonal block is also the prologue (no V loaded yet). Need to handle
+both prologue and steady-state paths in the extracted diagonal code,
+or special-case `loop_range == 1`.
+
+Expected impact: causal per-iter goes from 3.48 µs back to 2.19 µs,
+which (using the same total K iter count) brings causal time from
+3.55 ms to ~2.24 ms = ~490 TFLOPS = **~80% FA3**, matching the
+non-causal % FA3.
+
+### Tile pairing (already implemented in `_paired.py`)
+
+Pair `(tile_m=k, tile_m=M-1-k)` into the same CTA's persistent stream
+so each pair has constant total work `M+1` iters. Eliminates load
+imbalance. Currently gives +8.8% over the unpaired causal persistent.
+Once the SASS root cause above is fixed, pairing's contribution should
+be additive on top of the IntraWGOverlap recovery.
 
 ## Files
 
