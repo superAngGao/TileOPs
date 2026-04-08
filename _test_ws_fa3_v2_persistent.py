@@ -60,7 +60,6 @@ NUM_SMS = int(os.environ.get("V2P_NUM_SMS", "132"))
 def build_fa3_v2_persistent(B, S, H, Hkv, D, is_causal,
                             block_m=128, block_n=128):
     assert H % Hkv == 0 and block_m % 2 == 0 and D == 128
-    assert not is_causal, "non-causal only for v1 (loop_range=1 edge case)"
     half_m = block_m // 2
     groups = H // Hkv
     scale = make_log2e_scale(D)
@@ -173,7 +172,9 @@ def build_fa3_v2_persistent(B, S, H, Hkv, D, is_causal,
                         group_size=8,
                     ):
                         head_kv = tile_h // groups
-                        loop_range = T.ceildiv(S, block_n)
+                        loop_range = (
+                            T.ceildiv((tile_m + 1) * block_m, block_n)
+                            if is_causal else T.ceildiv(S, block_n))
 
                         for n_idx in T.Pipelined(loop_range, num_stages=0):
                             # Acquire K stage: wait for consumers to free it
@@ -247,7 +248,9 @@ def build_fa3_v2_persistent(B, S, H, Hkv, D, is_causal,
                         group_size=8,
                     ):
                         row_base = tile_m * block_m
-                        loop_range = T.ceildiv(S, block_n)
+                        loop_range = (
+                            T.ceildiv((tile_m + 1) * block_m, block_n)
+                            if is_causal else T.ceildiv(S, block_n))
 
                         # Per-WG Q load via TMA (faster than cp.async,
                         # no L1TEX stall). Issued by 1 thread, completion
@@ -268,8 +271,20 @@ def build_fa3_v2_persistent(B, S, H, Hkv, D, is_causal,
                         for n_idx in T.Pipelined(loop_range, num_stages=0):
                             T.barrier_wait(k_full, gi_kc1 % 2)
                             T.sync_threads(barrier_id=1, arrive_count=256)
-                            # Non-causal: just clear acc_s_1
-                            T.clear(acc_s_1)
+                            # Causal: only the diagonal block (last K
+                            # block of this tile) needs the mask. Earlier
+                            # blocks are strictly below the diagonal.
+                            if is_causal:
+                                if n_idx == loop_range - 1:
+                                    for i, j in T.Parallel(half_m, block_n):
+                                        acc_s_1[i, j] = T.if_then_else(
+                                            row_base + i
+                                            >= n_idx * block_n + j,
+                                            0, -T.infinity(accum_dtype))
+                                else:
+                                    T.clear(acc_s_1)
+                            else:
+                                T.clear(acc_s_1)
                             if n_idx == 0:
                                 if gi_kc1 % 2 == 0:
                                     T.wgmma_gemm(
@@ -376,7 +391,9 @@ def build_fa3_v2_persistent(B, S, H, Hkv, D, is_causal,
                         group_size=8,
                     ):
                         row_base = tile_m * block_m
-                        loop_range = T.ceildiv(S, block_n)
+                        loop_range = (
+                            T.ceildiv((tile_m + 1) * block_m, block_n)
+                            if is_causal else T.ceildiv(S, block_n))
 
                         # Per-WG Q load via TMA (own q_shared_2)
                         T.tma_copy(
@@ -396,7 +413,19 @@ def build_fa3_v2_persistent(B, S, H, Hkv, D, is_causal,
                         for n_idx in T.Pipelined(loop_range, num_stages=0):
                             T.barrier_wait(k_full, gi_kc2 % 2)
                             T.sync_threads(barrier_id=2, arrive_count=256)
-                            T.clear(acc_s_2)
+                            # Causal: only the diagonal block (last K
+                            # block of this tile) needs the mask.
+                            if is_causal:
+                                if n_idx == loop_range - 1:
+                                    for i, j in T.Parallel(half_m, block_n):
+                                        acc_s_2[i, j] = T.if_then_else(
+                                            row_base + half_m + i
+                                            >= n_idx * block_n + j,
+                                            0, -T.infinity(accum_dtype))
+                                else:
+                                    T.clear(acc_s_2)
+                            else:
+                                T.clear(acc_s_2)
                             if n_idx == 0:
                                 if gi_kc2 % 2 == 0:
                                     T.wgmma_gemm(
@@ -540,8 +569,14 @@ def test(B, S, H, Hkv, D, is_causal):
 if __name__ == "__main__":
     print(f"=== v2 PERSISTENT (NUM_SMS={NUM_SMS}) ===")
     ok = True
+    # non-causal
     ok &= test(1, 256, 8, 4, 128, False)
     ok &= test(4, 512, 64, 4, 128, False)
     ok &= test(2, 2048, 32, 8, 128, False)
     ok &= test(4, 2048, 64, 4, 128, False)
+    # causal — must include shapes that hit tile_m=0 (loop_range=1)
+    ok &= test(1, 256, 8, 4, 128, True)
+    ok &= test(4, 512, 64, 4, 128, True)
+    ok &= test(1, 1024, 32, 8, 128, True)
+    ok &= test(2, 2048, 32, 8, 128, True)
     print(f"\n{'All passed!' if ok else 'SOME FAILED!'}")
