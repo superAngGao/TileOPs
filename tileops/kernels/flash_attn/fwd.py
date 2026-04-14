@@ -794,8 +794,30 @@ def _gqa_fwd_ws_kernel(batch: int,
     3-WG design with double-buffered K/V, raw thread-binding (no T.ws blocks),
     named-barrier ping-pong scheduler between consumer warpgroups.
 
-    Production baseline on H200: 612 TFLOPS / 86% FA3 for
-    B=4 S=4096 H=64 Hkv=8 D=128 fp16 non-causal block_m=128 block_n=128.
+    Reference shape (B=4 S=4096 H=64 Hkv=8 D=128 fp16) on locked H200:
+      - non-causal block_m=128 block_n=176: ~88% FA3
+      - non-causal block_m=128 block_n=128: ~84% FA3
+      - causal     block_m=128 block_n=128: ~80% FA3 (post-wgmma mask)
+
+    Causal IntraWGOverlap fix (post-wgmma mask):
+      The causal mask is applied AFTER ``wait_wgmma`` (i.e., once the wgmma
+      has drained acc_s), not before the next wgmma issue.  Placing a
+      conditional non-wgmma write to acc_s inside the K loop body forces
+      TileLang's data-flow analysis to insert ``wait_group<0>`` instead of
+      ``<1>``, destroying IntraWGOverlap.  Empirical SASS check on H200:
+      healthy non-causal has ``7 × wait_group<0> + 2 × wait_group<1>``;
+      a broken in-loop-mask causal has ``128 × wait_group<0> + 0``.
+      The post-wgmma form restores the ``<1>`` count and gives ~+50%
+      causal TFLOPS over the in-loop form.
+
+    Required out-of-tree TileLang patches (active in env_tilelang_20260119):
+      1. ``barrier.h`` — 5-line ``tl::barrier_arrive_named(bar_id, count)``
+         helper.  Without this, the ``T.call_extern("handle",
+         "tl::barrier_arrive_named", ...)`` calls below fail to link.
+      2. ``wgmma_macro_generator.py`` — wgmma N gcd fix.  Required only
+         when running with ``block_n=176`` (otherwise wgmma macro picks an
+         N that doesn't divide block_n cleanly).  ``block_n=128`` works
+         without this patch.
     """
     if heads % heads_kv != 0:
         raise ValueError("heads must be divisible by heads_kv")
@@ -971,22 +993,10 @@ def _gqa_fwd_ws_kernel(batch: int,
                     for n_idx in T.Pipelined(loop_range, num_stages=0):
                         T.barrier_wait(k_full, n_idx % 2)
                         T.sync_threads(barrier_id=1, arrive_count=256)
-                        # Causal mask optimization: when block_m == block_n
-                        # the producer's loop_range cap (ceildiv((bx+1)*bm, bn))
-                        # ensures the LAST iter is the only one overlapping
-                        # the diagonal — all earlier iters are strictly below
-                        # the diagonal and need no mask, just T.clear.
-                        # FA3 does the same split.
-                        if is_causal:
-                            if n_idx == loop_range - 1:
-                                for i, j in T.Parallel(half_m, block_n):
-                                    acc_s_1[i, j] = T.if_then_else(
-                                        row_base + i >= n_idx * block_n + j,
-                                        0, -T.infinity(accum_dtype))
-                            else:
-                                T.clear(acc_s_1)
-                        else:
-                            T.clear(acc_s_1)
+                        # K loop body: ALWAYS clear, no inline mask.  The
+                        # causal mask is applied AFTER wait_wgmma (see
+                        # function docstring for the IntraWGOverlap rationale).
+                        T.clear(acc_s_1)
                         if n_idx == 0:
                             T.wgmma_gemm(q_shared_1, k_smem_0, acc_s_1,
                                          transpose_B=True,
@@ -996,6 +1006,15 @@ def _gqa_fwd_ws_kernel(batch: int,
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(acc_s_1, num_regs=64)
                             T.barrier_arrive(k_empty)
+                            # Post-wgmma mask: only diagonal block.
+                            if is_causal:
+                                if n_idx == loop_range - 1:
+                                    for i, j in T.Parallel(half_m, block_n):
+                                        acc_s_1[i, j] = T.if_then_else(
+                                            row_base + i
+                                            >= n_idx * block_n + j,
+                                            acc_s_1[i, j],
+                                            -T.infinity(accum_dtype))
                             softmax_1(acc_s_1, sm_1, smp_1, ss_1, ssum_1, ls_1)
                             T.copy(acc_s_1, acc_s_cast_1)
                         else:
@@ -1020,6 +1039,15 @@ def _gqa_fwd_ws_kernel(batch: int,
                             T.wait_wgmma(1)
                             T.warpgroup_fence_operand(acc_s_1, num_regs=64)
                             T.barrier_arrive(k_empty)
+                            # Post-wgmma mask: only diagonal block.
+                            if is_causal:
+                                if n_idx == loop_range - 1:
+                                    for i, j in T.Parallel(half_m, block_n):
+                                        acc_s_1[i, j] = T.if_then_else(
+                                            row_base + i
+                                            >= n_idx * block_n + j,
+                                            acc_s_1[i, j],
+                                            -T.infinity(accum_dtype))
                             softmax_1(acc_s_1, sm_1, smp_1, ss_1, ssum_1, ls_1)
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(acc_o_1, num_regs=64)
@@ -1058,19 +1086,8 @@ def _gqa_fwd_ws_kernel(batch: int,
                     for n_idx in T.Pipelined(loop_range, num_stages=0):
                         T.barrier_wait(k_full, n_idx % 2)
                         T.sync_threads(barrier_id=2, arrive_count=256)
-                        # See WG1 comment: only the last iter overlaps the
-                        # diagonal when block_m == block_n.
-                        if is_causal:
-                            if n_idx == loop_range - 1:
-                                for i, j in T.Parallel(half_m, block_n):
-                                    acc_s_2[i, j] = T.if_then_else(
-                                        row_base + half_m + i
-                                        >= n_idx * block_n + j,
-                                        0, -T.infinity(accum_dtype))
-                            else:
-                                T.clear(acc_s_2)
-                        else:
-                            T.clear(acc_s_2)
+                        # K loop body: ALWAYS clear (mask applied post-wgmma).
+                        T.clear(acc_s_2)
                         if n_idx == 0:
                             T.wgmma_gemm(q_shared_2, k_smem_0, acc_s_2,
                                          transpose_B=True,
@@ -1080,6 +1097,15 @@ def _gqa_fwd_ws_kernel(batch: int,
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(acc_s_2, num_regs=64)
                             T.barrier_arrive(k_empty)
+                            # Post-wgmma mask: only diagonal block.
+                            if is_causal:
+                                if n_idx == loop_range - 1:
+                                    for i, j in T.Parallel(half_m, block_n):
+                                        acc_s_2[i, j] = T.if_then_else(
+                                            row_base + half_m + i
+                                            >= n_idx * block_n + j,
+                                            acc_s_2[i, j],
+                                            -T.infinity(accum_dtype))
                             softmax_2(acc_s_2, sm_2, smp_2, ss_2, ssum_2, ls_2)
                             T.copy(acc_s_2, acc_s_cast_2)
                         else:
@@ -1104,6 +1130,15 @@ def _gqa_fwd_ws_kernel(batch: int,
                             T.wait_wgmma(1)
                             T.warpgroup_fence_operand(acc_s_2, num_regs=64)
                             T.barrier_arrive(k_empty)
+                            # Post-wgmma mask: only diagonal block.
+                            if is_causal:
+                                if n_idx == loop_range - 1:
+                                    for i, j in T.Parallel(half_m, block_n):
+                                        acc_s_2[i, j] = T.if_then_else(
+                                            row_base + half_m + i
+                                            >= n_idx * block_n + j,
+                                            acc_s_2[i, j],
+                                            -T.infinity(accum_dtype))
                             softmax_2(acc_s_2, sm_2, smp_2, ss_2, ssum_2, ls_2)
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(acc_o_2, num_regs=64)
