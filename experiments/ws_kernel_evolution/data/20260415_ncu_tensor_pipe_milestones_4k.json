@@ -1,0 +1,204 @@
+{
+  "study": "ws_kernel_evolution",
+  "kind": "ncu_tensor_pipe_profile",
+  "timestamp": "2026-04-15T21:05:06",
+  "shape": {
+    "shape_id": "canonical_4k",
+    "batch": 4,
+    "seq_len": 4096,
+    "heads": 64,
+    "heads_kv": 8,
+    "dim": 128,
+    "causal": true,
+    "dtype": "float16"
+  },
+  "variants": [
+    "pre_pr871_wgmma",
+    "pr871_base",
+    "pr871_reorder",
+    "anchor_causal"
+  ],
+  "metrics": [
+    "gpu__time_duration.sum",
+    "sm__pipe_tensor_cycles_active",
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "sm__inst_executed_pipe_tensor_op_gmma",
+    "sm__sass_inst_executed_op_shared_gmma"
+  ],
+  "environment": {
+    "python": "3.12.12 | packaged by Anaconda, Inc. | (main, Oct 21 2025, 20:16:04) [GCC 11.2.0]",
+    "python_executable": "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+    "cuda_visible_devices": "1",
+    "gpu_name_visible0": "NVIDIA H200",
+    "ncu": "NVIDIA (R) Nsight Compute Command Line Profiler\nCopyright (c) 2018-2025 NVIDIA Corporation\nVersion 2025.2.1.0 (build 35987062) (public-release)",
+    "tmpdir": "/home/ga/TileOPs/.tmp/ncu",
+    "base_repo": "/tmp/tileops-pr871-base",
+    "reorder_repo": "/tmp/tileops-pr871-reorder"
+  },
+  "results": [
+    {
+      "variant": "pre_pr871_wgmma",
+      "shape_id": "canonical_4k",
+      "status": "ok",
+      "returncode": 0,
+      "worker": {
+        "variant": "pre_pr871_wgmma",
+        "shape": {
+          "shape_id": "canonical_4k",
+          "batch": 4,
+          "seq_len": 4096,
+          "heads": 64,
+          "heads_kv": 8,
+          "dim": 128,
+          "causal": true,
+          "dtype": "float16"
+        },
+        "kernel_name": "GqaFwdWgmmaPipelinedKernel",
+        "median_ms": 3.4882240295410156,
+        "samples_ms": [
+          3.5521280765533447,
+          3.486975908279419,
+          3.4882240295410156,
+          3.490816116333008,
+          3.475775957107544
+        ]
+      },
+      "ncu": {
+        "kernel_names": [
+          "_gqa_fwd_wgmma_pipelined_main_kernel"
+        ],
+        "metrics": {
+          "gpu__time_duration.sum": 3981920.0,
+          "sm__inst_executed_pipe_tensor_op_gmma.sum": 17301504.0,
+          "sm__pipe_tensor_cycles_active.sum": 1107296256.0,
+          "sm__sass_inst_executed_op_shared_gmma.sum": 17301504.0,
+          "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": 35.22
+        }
+      },
+      "stderr": ""
+    },
+    {
+      "variant": "pr871_base",
+      "shape_id": "canonical_4k",
+      "status": "ok",
+      "returncode": 0,
+      "worker": {
+        "variant": "pr871_base",
+        "shape": {
+          "shape_id": "canonical_4k",
+          "batch": 4,
+          "seq_len": 4096,
+          "heads": 64,
+          "heads_kv": 8,
+          "dim": 128,
+          "causal": true,
+          "dtype": "float16"
+        },
+        "kernel_name": "GqaFwdWsPersistentKernel",
+        "median_ms": 2.1274240016937256,
+        "samples_ms": [
+          2.2046079635620117,
+          2.1255040168762207,
+          2.149535894393921,
+          2.126431941986084,
+          2.1274240016937256
+        ]
+      },
+      "ncu": {
+        "kernel_names": [
+          "_gqa_fwd_ws_persistent_main_kernel"
+        ],
+        "metrics": {
+          "gpu__time_duration.sum": 2347200.0,
+          "sm__inst_executed_pipe_tensor_op_gmma.sum": 17301504.0,
+          "sm__pipe_tensor_cycles_active.sum": 1107296256.0,
+          "sm__sass_inst_executed_op_shared_gmma.sum": 17301504.0,
+          "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": 60.03
+        }
+      },
+      "stderr": ""
+    },
+    {
+      "variant": "pr871_reorder",
+      "shape_id": "canonical_4k",
+      "status": "ok",
+      "returncode": 0,
+      "worker": {
+        "variant": "pr871_reorder",
+        "shape": {
+          "shape_id": "canonical_4k",
+          "batch": 4,
+          "seq_len": 4096,
+          "heads": 64,
+          "heads_kv": 8,
+          "dim": 128,
+          "causal": true,
+          "dtype": "float16"
+        },
+        "kernel_name": "GqaFwdWsPersistentKernel",
+        "median_ms": 2.0779199600219727,
+        "samples_ms": [
+          2.140064001083374,
+          2.073215961456299,
+          2.0819199085235596,
+          2.0625600814819336,
+          2.0779199600219727
+        ]
+      },
+      "ncu": {
+        "kernel_names": [
+          "_gqa_fwd_ws_persistent_main_kernel"
+        ],
+        "metrics": {
+          "gpu__time_duration.sum": 2296160.0,
+          "sm__inst_executed_pipe_tensor_op_gmma.sum": 17301504.0,
+          "sm__pipe_tensor_cycles_active.sum": 1107296256.0,
+          "sm__sass_inst_executed_op_shared_gmma.sum": 17301504.0,
+          "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": 61.41
+        }
+      },
+      "stderr": ""
+    },
+    {
+      "variant": "anchor_causal",
+      "shape_id": "canonical_4k",
+      "status": "ok",
+      "returncode": 0,
+      "worker": {
+        "variant": "anchor_causal",
+        "shape": {
+          "shape_id": "canonical_4k",
+          "batch": 4,
+          "seq_len": 4096,
+          "heads": 64,
+          "heads_kv": 8,
+          "dim": 128,
+          "causal": true,
+          "dtype": "float16"
+        },
+        "kernel_name": "anchor_causal",
+        "median_ms": 1.9472960233688354,
+        "samples_ms": [
+          1.9748480319976807,
+          1.9499520063400269,
+          1.9472960233688354,
+          1.9375040531158447,
+          1.944640040397644
+        ]
+      },
+      "ncu": {
+        "kernel_names": [
+          "main_kernel"
+        ],
+        "metrics": {
+          "gpu__time_duration.sum": 2149312.0,
+          "sm__inst_executed_pipe_tensor_op_gmma.sum": 17301504.0,
+          "sm__pipe_tensor_cycles_active.sum": 1107296256.0,
+          "sm__sass_inst_executed_op_shared_gmma.sum": 17301504.0,
+          "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": 65.42
+        }
+      },
+      "stderr": ""
+    }
+  ]
+}

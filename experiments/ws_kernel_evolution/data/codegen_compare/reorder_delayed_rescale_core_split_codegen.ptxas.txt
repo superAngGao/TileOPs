@@ -1,0 +1,98 @@
+/home/ga/anaconda3/envs/env_tilelang_20260119/lib/python3.12/site-packages/tilelang/src/tl_templates/cuda/instruction/../common.h(575): warning #20012-D: __device__ annotation is ignored on a function("float_e4m3_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                             ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/home/ga/anaconda3/envs/env_tilelang_20260119/lib/python3.12/site-packages/tilelang/src/tl_templates/cuda/instruction/../common.h(575): warning #20012-D: __host__ annotation is ignored on a function("float_e4m3_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                                                     ^
+
+/home/ga/anaconda3/envs/env_tilelang_20260119/lib/python3.12/site-packages/tilelang/src/tl_templates/cuda/instruction/../common.h(589): warning #20012-D: __device__ annotation is ignored on a function("float_e5m2_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                             ^
+
+/home/ga/anaconda3/envs/env_tilelang_20260119/lib/python3.12/site-packages/tilelang/src/tl_templates/cuda/instruction/../common.h(589): warning #20012-D: __host__ annotation is ignored on a function("float_e5m2_t") that is explicitly defaulted on its first declaration
+    __inline__ __attribute__((always_inline)) __attribute__((device)) __attribute__((host))
+                                                                                     ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(262): warning #1046-D: floating-point value cannot be represented exactly
+                  sm_1[i_5] = max(sm_1[i_5], -0x1.2ced32a16a1b1p+126f );
+                                              ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(266): warning #1046-D: floating-point value cannot be represented exactly
+                  ss_1[i_6] = exp2f(((smp_1[i_6] * 0x1.0527dbd5cafffp-3f ) - (sm_1[i_6] * 0x1.0527dbd5cafffp-3f )));
+                                                   ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(266): warning #1046-D: floating-point value cannot be represented exactly
+                  ss_1[i_6] = exp2f(((smp_1[i_6] * 0x1.0527dbd5cafffp-3f ) - (sm_1[i_6] * 0x1.0527dbd5cafffp-3f )));
+                                                                                          ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(270): warning #1046-D: floating-point value cannot be represented exactly
+                  acc_s_1[i_7] = exp2f(((acc_s_1[i_7] * 0x1.0527dbd5cafffp-3f ) - (sm_1[((i_7 & 3) >> 1)] * 0x1.0527dbd5cafffp-3f )));
+                                                        ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(270): warning #1046-D: floating-point value cannot be represented exactly
+                  acc_s_1[i_7] = exp2f(((acc_s_1[i_7] * 0x1.0527dbd5cafffp-3f ) - (sm_1[((i_7 & 3) >> 1)] * 0x1.0527dbd5cafffp-3f )));
+                                                                                                            ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(378): warning #1046-D: floating-point value cannot be represented exactly
+                  sm_1[i_14] = max(sm_1[i_14], -0x1.2ced32a16a1b1p+126f );
+                                                ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(382): warning #1046-D: floating-point value cannot be represented exactly
+                  ss_1[i_15] = exp2f(((smp_1[i_15] * 0x1.0527dbd5cafffp-3f ) - (sm_1[i_15] * 0x1.0527dbd5cafffp-3f )));
+                                                     ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(382): warning #1046-D: floating-point value cannot be represented exactly
+                  ss_1[i_15] = exp2f(((smp_1[i_15] * 0x1.0527dbd5cafffp-3f ) - (sm_1[i_15] * 0x1.0527dbd5cafffp-3f )));
+                                                                                             ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(386): warning #1046-D: floating-point value cannot be represented exactly
+                  acc_s_1[i_16] = exp2f(((acc_s_1[i_16] * 0x1.0527dbd5cafffp-3f ) - (sm_1[((i_16 & 3) >> 1)] * 0x1.0527dbd5cafffp-3f )));
+                                                          ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(386): warning #1046-D: floating-point value cannot be represented exactly
+                  acc_s_1[i_16] = exp2f(((acc_s_1[i_16] * 0x1.0527dbd5cafffp-3f ) - (sm_1[((i_16 & 3) >> 1)] * 0x1.0527dbd5cafffp-3f )));
+                                                                                                               ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(475): warning #1046-D: floating-point value cannot be represented exactly
+              ls_1[i_23] = (log2f(ls_1[i_23]) + (sm_1[i_23] * 0x1.0527dbd5cafffp-3f ));
+                                                              ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(601): warning #1046-D: floating-point value cannot be represented exactly
+                sm_2[i_30] = max(sm_2[i_30], -0x1.2ced32a16a1b1p+126f );
+                                              ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(605): warning #1046-D: floating-point value cannot be represented exactly
+                ss_2[i_31] = exp2f(((smp_2[i_31] * 0x1.0527dbd5cafffp-3f ) - (sm_2[i_31] * 0x1.0527dbd5cafffp-3f )));
+                                                   ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(605): warning #1046-D: floating-point value cannot be represented exactly
+                ss_2[i_31] = exp2f(((smp_2[i_31] * 0x1.0527dbd5cafffp-3f ) - (sm_2[i_31] * 0x1.0527dbd5cafffp-3f )));
+                                                                                           ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(609): warning #1046-D: floating-point value cannot be represented exactly
+                acc_s_2[i_32] = exp2f(((acc_s_2[i_32] * 0x1.0527dbd5cafffp-3f ) - (sm_2[((i_32 & 3) >> 1)] * 0x1.0527dbd5cafffp-3f )));
+                                                        ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(609): warning #1046-D: floating-point value cannot be represented exactly
+                acc_s_2[i_32] = exp2f(((acc_s_2[i_32] * 0x1.0527dbd5cafffp-3f ) - (sm_2[((i_32 & 3) >> 1)] * 0x1.0527dbd5cafffp-3f )));
+                                                                                                             ^
+
+/home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu(688): warning #1046-D: floating-point value cannot be represented exactly
+              ls_2[i_39] = (log2f(ls_2[i_39]) + (sm_2[i_39] * 0x1.0527dbd5cafffp-3f ));
+                                                              ^
+
+/home/ga/anaconda3/envs/env_tilelang_20260119/lib/python3.12/site-packages/tilelang/src/tl_templates/cuda/intrin.h(117): warning #179-D: right operand of "%" is zero
+                           (thread_extent / 32),
+                           ^
+          detected during instantiation of "__nv_bool tl::tl_shuffle_elect<thread_extent>() [with thread_extent=0]" at line 91 of /home/ga/TileOPs/experiments/ws_kernel_evolution/data/codegen_compare/reorder_delayed_rescale_core_split_codegen.cu
+
+ptxas info    : (C7514) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions reading accumulator registers of  a wgmma between start and end of the pipeline stage in the function 'main_kernel'
+ptxas info    : 11 bytes gmem
+ptxas info    : Compiling entry function 'main_kernel' for 'sm_90a'
+ptxas info    : Function properties for main_kernel
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 5 barriers, 1024 bytes smem
+ptxas info    : Compile time = 785.171 ms

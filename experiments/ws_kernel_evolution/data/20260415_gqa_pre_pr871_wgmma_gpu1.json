@@ -1,0 +1,218 @@
+{
+  "study": "ws_kernel_evolution",
+  "source": "bench_gqa_milestones.py",
+  "shape_set": "production_prefill",
+  "variants": [
+    "pre_pr871_wgmma"
+  ],
+  "environment": {
+    "timestamp": "2026-04-15T20:36:08",
+    "python": "3.12.12 | packaged by Anaconda, Inc. | (main, Oct 21 2025, 20:16:04) [GCC 11.2.0]",
+    "python_executable": "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+    "cuda_visible_devices": "1",
+    "gpu_count": 1,
+    "gpu_name_visible0": "NVIDIA H200",
+    "tilelang_cleanup_temp_files": "1",
+    "v2p_num_sms": null,
+    "base_repo": "/tmp/tileops-pr871-base",
+    "reorder_repo": "/tmp/tileops-pr871-reorder"
+  },
+  "results": [
+    {
+      "variant": "pre_pr871_wgmma",
+      "shape": {
+        "shape_id": "llama8b-1k",
+        "batch": 1,
+        "seq_len": 1024,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.12726399302482605,
+      "samples_ms": [
+        0.12726399302482605,
+        0.13327999413013458,
+        0.11577600240707397,
+        0.15488000214099884,
+        0.09440000355243683,
+        0.1305599957704544,
+        0.09667199850082397
+      ],
+      "tflops": 67.49697528604432,
+      "kernel_name": "GqaFwdWgmmaPipelinedKernel"
+    },
+    {
+      "variant": "pre_pr871_wgmma",
+      "shape": {
+        "shape_id": "llama8b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.5352960228919983,
+      "samples_ms": [
+        0.5583040118217468,
+        0.5544639825820923,
+        0.5401920080184937,
+        0.5348799824714661,
+        0.5348799824714661,
+        0.5352960228919983,
+        0.5293440222740173
+      ],
+      "tflops": 256.7531750553091,
+      "kernel_name": "GqaFwdWgmmaPipelinedKernel"
+    },
+    {
+      "variant": "pre_pr871_wgmma",
+      "shape": {
+        "shape_id": "llama8b-8k",
+        "batch": 1,
+        "seq_len": 8192,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 1.7506239414215088,
+      "samples_ms": [
+        1.7708799839019775,
+        1.79420804977417,
+        1.759168028831482,
+        1.7477439641952515,
+        1.7506239414215088,
+        1.748255968093872,
+        1.741919994354248
+      ],
+      "tflops": 314.034214247977,
+      "kernel_name": "GqaFwdWgmmaPipelinedKernel"
+    },
+    {
+      "variant": "pre_pr871_wgmma",
+      "shape": {
+        "shape_id": "llama8b-32k",
+        "batch": 1,
+        "seq_len": 32768,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 24.377151489257812,
+      "samples_ms": [
+        24.523168563842773,
+        24.437631607055664,
+        24.377151489257812,
+        24.331647872924805,
+        24.329919815063477,
+        24.34556770324707,
+        24.377567291259766
+      ],
+      "tflops": 360.833505345534,
+      "kernel_name": "GqaFwdWgmmaPipelinedKernel"
+    },
+    {
+      "variant": "pre_pr871_wgmma",
+      "shape": {
+        "shape_id": "llama8b-128k",
+        "batch": 1,
+        "seq_len": 131072,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 424.9382019042969,
+      "samples_ms": [
+        424.4488220214844,
+        426.5769958496094,
+        424.17730712890625,
+        424.9382019042969,
+        424.8341064453125,
+        425.2721862792969,
+        426.33013916015625
+      ],
+      "tflops": 331.1951896172998,
+      "kernel_name": "GqaFwdWgmmaPipelinedKernel"
+    },
+    {
+      "variant": "pre_pr871_wgmma",
+      "shape": {
+        "shape_id": "llama70b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 64,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.9462400078773499,
+      "samples_ms": [
+        0.9819200038909912,
+        0.9513279795646667,
+        0.9462400078773499,
+        0.9376959800720215,
+        0.9483519792556763,
+        0.933791995048523,
+        0.9319999814033508
+      ],
+      "tflops": 290.4949110750655,
+      "kernel_name": "GqaFwdWgmmaPipelinedKernel"
+    },
+    {
+      "variant": "pre_pr871_wgmma",
+      "shape": {
+        "shape_id": "llama405b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 128,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 1.7307519912719727,
+      "samples_ms": [
+        1.7568960189819336,
+        1.741760015487671,
+        1.7303040027618408,
+        1.7307519912719727,
+        1.7335360050201416,
+        1.728063941001892,
+        1.7267199754714966
+      ],
+      "tflops": 317.63985635167217,
+      "kernel_name": "GqaFwdWgmmaPipelinedKernel"
+    }
+  ]
+}

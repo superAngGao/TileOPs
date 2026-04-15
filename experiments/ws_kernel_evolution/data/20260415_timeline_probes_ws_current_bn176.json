@@ -1,0 +1,108 @@
+{
+  "study": "ws_kernel_evolution",
+  "kind": "timeline_probe_run",
+  "timestamp": "2026-04-15T17:20:38",
+  "milestone": "ws_current_bn176",
+  "milestone_spec": {
+    "milestone_id": "ws_current_bn176",
+    "label": "Current WS BN176 Reference",
+    "status": "implemented",
+    "description": "Current non-causal BN176 WS reference used for existing timeline analysis and split-barrier measurements.",
+    "repo_root": "/home/ga/TileOPs",
+    "kernel_entry": "_bench_clock_bn176.py instrumented kernel",
+    "default_shape": "B=4 S=4096 H=64 Hkv=8 D=128",
+    "causal": false,
+    "block_m": 128,
+    "block_n": 176,
+    "notes": "This is a framework bootstrap node, not one of the four blog milestones."
+  },
+  "requested_probes": [
+    "current_bn176_steady_state_regions",
+    "current_bn176_split_barrier"
+  ],
+  "probe_registry": {
+    "current_bn176_steady_state_regions": {
+      "probe_id": "current_bn176_steady_state_regions",
+      "label": "BN176 steady-state region cycles",
+      "status": "implemented",
+      "probe_kind": "steady_state_regions",
+      "script_path": "/home/ga/TileOPs/_bench_clock_bn176.py",
+      "parser": "region_cycles_table",
+      "description": "Measures WG1 steady-state region cycles: wgmma_issue, wait<1>, softmax, wait<0>.",
+      "milestones": [
+        "ws_current_bn176"
+      ],
+      "notes": null
+    },
+    "current_bn176_split_barrier": {
+      "probe_id": "current_bn176_split_barrier",
+      "label": "BN176 split barrier/scheduler",
+      "status": "implemented",
+      "probe_kind": "barrier_split",
+      "script_path": "/home/ga/TileOPs/_bench_split_barrier.py",
+      "parser": "split_barrier_summary",
+      "description": "Splits pre-QK rendezvous into barrier_wait(k_full), scheduler_sync, and inferred clear(acc_s).",
+      "milestones": [
+        "ws_current_bn176"
+      ],
+      "notes": null
+    }
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "1",
+    "TILELANG_CLEANUP_TEMP_FILES": "1",
+    "V2P_NUM_SMS": "132"
+  },
+  "results": [
+    {
+      "probe_id": "current_bn176_steady_state_regions",
+      "label": "BN176 steady-state region cycles",
+      "probe_kind": "steady_state_regions",
+      "status": "ok",
+      "description": "Measures WG1 steady-state region cycles: wgmma_issue, wait<1>, softmax, wait<0>.",
+      "milestones": [
+        "ws_current_bn176"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/_bench_clock_bn176.py"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel...\n\nRegion                   Cycles        %\n----------------------------------------\n  wgmma_issue              1021    30.0%\n  wait<1> (QK)              170     5.0%\n  softmax                  2207    64.8%\n  wait<0> (PV res)            6     0.2%\n  TOTAL                    3403   100.0%\n\nSamples: 24117248 (WG1 steady-state iters across all CTAs)\n\nInterpretation:\n  wait<0> residual \u2248 0 \u2192 PV finishes BEFORE softmax\n  \u2192 softmax is the bottleneck (PV is fully hidden)\n",
+      "stderr": "",
+      "parsed": {
+        "cycles": {
+          "wgmma_issue": 1021.0,
+          "wait<1> (QK)": 170.0,
+          "softmax": 2207.0,
+          "wait<0> (PV res)": 6.0
+        },
+        "total_cycles": 3403.0,
+        "samples": 24117248
+      }
+    },
+    {
+      "probe_id": "current_bn176_split_barrier",
+      "label": "BN176 split barrier/scheduler",
+      "probe_kind": "barrier_split",
+      "status": "ok",
+      "description": "Splits pre-QK rendezvous into barrier_wait(k_full), scheduler_sync, and inferred clear(acc_s).",
+      "milestones": [
+        "ws_current_bn176"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/_bench_split_barrier.py"
+      ],
+      "returncode": 0,
+      "stdout": "barrier_wait(k_full): 310 cycles\nscheduler_sync:       13 cycles\nsum:                  323 cycles\n(previous total barrier+sched+clear was 698)\nclear(acc_s) \u2248 698 - 323 = 375 cycles\n",
+      "stderr": "",
+      "parsed": {
+        "barrier_wait_k_full": 310.0,
+        "scheduler_sync": 13.0,
+        "sum_cycles": 323.0,
+        "clear_acc_s_inferred": 375.0
+      }
+    }
+  ]
+}

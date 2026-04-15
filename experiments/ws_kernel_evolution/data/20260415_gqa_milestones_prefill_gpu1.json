@@ -1,0 +1,732 @@
+{
+  "study": "ws_kernel_evolution",
+  "source": "bench_gqa_milestones.py",
+  "shape_set": "production_prefill",
+  "variants": [
+    "pr871_base",
+    "pr871_reorder",
+    "anchor_causal",
+    "fa3"
+  ],
+  "environment": {
+    "timestamp": "2026-04-15T17:13:23",
+    "python": "3.12.12 | packaged by Anaconda, Inc. | (main, Oct 21 2025, 20:16:04) [GCC 11.2.0]",
+    "python_executable": "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+    "cuda_visible_devices": "1",
+    "gpu_count": 1,
+    "gpu_name_visible0": "NVIDIA H200",
+    "tilelang_cleanup_temp_files": "1",
+    "v2p_num_sms": "132",
+    "base_repo": "/tmp/tileops-pr871-base",
+    "reorder_repo": "/tmp/tileops-pr871-reorder"
+  },
+  "results": [
+    {
+      "variant": "pr871_base",
+      "shape": {
+        "shape_id": "llama8b-1k",
+        "batch": 1,
+        "seq_len": 1024,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.06963200122117996,
+      "samples_ms": [
+        0.08659200370311737,
+        0.08150400221347809,
+        0.07158400118350983,
+        0.06729599833488464,
+        0.06963200122117996,
+        0.0663679987192154,
+        0.06499200314283371
+      ],
+      "tflops": 123.36188018946667,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "pr871_reorder",
+      "shape": {
+        "shape_id": "llama8b-1k",
+        "batch": 1,
+        "seq_len": 1024,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.0719040036201477,
+      "samples_ms": [
+        0.09967999905347824,
+        0.08470399677753448,
+        0.0719040036201477,
+        0.07478400319814682,
+        0.06630399823188782,
+        0.06886400282382965,
+        0.06268800050020218
+      ],
+      "tflops": 119.46392633960478,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-1k",
+        "batch": 1,
+        "seq_len": 1024,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "error",
+      "error": "ValueError: anchor_causal requires total_pairs >= NUM_SMS, got 128 < 132"
+    },
+    {
+      "variant": "fa3",
+      "shape": {
+        "shape_id": "llama8b-1k",
+        "batch": 1,
+        "seq_len": 1024,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.118367999792099,
+      "samples_ms": [
+        0.14963200688362122,
+        0.12912000715732574,
+        0.118367999792099,
+        0.1136000007390976,
+        0.1260800063610077,
+        0.10950399935245514,
+        0.11497599631547928
+      ],
+      "tflops": 72.56973681305185,
+      "kernel_name": "fa3"
+    },
+    {
+      "variant": "pr871_base",
+      "shape": {
+        "shape_id": "llama8b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.31648001074790955,
+      "samples_ms": [
+        0.3623040020465851,
+        0.33215999603271484,
+        0.3187519907951355,
+        0.3096959888935089,
+        0.31648001074790955,
+        0.3062080144882202,
+        0.3017280101776123
+      ],
+      "tflops": 434.27372599995346,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "pr871_reorder",
+      "shape": {
+        "shape_id": "llama8b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.3099200129508972,
+      "samples_ms": [
+        0.33184000849723816,
+        0.3213120102882385,
+        0.31539198756217957,
+        0.3099200129508972,
+        0.30636799335479736,
+        0.3028480112552643,
+        0.30297601222991943
+      ],
+      "tflops": 443.465887095763,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "error",
+      "error": "ModuleNotFoundError: No module named 'tileops.kernels.online_softmax'"
+    },
+    {
+      "variant": "fa3",
+      "shape": {
+        "shape_id": "llama8b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.27584001421928406,
+      "samples_ms": [
+        0.30272001028060913,
+        0.28332799673080444,
+        0.2781440019607544,
+        0.27584001421928406,
+        0.271232008934021,
+        0.2723200023174286,
+        0.27132800221443176
+      ],
+      "tflops": 498.25604113673074,
+      "kernel_name": "fa3"
+    },
+    {
+      "variant": "pr871_base",
+      "shape": {
+        "shape_id": "llama8b-8k",
+        "batch": 1,
+        "seq_len": 8192,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 1.032096028327942,
+      "samples_ms": [
+        1.0511679649353027,
+        1.0412160158157349,
+        1.0313600301742554,
+        1.0288000106811523,
+        1.032096028327942,
+        1.0334080457687378,
+        1.0281599760055542
+      ],
+      "tflops": 532.6595576369359,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "pr871_reorder",
+      "shape": {
+        "shape_id": "llama8b-8k",
+        "batch": 1,
+        "seq_len": 8192,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.9938240051269531,
+      "samples_ms": [
+        1.01254403591156,
+        0.9987199902534485,
+        0.9944959878921509,
+        0.9855679869651794,
+        0.9938240051269531,
+        0.9829440116882324,
+        0.9844800233840942
+      ],
+      "tflops": 553.1722025750154,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-8k",
+        "batch": 1,
+        "seq_len": 8192,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "error",
+      "error": "ModuleNotFoundError: No module named 'tileops.kernels.online_softmax'"
+    },
+    {
+      "variant": "fa3",
+      "shape": {
+        "shape_id": "llama8b-8k",
+        "batch": 1,
+        "seq_len": 8192,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.8370879888534546,
+      "samples_ms": [
+        0.8579840064048767,
+        0.8436800241470337,
+        0.8370879888534546,
+        0.8389120101928711,
+        0.8362560272216797,
+        0.8322240114212036,
+        0.830016016960144
+      ],
+      "tflops": 656.7479419230365,
+      "kernel_name": "fa3"
+    },
+    {
+      "variant": "pr871_base",
+      "shape": {
+        "shape_id": "llama8b-32k",
+        "batch": 1,
+        "seq_len": 32768,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 17.006336212158203,
+      "samples_ms": [
+        15.93769645690918,
+        16.063552856445312,
+        16.983104705810547,
+        17.006336212158203,
+        17.191936492919922,
+        17.166528701782227,
+        17.25939178466797
+      ],
+      "tflops": 517.2244575477391,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "pr871_reorder",
+      "shape": {
+        "shape_id": "llama8b-32k",
+        "batch": 1,
+        "seq_len": 32768,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 16.264223098754883,
+      "samples_ms": [
+        15.166463851928711,
+        16.019487380981445,
+        16.232479095458984,
+        16.28316879272461,
+        16.295455932617188,
+        16.2891845703125,
+        16.264223098754883
+      ],
+      "tflops": 540.8246658201208,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-32k",
+        "batch": 1,
+        "seq_len": 32768,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "error",
+      "error": "ModuleNotFoundError: No module named 'tileops.kernels.online_softmax'"
+    },
+    {
+      "variant": "fa3",
+      "shape": {
+        "shape_id": "llama8b-32k",
+        "batch": 1,
+        "seq_len": 32768,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 12.912575721740723,
+      "samples_ms": [
+        11.857728004455566,
+        11.831263542175293,
+        12.454912185668945,
+        12.912575721740723,
+        12.973407745361328,
+        12.974495887756348,
+        12.97276782989502
+      ],
+      "tflops": 681.203596537145,
+      "kernel_name": "fa3"
+    },
+    {
+      "variant": "pr871_base",
+      "shape": {
+        "shape_id": "llama8b-128k",
+        "batch": 1,
+        "seq_len": 131072,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 273.6085510253906,
+      "samples_ms": [
+        303.80938720703125,
+        272.3221130371094,
+        269.8245849609375,
+        286.6785888671875,
+        285.566650390625,
+        271.2529602050781,
+        273.6085510253906
+      ],
+      "tflops": 514.3753286507033,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "pr871_reorder",
+      "shape": {
+        "shape_id": "llama8b-128k",
+        "batch": 1,
+        "seq_len": 131072,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 267.2308044433594,
+      "samples_ms": [
+        293.9453125,
+        266.5270690917969,
+        263.86798095703125,
+        270.1622314453125,
+        281.8953857421875,
+        267.2308044433594,
+        264.0066833496094
+      ],
+      "tflops": 526.6514414327479,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-128k",
+        "batch": 1,
+        "seq_len": 131072,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "error",
+      "error": "ModuleNotFoundError: No module named 'tileops.kernels.online_softmax'"
+    },
+    {
+      "variant": "fa3",
+      "shape": {
+        "shape_id": "llama8b-128k",
+        "batch": 1,
+        "seq_len": 131072,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 216.14822387695312,
+      "samples_ms": [
+        210.4872283935547,
+        261.3581237792969,
+        216.14822387695312,
+        209.87484741210938,
+        208.9644775390625,
+        226.5937957763672,
+        236.9212188720703
+      ],
+      "tflops": 651.1156364414345,
+      "kernel_name": "fa3"
+    },
+    {
+      "variant": "pr871_base",
+      "shape": {
+        "shape_id": "llama70b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 64,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.5636159777641296,
+      "samples_ms": [
+        0.5873919725418091,
+        0.5729920268058777,
+        0.5636159777641296,
+        0.5577600002288818,
+        0.5532479882240295,
+        0.5498239994049072,
+        0.5676800012588501
+      ],
+      "tflops": 487.7042486170167,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "pr871_reorder",
+      "shape": {
+        "shape_id": "llama70b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 64,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.5575360059738159,
+      "samples_ms": [
+        0.5661759972572327,
+        0.5575360059738159,
+        0.5433599948883057,
+        0.5669440031051636,
+        0.5688639879226685,
+        0.5371519923210144,
+        0.5342079997062683
+      ],
+      "tflops": 493.0226998772692,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama70b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 64,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "error",
+      "error": "ModuleNotFoundError: No module named 'tileops.kernels.online_softmax'"
+    },
+    {
+      "variant": "fa3",
+      "shape": {
+        "shape_id": "llama70b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 64,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.46803200244903564,
+      "samples_ms": [
+        0.5209280252456665,
+        0.47571200132369995,
+        0.4710400104522705,
+        0.46803200244903564,
+        0.4636479914188385,
+        0.46617600321769714,
+        0.46492800116539
+      ],
+      "tflops": 587.3057942740393,
+      "kernel_name": "fa3"
+    },
+    {
+      "variant": "pr871_base",
+      "shape": {
+        "shape_id": "llama405b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 128,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 1.0463039875030518,
+      "samples_ms": [
+        1.065567970275879,
+        1.0548160076141357,
+        1.051967978477478,
+        1.0399359464645386,
+        1.043295979499817,
+        1.0370240211486816,
+        1.0463039875030518
+      ],
+      "tflops": 525.4264730462919,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "pr871_reorder",
+      "shape": {
+        "shape_id": "llama405b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 128,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 1.0164159536361694,
+      "samples_ms": [
+        1.0459200143814087,
+        1.0357760190963745,
+        1.0210239887237549,
+        1.0152640342712402,
+        1.0164159536361694,
+        1.0107200145721436,
+        1.0147199630737305
+      ],
+      "tflops": 540.8768053288422,
+      "kernel_name": "GqaFwdWsPersistentKernel"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama405b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 128,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "error",
+      "error": "ModuleNotFoundError: No module named 'tileops.kernels.online_softmax'"
+    },
+    {
+      "variant": "fa3",
+      "shape": {
+        "shape_id": "llama405b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 128,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.8598399758338928,
+      "samples_ms": [
+        0.8829119801521301,
+        0.8705919981002808,
+        0.8705599904060364,
+        0.8598399758338928,
+        0.8559359908103943,
+        0.8595200181007385,
+        0.8563519716262817
+      ],
+      "tflops": 639.369916890447,
+      "kernel_name": "fa3"
+    }
+  ]
+}

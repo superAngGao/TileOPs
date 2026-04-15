@@ -1,0 +1,207 @@
+{
+  "study": "ws_kernel_evolution",
+  "source": "bench_gqa_milestones.py",
+  "shape_set": "production_prefill",
+  "variants": [
+    "anchor_causal"
+  ],
+  "environment": {
+    "timestamp": "2026-04-15T17:15:16",
+    "python": "3.12.12 | packaged by Anaconda, Inc. | (main, Oct 21 2025, 20:16:04) [GCC 11.2.0]",
+    "python_executable": "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+    "cuda_visible_devices": "1",
+    "gpu_count": 1,
+    "gpu_name_visible0": "NVIDIA H200",
+    "tilelang_cleanup_temp_files": "1",
+    "v2p_num_sms": "132",
+    "base_repo": "/tmp/tileops-pr871-base",
+    "reorder_repo": "/tmp/tileops-pr871-reorder"
+  },
+  "results": [
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-1k",
+        "batch": 1,
+        "seq_len": 1024,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "error",
+      "error": "ValueError: anchor_causal requires total_pairs >= NUM_SMS, got 128 < 132"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.2630079984664917,
+      "samples_ms": [
+        0.27497598528862,
+        0.26841598749160767,
+        0.2630079984664917,
+        0.26262399554252625,
+        0.26150399446487427,
+        0.2632319927215576,
+        0.2619839906692505
+      ],
+      "tflops": 522.565679649892,
+      "kernel_name": "anchor_causal"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-8k",
+        "batch": 1,
+        "seq_len": 8192,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.9132159948348999,
+      "samples_ms": [
+        0.9200320243835449,
+        0.9166399836540222,
+        0.9108800292015076,
+        0.910975992679596,
+        0.9181439876556396,
+        0.9094399809837341,
+        0.9132159948348999
+      ],
+      "tflops": 601.9997645654358,
+      "kernel_name": "anchor_causal"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-32k",
+        "batch": 1,
+        "seq_len": 32768,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 15.407551765441895,
+      "samples_ms": [
+        14.05679988861084,
+        14.173600196838379,
+        15.232192039489746,
+        15.46560001373291,
+        15.40771198272705,
+        15.407551765441895,
+        15.412223815917969
+      ],
+      "tflops": 570.894919330211,
+      "kernel_name": "anchor_causal"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama8b-128k",
+        "batch": 1,
+        "seq_len": 131072,
+        "heads": 32,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 259.1798095703125,
+      "samples_ms": [
+        278.61328125,
+        260.5852355957031,
+        250.58489990234375,
+        250.4363250732422,
+        270.17120361328125,
+        259.1798095703125,
+        251.77337646484375
+      ],
+      "tflops": 543.0110030123606,
+      "kernel_name": "anchor_causal"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama70b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 64,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.48630398511886597,
+      "samples_ms": [
+        0.4973759949207306,
+        0.48771199584007263,
+        0.4849280118942261,
+        0.48713600635528564,
+        0.48601600527763367,
+        0.48630398511886597,
+        0.483487993478775
+      ],
+      "tflops": 565.2388533826478,
+      "kernel_name": "anchor_causal"
+    },
+    {
+      "variant": "anchor_causal",
+      "shape": {
+        "shape_id": "llama405b-4k",
+        "batch": 1,
+        "seq_len": 4096,
+        "heads": 128,
+        "heads_kv": 8,
+        "dim": 128,
+        "causal": true,
+        "dtype": "float16"
+      },
+      "warmup": 3,
+      "reps": 7,
+      "status": "ok",
+      "median_ms": 0.9440000057220459,
+      "samples_ms": [
+        0.953216016292572,
+        0.9525120258331299,
+        0.9467520117759705,
+        0.9440000057220459,
+        0.9427199959754944,
+        0.9429119825363159,
+        0.9435520172119141
+      ],
+      "tflops": 582.3684433852342,
+      "kernel_name": "anchor_causal"
+    }
+  ]
+}

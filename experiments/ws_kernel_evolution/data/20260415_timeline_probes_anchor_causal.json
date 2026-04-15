@@ -1,0 +1,228 @@
+{
+  "study": "ws_kernel_evolution",
+  "kind": "timeline_probe_run",
+  "timestamp": "2026-04-15T19:56:19",
+  "milestone": "anchor_causal",
+  "milestone_spec": {
+    "milestone_id": "anchor_causal",
+    "label": "Anchor Causal",
+    "status": "planned",
+    "description": "Anchor causal kernel with delayed rescale, anchored waits, and L2-friendly persistent ordering.",
+    "repo_root": "/home/ga/TileOPs",
+    "kernel_entry": "_test_ws_fa3_v2_persistent_anchor_causal.py:build_fa3_v2_persistent_causal",
+    "default_shape": "B=4 S=4096 H=64 Hkv=8 D=128",
+    "causal": true,
+    "block_m": 128,
+    "block_n": 128,
+    "notes": "Requires dedicated anchor-aware probes because wait semantics differ from plain wait_wgmma."
+  },
+  "requested_probes": [
+    "anchor_causal_steady_state_regions",
+    "anchor_causal_scheduler_split",
+    "anchor_causal_tail_split",
+    "anchor_causal_core_split",
+    "anchor_causal_total_cycle"
+  ],
+  "probe_registry": {
+    "anchor_causal_steady_state_regions": {
+      "probe_id": "anchor_causal_steady_state_regions",
+      "label": "Anchor causal steady-state region cycles",
+      "status": "implemented",
+      "probe_kind": "steady_state_regions",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_steady_state.py",
+      "script_args": null,
+      "parser": "region_cycles_table",
+      "description": "Anchor-aware clock probe for delayed rescale and wait_wgmma_anchor<1/0>.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "notes": "Measures WG1 steady-state with anchor-specific wait placement; delayed rescale is outside the measured region table."
+    },
+    "anchor_causal_scheduler_split": {
+      "probe_id": "anchor_causal_scheduler_split",
+      "label": "Anchor causal scheduler split",
+      "status": "implemented",
+      "probe_kind": "scheduler_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_scheduler_split.py",
+      "script_args": null,
+      "parser": "split_barrier_summary",
+      "description": "Split probe for named-barrier handoff cost in the anchor kernel.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "notes": "Reports barrier_wait(k_full), named-barrier scheduler sync, and zero explicit clear(acc_s) front-end cost."
+    },
+    "anchor_causal_tail_split": {
+      "probe_id": "anchor_causal_tail_split",
+      "label": "Anchor causal tail split",
+      "status": "implemented",
+      "probe_kind": "tail_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_tail_split.py",
+      "script_args": null,
+      "parser": "tail_split_summary",
+      "description": "Split probe for the post-wait<0> tail in the anchor kernel: v_empty handoff, delayed rescale, and acc_s cast copy.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "notes": "Measures WG1 steady-state tail after wait_wgmma_anchor<0> without perturbing the main steady-state region probe."
+    },
+    "anchor_causal_core_split": {
+      "probe_id": "anchor_causal_core_split",
+      "label": "Anchor causal detailed core split",
+      "status": "implemented",
+      "probe_kind": "core_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_core_split.py",
+      "script_args": null,
+      "parser": "named_cycle_summary",
+      "description": "Detailed anchor WG1 steady-state core split with explicit QK issue, wait(v_full), PV issue, post-wait<1> preamble, softmax core, and wait<0> fence.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "notes": "Uses rescale_before_pv=0 to make the delayed-rescale design visible without mixing it back into the core window."
+    },
+    "anchor_causal_total_cycle": {
+      "probe_id": "anchor_causal_total_cycle",
+      "label": "Anchor causal steady-state total cycle",
+      "status": "implemented",
+      "probe_kind": "total_cycle",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_total_cycle.py",
+      "script_args": null,
+      "parser": "total_cycle_summary",
+      "description": "Directly measured WG1 steady-state total cycle count for anchor causal.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "notes": "Measures from pre-k_full wait to post-delayed-rescale tail for n_idx > 0."
+    }
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "1",
+    "TILELANG_CLEANUP_TEMP_FILES": null,
+    "V2P_NUM_SMS": "132"
+  },
+  "results": [
+    {
+      "probe_id": "anchor_causal_steady_state_regions",
+      "label": "Anchor causal steady-state region cycles",
+      "probe_kind": "steady_state_regions",
+      "status": "ok",
+      "description": "Anchor-aware clock probe for delayed rescale and wait_wgmma_anchor<1/0>.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_steady_state.py"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (anchor_causal)...\n\nRegion                   Cycles        %\n----------------------------------------\n  wgmma_issue               999    39.6%\n  wait<1> (QK)               59     2.3%\n  softmax                  1435    56.9%\n  wait<0> (PV res)           29     1.1%\n  TOTAL                    2522   100.0%\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "cycles": {
+          "wgmma_issue": 999.0,
+          "wait<1> (QK)": 59.0,
+          "softmax": 1435.0,
+          "wait<0> (PV res)": 29.0
+        },
+        "total_cycles": 2522.0,
+        "samples": 16252928
+      }
+    },
+    {
+      "probe_id": "anchor_causal_scheduler_split",
+      "label": "Anchor causal scheduler split",
+      "probe_kind": "scheduler_split",
+      "status": "ok",
+      "description": "Split probe for named-barrier handoff cost in the anchor kernel.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_scheduler_split.py"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (anchor_causal scheduler split)...\nbarrier_wait(k_full): 127 cycles\nscheduler_sync:       11 cycles\nsum:                  138 cycles\nclear(acc_s) \u2248 0 cycles (handled by clear_accum=True on QK issue)\n",
+      "stderr": "",
+      "parsed": {
+        "barrier_wait_k_full": 127.0,
+        "scheduler_sync": 11.0,
+        "sum_cycles": 138.0,
+        "clear_acc_s_inferred": 0.0
+      }
+    },
+    {
+      "probe_id": "anchor_causal_tail_split",
+      "label": "Anchor causal tail split",
+      "probe_kind": "tail_split",
+      "status": "ok",
+      "description": "Split probe for the post-wait<0> tail in the anchor kernel: v_empty handoff, delayed rescale, and acc_s cast copy.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_tail_split.py"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (anchor_causal tail split)...\nv_empty_handoff:    32 cycles\ndelayed_rescale:    88 cycles\nacc_s_cast_copy:    111 cycles\nsum:                232 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "v_empty_handoff": 32.0,
+        "delayed_rescale": 88.0,
+        "acc_s_cast_copy": 111.0,
+        "sum_cycles": 232.0
+      }
+    },
+    {
+      "probe_id": "anchor_causal_core_split",
+      "label": "Anchor causal detailed core split",
+      "probe_kind": "core_split",
+      "status": "ok",
+      "description": "Detailed anchor WG1 steady-state core split with explicit QK issue, wait(v_full), PV issue, post-wait<1> preamble, softmax core, and wait<0> fence.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_core_split.py"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (anchor_causal core split)...\nqk_issue: 1079 cycles\nrescale_before_pv: 0 cycles\nwait_v_full: 82 cycles\npv_issue: 937 cycles\nwait1_fence: 31 cycles\npost_wait1_preamble: 78 cycles\nsoftmax_core: 1030 cycles\nwait0_fence: 25 cycles\nsum_cycles: 3262 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "qk_issue": 1079.0,
+        "rescale_before_pv": 0.0,
+        "wait_v_full": 82.0,
+        "pv_issue": 937.0,
+        "wait1_fence": 31.0,
+        "post_wait1_preamble": 78.0,
+        "softmax_core": 1030.0,
+        "wait0_fence": 25.0,
+        "sum_cycles": 3262.0,
+        "samples": 16252928
+      }
+    },
+    {
+      "probe_id": "anchor_causal_total_cycle",
+      "label": "Anchor causal steady-state total cycle",
+      "probe_kind": "total_cycle",
+      "status": "ok",
+      "description": "Directly measured WG1 steady-state total cycle count for anchor causal.",
+      "milestones": [
+        "anchor_causal"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_anchor_causal_total_cycle.py"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (anchor_causal total cycle)...\nsteady_iter_total:  2665 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "steady_iter_total": 2665.0,
+        "samples": 16252928
+      }
+    }
+  ]
+}

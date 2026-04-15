@@ -1,0 +1,67 @@
+{
+  "study": "ws_kernel_evolution",
+  "kind": "timeline_probe_run",
+  "timestamp": "2026-04-15T20:49:08",
+  "milestone": "pre_pr871",
+  "milestone_spec": {
+    "milestone_id": "pre_pr871",
+    "label": "Pre-PR-871 WGMMA",
+    "status": "partial",
+    "description": "Hopper GQA WGMMA-pipelined kernel before warp-specialized producer/consumer pipeline was introduced.",
+    "repo_root": "/home/ga/TileOPs",
+    "kernel_entry": "tileops.kernels.flash_attn.fwd:GqaFwdWgmmaPipelinedKernel",
+    "default_shape": "B=4 S=4096 H=64 Hkv=8 D=128",
+    "causal": true,
+    "block_m": 128,
+    "block_n": 128,
+    "notes": "Use this as the pre-WS milestone. Performance harness exists and a coarse tile-timing probe is available; fine-grained in-loop timing currently hits a TileLang/TVM WgmmaSyncRewriter crash."
+  },
+  "requested_probes": [
+    "pre_pr871_coarse_total"
+  ],
+  "probe_registry": {
+    "pre_pr871_coarse_total": {
+      "probe_id": "pre_pr871_coarse_total",
+      "label": "Pre-PR871 coarse tile timing",
+      "status": "implemented",
+      "probe_kind": "coarse_total",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pre_pr871_wgmma_total_cycle.py",
+      "script_args": null,
+      "parser": "named_cycle_summary",
+      "description": "Coarse timing for the pre-WS WGMMA-pipelined kernel: software-pipelined loop body total and epilogue total on the last causal tile.",
+      "milestones": [
+        "pre_pr871"
+      ],
+      "notes": "This milestone does not share the WS producer/consumer schedule vocabulary. Fine-grained in-loop clocking currently crashes in WgmmaSyncRewriter, so we start from coarse boundaries."
+    }
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "1",
+    "TILELANG_CLEANUP_TEMP_FILES": null,
+    "V2P_NUM_SMS": null
+  },
+  "results": [
+    {
+      "probe_id": "pre_pr871_coarse_total",
+      "label": "Pre-PR871 coarse tile timing",
+      "probe_kind": "coarse_total",
+      "status": "ok",
+      "description": "Coarse timing for the pre-WS WGMMA-pipelined kernel: software-pipelined loop body total and epilogue total on the last causal tile.",
+      "milestones": [
+        "pre_pr871"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pre_pr871_wgmma_total_cycle.py"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (pre_pr871_wgmma total cycle)...\nPre-PR871 WGMMA coarse timing\n  loop_body_total: 174390.0 cycles\n  epilogue_total: 787.6 cycles\nSamples: 256\n",
+      "stderr": "",
+      "parsed": {
+        "loop_body_total": 174390.0,
+        "epilogue_total": 787.6,
+        "samples": 256
+      }
+    }
+  ]
+}

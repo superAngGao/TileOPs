@@ -1,0 +1,252 @@
+{
+  "study": "ws_kernel_evolution",
+  "kind": "timeline_probe_run",
+  "timestamp": "2026-04-15T19:54:36",
+  "milestone": "pr871_base",
+  "milestone_spec": {
+    "milestone_id": "pr871_base",
+    "label": "PR 871 Base",
+    "status": "planned",
+    "description": "Persistent causal kernel from PR 871 before our locality reorder.",
+    "repo_root": "/tmp/tileops-pr871-base",
+    "kernel_entry": "tileops.kernels.flash_attn.fwd:GqaFwdWsPersistentKernel",
+    "default_shape": "B=4 S=4096 H=64 Hkv=8 D=128",
+    "causal": true,
+    "block_m": 128,
+    "block_n": 128,
+    "notes": "Performance harness exists; timeline probes still need milestone-specific instrumented scripts."
+  },
+  "requested_probes": [
+    "pr871_base_steady_state_regions",
+    "pr871_base_scheduler_split",
+    "pr871_base_tail_split",
+    "pr871_base_core_split",
+    "pr871_base_total_cycle"
+  ],
+  "probe_registry": {
+    "pr871_base_steady_state_regions": {
+      "probe_id": "pr871_base_steady_state_regions",
+      "label": "PR 871 steady-state region cycles",
+      "status": "implemented",
+      "probe_kind": "steady_state_regions",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_base_steady_state.py",
+      "script_args": [
+        "--variant",
+        "base"
+      ],
+      "parser": "region_cycles_table",
+      "description": "PR 871-specific clock probe for QK/PV/softmax overlap in the persistent causal kernel.",
+      "milestones": [
+        "pr871_base"
+      ],
+      "notes": "Derived from the PR 871 base persistent kernel schedule with WG1 steady-state timestamps."
+    },
+    "pr871_base_scheduler_split": {
+      "probe_id": "pr871_base_scheduler_split",
+      "label": "PR 871 front-end split",
+      "status": "implemented",
+      "probe_kind": "scheduler_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_frontend_split.py",
+      "script_args": [
+        "--variant",
+        "base"
+      ],
+      "parser": "split_barrier_summary",
+      "description": "PR 871 front-end split into barrier_wait(k_full), scheduler sync, and clear(acc_s).",
+      "milestones": [
+        "pr871_base"
+      ],
+      "notes": "Measures WG1 front-end directly before QK issue."
+    },
+    "pr871_base_tail_split": {
+      "probe_id": "pr871_base_tail_split",
+      "label": "PR 871 tail split",
+      "status": "implemented",
+      "probe_kind": "tail_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_tail_split.py",
+      "script_args": [
+        "--variant",
+        "base"
+      ],
+      "parser": "tail_split_summary",
+      "description": "PR 871 tail split after wait<0>: v_empty handoff and acc_s cast copy.",
+      "milestones": [
+        "pr871_base"
+      ],
+      "notes": "Measures WG1 steady-state tail without perturbing the main steady-state region probe."
+    },
+    "pr871_base_core_split": {
+      "probe_id": "pr871_base_core_split",
+      "label": "PR 871 detailed core split",
+      "status": "implemented",
+      "probe_kind": "core_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_core_split.py",
+      "script_args": [
+        "--variant",
+        "base"
+      ],
+      "parser": "named_cycle_summary",
+      "description": "Detailed PR 871 WG1 steady-state core split for QK issue, rescale, wait(v_full), PV issue, post-wait<1> preamble, softmax core, and wait<0> fence.",
+      "milestones": [
+        "pr871_base"
+      ],
+      "notes": "Introduced to remove ambiguity in the old merged 'issue' and 'softmax' interval labels."
+    },
+    "pr871_base_total_cycle": {
+      "probe_id": "pr871_base_total_cycle",
+      "label": "PR 871 steady-state total cycle",
+      "status": "implemented",
+      "probe_kind": "total_cycle",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_total_cycle.py",
+      "script_args": [
+        "--variant",
+        "base"
+      ],
+      "parser": "total_cycle_summary",
+      "description": "Directly measured WG1 steady-state total cycle count for PR 871 base.",
+      "milestones": [
+        "pr871_base"
+      ],
+      "notes": "Measures from pre-k_full wait to post-tail copy for n_idx > 0."
+    }
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "1",
+    "TILELANG_CLEANUP_TEMP_FILES": null,
+    "V2P_NUM_SMS": null
+  },
+  "results": [
+    {
+      "probe_id": "pr871_base_steady_state_regions",
+      "label": "PR 871 steady-state region cycles",
+      "probe_kind": "steady_state_regions",
+      "status": "ok",
+      "description": "PR 871-specific clock probe for QK/PV/softmax overlap in the persistent causal kernel.",
+      "milestones": [
+        "pr871_base"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_base_steady_state.py",
+        "--variant",
+        "base"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (base)...\n\nRegion                   Cycles        %\n----------------------------------------\n  wgmma_issue               660    31.2%\n  wait<1> (QK)               57     2.7%\n  softmax                  1391    65.8%\n  wait<0> (PV res)            6     0.3%\n  TOTAL                    2113   100.0%\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "cycles": {
+          "wgmma_issue": 660.0,
+          "wait<1> (QK)": 57.0,
+          "softmax": 1391.0,
+          "wait<0> (PV res)": 6.0
+        },
+        "total_cycles": 2113.0,
+        "samples": 16252928
+      }
+    },
+    {
+      "probe_id": "pr871_base_scheduler_split",
+      "label": "PR 871 front-end split",
+      "probe_kind": "scheduler_split",
+      "status": "ok",
+      "description": "PR 871 front-end split into barrier_wait(k_full), scheduler sync, and clear(acc_s).",
+      "milestones": [
+        "pr871_base"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_frontend_split.py",
+        "--variant",
+        "base"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (base scheduler split)...\nbarrier_wait(k_full): 493 cycles\nscheduler_sync:       66 cycles\nclear(acc_s):        14 cycles\nsum:                  573 cycles\n",
+      "stderr": "",
+      "parsed": {
+        "barrier_wait_k_full": 493.0,
+        "scheduler_sync": 66.0,
+        "sum_cycles": 573.0,
+        "clear_acc_s_inferred": 14.0
+      }
+    },
+    {
+      "probe_id": "pr871_base_tail_split",
+      "label": "PR 871 tail split",
+      "probe_kind": "tail_split",
+      "status": "ok",
+      "description": "PR 871 tail split after wait<0>: v_empty handoff and acc_s cast copy.",
+      "milestones": [
+        "pr871_base"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_tail_split.py",
+        "--variant",
+        "base"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (base tail split)...\nv_empty_handoff:    18 cycles\nacc_s_cast_copy:    116 cycles\nsum:                134 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "v_empty_handoff": 18.0,
+        "acc_s_cast_copy": 116.0,
+        "sum_cycles": 134.0
+      }
+    },
+    {
+      "probe_id": "pr871_base_core_split",
+      "label": "PR 871 detailed core split",
+      "probe_kind": "core_split",
+      "status": "ok",
+      "description": "Detailed PR 871 WG1 steady-state core split for QK issue, rescale, wait(v_full), PV issue, post-wait<1> preamble, softmax core, and wait<0> fence.",
+      "milestones": [
+        "pr871_base"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_core_split.py",
+        "--variant",
+        "base"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (base core split)...\nqk_issue: 198 cycles\nrescale_before_pv: 140 cycles\nwait_v_full: 100 cycles\npv_issue: 215 cycles\nwait1_fence: 58 cycles\npost_wait1_preamble: 81 cycles\nsoftmax_core: 1309 cycles\nwait0_fence: 6 cycles\nsum_cycles: 2106 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "qk_issue": 198.0,
+        "rescale_before_pv": 140.0,
+        "wait_v_full": 100.0,
+        "pv_issue": 215.0,
+        "wait1_fence": 58.0,
+        "post_wait1_preamble": 81.0,
+        "softmax_core": 1309.0,
+        "wait0_fence": 6.0,
+        "sum_cycles": 2106.0,
+        "samples": 16252928
+      }
+    },
+    {
+      "probe_id": "pr871_base_total_cycle",
+      "label": "PR 871 steady-state total cycle",
+      "probe_kind": "total_cycle",
+      "status": "ok",
+      "description": "Directly measured WG1 steady-state total cycle count for PR 871 base.",
+      "milestones": [
+        "pr871_base"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_total_cycle.py",
+        "--variant",
+        "base"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (base total cycle)...\nsteady_iter_total:  2915 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "steady_iter_total": 2915.0,
+        "samples": 16252928
+      }
+    }
+  ]
+}

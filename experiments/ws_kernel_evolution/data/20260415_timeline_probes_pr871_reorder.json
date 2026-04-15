@@ -1,0 +1,252 @@
+{
+  "study": "ws_kernel_evolution",
+  "kind": "timeline_probe_run",
+  "timestamp": "2026-04-15T19:55:29",
+  "milestone": "pr871_reorder",
+  "milestone_spec": {
+    "milestone_id": "pr871_reorder",
+    "label": "PR 871 + Reorder",
+    "status": "planned",
+    "description": "PR 871 persistent kernel with KV-head-friendly persistent ordering.",
+    "repo_root": "/tmp/tileops-pr871-reorder",
+    "kernel_entry": "tileops.kernels.flash_attn.fwd:GqaFwdWsPersistentKernel",
+    "default_shape": "B=4 S=4096 H=64 Hkv=8 D=128",
+    "causal": true,
+    "block_m": 128,
+    "block_n": 128,
+    "notes": "Needs instrumented probes for delayed handoff and steady-state split timings."
+  },
+  "requested_probes": [
+    "pr871_reorder_steady_state_regions",
+    "pr871_reorder_scheduler_split",
+    "pr871_reorder_tail_split",
+    "pr871_reorder_core_split",
+    "pr871_reorder_total_cycle"
+  ],
+  "probe_registry": {
+    "pr871_reorder_steady_state_regions": {
+      "probe_id": "pr871_reorder_steady_state_regions",
+      "label": "PR 871 reorder steady-state region cycles",
+      "status": "implemented",
+      "probe_kind": "steady_state_regions",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_base_steady_state.py",
+      "script_args": [
+        "--variant",
+        "reorder"
+      ],
+      "parser": "region_cycles_table",
+      "description": "Reorder-specific clock probe for steady-state overlap using the same instrumented harness as PR 871 base.",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "notes": "Shares the same instrumented harness as PR 871 base, differing only in persistent tile ordering."
+    },
+    "pr871_reorder_scheduler_split": {
+      "probe_id": "pr871_reorder_scheduler_split",
+      "label": "PR 871 reorder front-end split",
+      "status": "implemented",
+      "probe_kind": "scheduler_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_frontend_split.py",
+      "script_args": [
+        "--variant",
+        "reorder"
+      ],
+      "parser": "split_barrier_summary",
+      "description": "PR 871 reorder front-end split into barrier_wait(k_full), scheduler sync, and clear(acc_s).",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "notes": "Same probe as PR 871 base with reordered persistent tile traversal."
+    },
+    "pr871_reorder_tail_split": {
+      "probe_id": "pr871_reorder_tail_split",
+      "label": "PR 871 reorder tail split",
+      "status": "implemented",
+      "probe_kind": "tail_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_tail_split.py",
+      "script_args": [
+        "--variant",
+        "reorder"
+      ],
+      "parser": "tail_split_summary",
+      "description": "PR 871 reorder tail split after wait<0>: v_empty handoff and acc_s cast copy.",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "notes": "Same tail probe as PR 871 base with reordered persistent tile traversal."
+    },
+    "pr871_reorder_core_split": {
+      "probe_id": "pr871_reorder_core_split",
+      "label": "PR 871 reorder detailed core split",
+      "status": "implemented",
+      "probe_kind": "core_split",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_core_split.py",
+      "script_args": [
+        "--variant",
+        "reorder"
+      ],
+      "parser": "named_cycle_summary",
+      "description": "Detailed reorder WG1 steady-state core split using the same instrumented harness as PR 871 base.",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "notes": "Lets us compare QK/PV launch, preamble, and softmax-core pieces without the old merged labels."
+    },
+    "pr871_reorder_total_cycle": {
+      "probe_id": "pr871_reorder_total_cycle",
+      "label": "PR 871 reorder steady-state total cycle",
+      "status": "implemented",
+      "probe_kind": "total_cycle",
+      "script_path": "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_total_cycle.py",
+      "script_args": [
+        "--variant",
+        "reorder"
+      ],
+      "parser": "total_cycle_summary",
+      "description": "Directly measured WG1 steady-state total cycle count for PR 871 reorder.",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "notes": "Measures from pre-k_full wait to post-tail copy for n_idx > 0."
+    }
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "1",
+    "TILELANG_CLEANUP_TEMP_FILES": null,
+    "V2P_NUM_SMS": null
+  },
+  "results": [
+    {
+      "probe_id": "pr871_reorder_steady_state_regions",
+      "label": "PR 871 reorder steady-state region cycles",
+      "probe_kind": "steady_state_regions",
+      "status": "ok",
+      "description": "Reorder-specific clock probe for steady-state overlap using the same instrumented harness as PR 871 base.",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_base_steady_state.py",
+        "--variant",
+        "reorder"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (reorder)...\n\nRegion                   Cycles        %\n----------------------------------------\n  wgmma_issue               682    31.1%\n  wait<1> (QK)               77     3.5%\n  softmax                  1419    64.7%\n  wait<0> (PV res)           16     0.7%\n  TOTAL                    2194   100.0%\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "cycles": {
+          "wgmma_issue": 682.0,
+          "wait<1> (QK)": 77.0,
+          "softmax": 1419.0,
+          "wait<0> (PV res)": 16.0
+        },
+        "total_cycles": 2194.0,
+        "samples": 16252928
+      }
+    },
+    {
+      "probe_id": "pr871_reorder_scheduler_split",
+      "label": "PR 871 reorder front-end split",
+      "probe_kind": "scheduler_split",
+      "status": "ok",
+      "description": "PR 871 reorder front-end split into barrier_wait(k_full), scheduler sync, and clear(acc_s).",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_frontend_split.py",
+        "--variant",
+        "reorder"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (reorder scheduler split)...\nbarrier_wait(k_full): 429 cycles\nscheduler_sync:       68 cycles\nclear(acc_s):        16 cycles\nsum:                  513 cycles\n",
+      "stderr": "",
+      "parsed": {
+        "barrier_wait_k_full": 429.0,
+        "scheduler_sync": 68.0,
+        "sum_cycles": 513.0,
+        "clear_acc_s_inferred": 16.0
+      }
+    },
+    {
+      "probe_id": "pr871_reorder_tail_split",
+      "label": "PR 871 reorder tail split",
+      "probe_kind": "tail_split",
+      "status": "ok",
+      "description": "PR 871 reorder tail split after wait<0>: v_empty handoff and acc_s cast copy.",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_tail_split.py",
+        "--variant",
+        "reorder"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (reorder tail split)...\nv_empty_handoff:    19 cycles\nacc_s_cast_copy:    123 cycles\nsum:                142 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "v_empty_handoff": 19.0,
+        "acc_s_cast_copy": 123.0,
+        "sum_cycles": 142.0
+      }
+    },
+    {
+      "probe_id": "pr871_reorder_core_split",
+      "label": "PR 871 reorder detailed core split",
+      "probe_kind": "core_split",
+      "status": "ok",
+      "description": "Detailed reorder WG1 steady-state core split using the same instrumented harness as PR 871 base.",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_core_split.py",
+        "--variant",
+        "reorder"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (reorder core split)...\nqk_issue: 200 cycles\nrescale_before_pv: 137 cycles\nwait_v_full: 98 cycles\npv_issue: 216 cycles\nwait1_fence: 59 cycles\npost_wait1_preamble: 83 cycles\nsoftmax_core: 1313 cycles\nwait0_fence: 6 cycles\nsum_cycles: 2111 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "qk_issue": 200.0,
+        "rescale_before_pv": 137.0,
+        "wait_v_full": 98.0,
+        "pv_issue": 216.0,
+        "wait1_fence": 59.0,
+        "post_wait1_preamble": 83.0,
+        "softmax_core": 1313.0,
+        "wait0_fence": 6.0,
+        "sum_cycles": 2111.0,
+        "samples": 16252928
+      }
+    },
+    {
+      "probe_id": "pr871_reorder_total_cycle",
+      "label": "PR 871 reorder steady-state total cycle",
+      "probe_kind": "total_cycle",
+      "status": "ok",
+      "description": "Directly measured WG1 steady-state total cycle count for PR 871 reorder.",
+      "milestones": [
+        "pr871_reorder"
+      ],
+      "command": [
+        "/home/ga/anaconda3/envs/env_tilelang_20260119/bin/python",
+        "/home/ga/TileOPs/experiments/ws_kernel_evolution/scripts/bench_timeline_pr871_total_cycle.py",
+        "--variant",
+        "reorder"
+      ],
+      "returncode": 0,
+      "stdout": "Building kernel (reorder total cycle)...\nsteady_iter_total:  2841 cycles\n\nSamples: 16252928 (WG1 steady-state iters across all persistent tiles)\n",
+      "stderr": "",
+      "parsed": {
+        "steady_iter_total": 2841.0,
+        "samples": 16252928
+      }
+    }
+  ]
+}
