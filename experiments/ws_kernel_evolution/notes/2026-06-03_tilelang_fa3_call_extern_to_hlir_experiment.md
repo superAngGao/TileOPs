@@ -3510,6 +3510,375 @@ latency <= 1.15x M4 baseline
 这是第一个真正有意义的 performance gate，因为它开始恢复 FA3 producer 的
 load/compute overlap。
 
+B3-0a 更新（2026-06-04）：
+
+新增独立入口：
+
+```text
+--producer-tma-hlir-exact-order-shadow-probe
+```
+
+当前实现是 standalone shadow skeleton，不接入真实 FA3 output path，也不分配
+FA3 `SharedStorage`。这样可以在一个 384-thread CTA 内容纳：
+
+```text
+Q stage
+K stage ping-pong
+Vt stage ping-pong
+V stage ping-pong
+```
+
+默认只验 exact ordering / barrier parity / stage reuse，不打开内容 checker：
+
+```text
+--producer-tma-hlir-exact-order-shadow-checks none
+```
+
+强检查使用：
+
+```text
+--producer-tma-hlir-exact-order-shadow-checks all
+```
+
+`all` 不是把四类 checker 全部塞进同一个 CTA，而是按 `bidh % 4` 分发：
+
+```text
+0 -> q
+1 -> k
+2 -> vt
+3 -> v layout-only
+```
+
+这样 `H=8, HKV=2` 会覆盖两组 `q/k/vt/v`，同时避免 monolithic all-check
+带来的组合副作用。
+
+事件 trace 约定：
+
+```text
+1: initial Vt(last)
+2: initial K(last)
+3: Q(tile_m)
+4: loop Vt(next)
+5: loop K(next)
+6: loop Vt->V(previous)
+7: tail Vt->V(last)
+```
+
+通过命令：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-exact-order-shadow-probe \
+  --producer-tma-hlir-exact-order-shadow-checks all \
+  --warmup 1 --repeat 1
+```
+
+通过 trace：
+
+```text
+exact_order_shadow_status [1]
+[[1, 3, 0, 0],
+ [2, 3, 0, 0],
+ [3, 0, 0, 0],
+ [4, 2, 1, 0],
+ [5, 2, 1, 0],
+ [6, 3, 0, 1],
+ [4, 1, 0, 1],
+ [5, 1, 0, 1],
+ [6, 2, 1, 0],
+ [4, 0, 1, 0],
+ [5, 0, 1, 0],
+ [6, 1, 0, 1],
+ [7, 0, 1, 0]]
+```
+
+已验证：
+
+```text
+S=896, H=1, HKV=1, checks=all 通过（只覆盖 q；单项 k/vt/v 另测）
+S=896, H=4, HKV=2, checks=all 通过（分发式 all）
+S=896, H=8, HKV=2, checks=all 通过（分发式 all，目标 GQA 形态）
+B2b PV correctness: S=224, H=4, HKV=4 通过
+```
+
+定位记录：
+
+- `checks=none` 在 `H=8, HKV=2` 通过，说明 exact-order barrier/parity skeleton
+  能覆盖目标 GQA 形态。
+- 单项定位显示 `q/k/vt/v` checker 在 `H=2, HKV=2`、`H=4, HKV=2`
+  下均可独立通过。
+- 旧的 monolithic `checks=all` 在 `H>=4` 会 trap，但单项均过；因此判断为
+  checker 组合副作用，而不是 producer ordering 或单项 content checker 错误。
+- 已修为 distributed all：`H=4, HKV=2` 和 `H=8, HKV=2` 通过。
+- K 曾短暂尝试改成 `tl::fp8_tma_load_4d_ptx`，但该 descriptor 写入的 shared
+  layout 不等同于 `SmemLayoutK` 期望形态，连 `H=1, HKV=1` K checker 都会
+  trap；因此 K shadow load 已恢复为 `T.tma_copy`。
+
+B3-0b 更新（2026-06-04）：
+
+exact-order shadow 已支持 `ceildiv(seq_len, 224)` 的 N tile 个数，不再要求
+`seq_len % 224 == 0`。`S=4096` 时：
+
+```text
+num_n_blocks = ceildiv(4096, 224) = 19
+last_tile_n = 18
+trace_len = 3 * 19 + 1 = 58
+```
+
+长序列验收命令：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-exact-order-shadow-probe \
+  --producer-tma-hlir-exact-order-shadow-checks all \
+  --warmup 1 --repeat 1
+```
+
+通过结果：
+
+```text
+exact_order_shadow_status [1]
+trace starts:
+  [1, 18, 0, 0], [2, 18, 0, 0], [3, 0, 0, 0],
+  [4, 17, 1, 0], [5, 17, 1, 0], [6, 18, 0, 1]
+trace ends:
+  [4, 0, 0, 1], [5, 0, 0, 1], [6, 1, 1, 0], [7, 0, 0, 0]
+```
+
+这说明 producer shadow 的 order/parity/stage reuse 已覆盖目标长序列：
+
+```text
+initial:
+  Vt(last=18), K(last=18), Q(tile_m)
+loop:
+  Vt(next), K(next), Vt->V(previous)
+tail:
+  Vt->V(tile 0)
+```
+
+单项定位：
+
+```text
+S=4096, H=8, HKV=2, checks=q    通过
+S=4096, H=8, HKV=2, checks=k    通过
+S=4096, H=8, HKV=2, checks=v    通过
+S=4096, H=8, HKV=2, checks=none 通过
+S=4096, H=8, HKV=2, checks=vt   通过
+S=4096, H=8, HKV=2, checks=all  通过
+```
+
+Vt 长序列失败的根因已定位并修复：
+
+```text
+错误：两个 Vt TMA mbarrier 复用时直接使用 buffer id parity。
+正确：每个 Vt TMA mbarrier 需要按自身复用次数翻转 parity。
+```
+
+具体说，`vt_tma_full0` 的使用序列是：
+
+```text
+initial tile 18 -> parity 0
+loop tile 16   -> parity 1
+loop tile 14   -> parity 0
+...
+```
+
+`vt_tma_full1` 的使用序列是：
+
+```text
+loop tile 17 -> parity 0
+loop tile 15 -> parity 1
+loop tile 13 -> parity 0
+...
+```
+
+修复后长序列 `checks=all` 重新覆盖 Q/K/Vt/V layout、barrier parity、
+ping-pong stage reuse 和完整 trace。`S=4096` 的 partial last tile 也由
+Vt checker 按 valid row 采样覆盖。
+
+B3-0b 后续事项：
+
+```text
+1. 把 exact-order shadow 接回 role-run / producer-split 语境。
+2. 用 4096 benchmark 记录 producer skeleton 的速度回退。
+3. 后续如果要降低 probe 编译/运行成本，再单独做低开销采样 checker。
+```
+
+B3-0c 性能锚点（2026-06-04）：
+
+旧的 monolithic `build_kernel(...)` 现在不适合继续作为 B3 性能入口：
+
+```text
+--role-run --producer-split
+-> TileLang eager: too many statically nested blocks
+```
+
+根因不是 kernel runtime，而是历史 probe 分支过多。即使这些分支运行时为 false，
+TileLang eager 仍会把它们展开进 AST。为后续性能线新增 dedicated 瘦身入口：
+
+```text
+--producer-tma-hlir-slim-baseline-probe
+```
+
+该入口只保留 M4 role-run producer-split 的必要路径：
+
+```text
+prepare_params
+prepare_runtime
+producer_load_one_tile
+producer_load_tail
+run_consumer_wg1
+run_consumer_wg2
+```
+
+correctness smoke：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-baseline-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+correctness max_abs=0.000915527 cosine=0.99977273
+```
+
+4096 benchmark：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-baseline-probe \
+  --bench --warmup 5 --repeat 20
+```
+
+结果：
+
+```text
+correctness max_abs=0.000457764 cosine=0.99970412
+latency_ms=0.113416 tflops=605.91
+```
+
+standalone exact-order skeleton 裸开销：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-exact-order-shadow-probe \
+  --producer-tma-hlir-exact-order-shadow-checks none \
+  --bench --warmup 5 --repeat 20
+```
+
+结果：
+
+```text
+latency_ms=0.066074
+```
+
+解释：
+
+- `0.113416 ms` 是新的同环境 M4 baseline，和旧记录 `0.113312 ms`
+  基本一致。
+- `0.066074 ms` 只代表 exact-order shadow skeleton 的裸数据搬运/同步开销，
+  还没有接入真实 FA3 output path，不能直接当最终回退。
+- 如果把 standalone skeleton 完全串行叠加到 M4 baseline，上界约为
+  `0.066074 / 0.113416 = 58.3%` 额外开销。下一步 B3-1 要在 slim builder
+  中串入 exact-order shadow，先记录 shadow-path 回退，再推进替换 producer core。
+
+B3-1 shadow-path benchmark（2026-06-04）：
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-exact-order-shadow-probe
+```
+
+实现方式：
+
+```text
+same CTA / same dynamic smem arena
+exact-order shadow runs before prepare_params / prepare_runtime
+then normal FA3 producer_load_one_tile / producer_load_tail / consumers produce output
+```
+
+为什么 shadow 放在 `prepare_params` 前：
+
+```text
+FA3 SharedStorage already uses ~196KB dynamic smem.
+Standalone shadow needs ~188KB for Q/K/Vt/V stages.
+Therefore B3-1 reuses the same smem arena by byte offset instead of allocating
+extra shared memory. Running shadow before prepare_params avoids clobbering
+FA3 runtime metadata.
+```
+
+smoke：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-exact-order-shadow-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+correctness max_abs=0.000915527 cosine=0.99977273
+```
+
+4096 benchmark：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-exact-order-shadow-probe \
+  --bench --warmup 5 --repeat 20
+```
+
+结果：
+
+```text
+correctness max_abs=0.000457764 cosine=0.99970412
+latency_ms=0.156368 tflops=439.47
+```
+
+baseline 复测：
+
+```text
+--producer-tma-hlir-slim-baseline-probe
+latency_ms=0.113451 tflops=605.72
+```
+
+回退：
+
+```text
+absolute overhead = 0.156368 - 0.113451 = 0.042917 ms
+relative overhead = 37.8%
+throughput ratio  = 0.113451 / 0.156368 = 72.6%
+```
+
+解释：
+
+- 这是 shadow path 上界回退：真实 FA3 output 仍由原 producer core 生成，
+  exact-order shadow 额外串在前面。
+- 集成后的额外开销 `0.0429 ms` 小于 standalone skeleton `0.0661 ms`，
+  说明同 CTA / same smem arena 下已有一部分 launch/CTA 固定成本被摊掉。
+- 下一步 B3-2 不应继续叠加 shadow，而应开始替换 producer core 的局部阶段：
+  先让 slim path 使用 exact-order Q/K/Vt->V 的一部分真实输出前置条件，
+  再逐步删除 `producer_load_one_tile` / `producer_load_tail` 对应职责。
+
 **B4: remove producer core sub-call**
 
 边界：

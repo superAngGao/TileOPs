@@ -3150,6 +3150,8 @@ def build_core_shadow_kernel(
             "-DCUTLASS_ARCH_MMA_SM90A_ENABLED",
             f"-I{FA3_INC}",
             "-include",
+            str(ROOT / "tileops" / "kernels" / "attention" / "_fp8_gqa_helper.h"),
+            "-include",
             str(helper_header),
         ],
     )
@@ -3654,6 +3656,8 @@ def build_vt_to_v_boundary_probe_kernel(
             "-DCUTLASS_ARCH_MMA_SM90A_ENABLED",
             f"-I{FA3_INC}",
             "-include",
+            str(ROOT / "tileops" / "kernels" / "attention" / "_fp8_gqa_helper.h"),
+            "-include",
             str(helper_header),
         ],
     )
@@ -3848,6 +3852,1165 @@ def build_pv_correctness_probe_kernel(
     return func()
 
 
+def build_slim_role_split_baseline_kernel(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    heads_kv: int,
+    dim: int,
+    smem_bytes: int,
+    stages: int,
+    query_smem: bool,
+    static_persistent_call_extern: bool,
+    exact_order_shadow: bool = False,
+):
+    group = heads // heads_kv
+    num_m_blocks = (seq_len + 127) // 128
+    num_n_blocks = (seq_len + 223) // 224
+    q_shadow_offset = 0
+    q_shadow_bytes = 128 * dim
+    k_shadow0_offset = q_shadow_offset + q_shadow_bytes
+    k_shadow_bytes = 224 * dim
+    k_shadow1_offset = k_shadow0_offset + k_shadow_bytes
+    vt_shadow0_offset = k_shadow1_offset + k_shadow_bytes
+    vt_shadow_bytes = dim * 224
+    vt_shadow1_offset = vt_shadow0_offset + vt_shadow_bytes
+    v_shadow0_offset = vt_shadow1_offset + vt_shadow_bytes
+    v_shadow_bytes = dim * 224
+    v_shadow1_offset = v_shadow0_offset + v_shadow_bytes
+    if exact_order_shadow and v_shadow1_offset + v_shadow_bytes > smem_bytes:
+        raise ValueError("slim exact-order shadow requires enough smem arena bytes")
+    helper_header = _write_extern_helper_header(
+        batch,
+        seq_len,
+        heads,
+        heads_kv,
+        dim,
+        stages,
+        query_smem,
+        static_persistent_call_extern,
+    )
+
+    @tilelang.jit(
+        out_idx=[6, 7],
+        execution_backend="tvm_ffi",
+        compile_flags=[
+            "-O3",
+            "-DNDEBUG",
+            "-DTILEOPS_FA3_SHAPED_LAUNCHER_TAG_slim_role_split_baseline",
+            "-Xptxas=-v",
+            "--expt-relaxed-constexpr",
+            "-DENABLE_BF16",
+            "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+            "-DCUTLASS_ARCH_MMA_SM90_ENABLED",
+            "-DCUTLASS_ARCH_MMA_SM90A_ENABLED",
+            f"-I{FA3_INC}",
+            "-include",
+            str(ROOT / "tileops" / "kernels" / "attention" / "_fp8_gqa_helper.h"),
+            "-include",
+            str(helper_header),
+        ],
+    )
+    def func():
+        q_shape = (batch, seq_len, heads, dim)
+        kv_shape = (batch, seq_len, heads_kv, dim)
+        descale_shape = (batch, heads_kv)
+
+        @T.macro
+        def producer_slim_exact_shadow(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            smem,
+            q_tma_full,
+            q_done,
+            k_tma_full0,
+            k_tma_full1,
+            k_done,
+            vt_tma_full0,
+            vt_tma_full1,
+            v_transform_full,
+            v_done,
+            tx: T.int32,
+            tile_m: T.int32,
+            bidh: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            q_row_base = tile_m * 128
+            last_tile_n = num_n_blocks - 1
+
+            q_shadow_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, q_tensor.data,
+                dim, heads, seq_len, batch,
+                1, dim, heads * dim, seq_len * heads * dim,
+                dim, 1, 128, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            k_shadow_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, k_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            vt_shadow_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+
+            if tx == 0:
+                T.mbarrier_expect_tx(vt_tma_full0, vt_shadow_bytes)
+                tir.call_extern(
+                    "handle",
+                    "tl::fp8_tma_load_4d_ptx",
+                    vt_shadow_desc,
+                    vt_tma_full0[0],
+                    smem.access_ptr("w", offset=vt_shadow0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                )
+                T.barrier_arrive(vt_tma_full0)
+                T.mbarrier_expect_tx(k_tma_full0, k_shadow_bytes)
+                tir.call_extern(
+                    "handle",
+                    "tl::fp8_tma_load_4d_ptx",
+                    k_shadow_desc,
+                    k_tma_full0[0],
+                    smem.access_ptr("w", offset=k_shadow0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                )
+                T.barrier_arrive(k_tma_full0)
+                if q_row_base + 128 <= seq_len:
+                    T.mbarrier_expect_tx(q_tma_full, q_shadow_bytes)
+                    tir.call_extern(
+                        "handle",
+                        "tl::fp8_tma_load_4d_ptx",
+                        q_shadow_desc,
+                        q_tma_full[0],
+                        smem.access_ptr("w", offset=q_shadow_offset),
+                        0,
+                        bidh,
+                        q_row_base,
+                        bidb,
+                    )
+                    T.barrier_arrive(q_tma_full)
+
+            T.mbarrier_wait_parity(vt_tma_full0, 0)
+            T.mbarrier_wait_parity(k_tma_full0, 0)
+            T.barrier_wait(k_done, 0)
+            if q_row_base + 128 <= seq_len:
+                T.mbarrier_wait_parity(q_tma_full, 0)
+                T.barrier_wait(q_done, 0)
+
+            for exact_iter in T.Pipelined(num_n_blocks - 1, num_stages=0):
+                next_tile_n = num_n_blocks - 2 - exact_iter
+                next_phase = (exact_iter + 1) % 2
+                prev_phase = exact_iter % 2
+                if next_phase == 0:
+                    tma_phase0 = ((exact_iter + 1) // 2) % 2
+                    if tx == 0:
+                        T.mbarrier_expect_tx(vt_tma_full0, vt_shadow_bytes)
+                        tir.call_extern(
+                            "handle",
+                            "tl::fp8_tma_load_4d_ptx",
+                            vt_shadow_desc,
+                            vt_tma_full0[0],
+                            smem.access_ptr("w", offset=vt_shadow0_offset),
+                            0,
+                            bidh_kv,
+                            next_tile_n * 224,
+                            bidb,
+                        )
+                        T.barrier_arrive(vt_tma_full0)
+                        T.mbarrier_expect_tx(k_tma_full0, k_shadow_bytes)
+                        tir.call_extern(
+                            "handle",
+                            "tl::fp8_tma_load_4d_ptx",
+                            k_shadow_desc,
+                            k_tma_full0[0],
+                            smem.access_ptr("w", offset=k_shadow0_offset),
+                            0,
+                            bidh_kv,
+                            next_tile_n * 224,
+                            bidb,
+                        )
+                        T.barrier_arrive(k_tma_full0)
+                    T.mbarrier_wait_parity(vt_tma_full0, tma_phase0)
+                    T.mbarrier_wait_parity(k_tma_full0, tma_phase0)
+                else:
+                    tma_phase1 = (exact_iter // 2) % 2
+                    if tx == 0:
+                        T.mbarrier_expect_tx(vt_tma_full1, vt_shadow_bytes)
+                        tir.call_extern(
+                            "handle",
+                            "tl::fp8_tma_load_4d_ptx",
+                            vt_shadow_desc,
+                            vt_tma_full1[0],
+                            smem.access_ptr("w", offset=vt_shadow1_offset),
+                            0,
+                            bidh_kv,
+                            next_tile_n * 224,
+                            bidb,
+                        )
+                        T.barrier_arrive(vt_tma_full1)
+                        T.mbarrier_expect_tx(k_tma_full1, k_shadow_bytes)
+                        tir.call_extern(
+                            "handle",
+                            "tl::fp8_tma_load_4d_ptx",
+                            k_shadow_desc,
+                            k_tma_full1[0],
+                            smem.access_ptr("w", offset=k_shadow1_offset),
+                            0,
+                            bidh_kv,
+                            next_tile_n * 224,
+                            bidb,
+                        )
+                        T.barrier_arrive(k_tma_full1)
+                    T.mbarrier_wait_parity(vt_tma_full1, tma_phase1)
+                    T.mbarrier_wait_parity(k_tma_full1, tma_phase1)
+                T.barrier_wait(k_done, next_phase)
+
+                if prev_phase == 0:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_vt_to_v_boundary",
+                        smem.access_ptr("r", offset=vt_shadow0_offset),
+                        smem.access_ptr("w", offset=v_shadow0_offset),
+                        tx,
+                    )
+                else:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_vt_to_v_boundary",
+                        smem.access_ptr("r", offset=vt_shadow1_offset),
+                        smem.access_ptr("w", offset=v_shadow1_offset),
+                        tx,
+                    )
+                T.barrier_arrive(v_transform_full)
+                T.barrier_wait(v_done, prev_phase)
+
+            tail_phase = (num_n_blocks - 1) % 2
+            if tail_phase == 0:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_vt_to_v_boundary",
+                    smem.access_ptr("r", offset=vt_shadow0_offset),
+                    smem.access_ptr("w", offset=v_shadow0_offset),
+                    tx,
+                )
+            else:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_vt_to_v_boundary",
+                    smem.access_ptr("r", offset=vt_shadow1_offset),
+                    smem.access_ptr("w", offset=v_shadow1_offset),
+                    tx,
+                )
+            T.barrier_arrive(v_transform_full)
+            T.barrier_wait(v_done, tail_phase)
+
+        @T.macro
+        def consumer_slim_exact_shadow(
+            q_tma_full,
+            q_done,
+            k_tma_full0,
+            k_tma_full1,
+            k_done,
+            v_transform_full,
+            v_done,
+            tile_m: T.int32,
+        ) -> None:
+            q_row_base = tile_m * 128
+            last_tile_n = num_n_blocks - 1
+            T.mbarrier_wait_parity(k_tma_full0, 0)
+            T.barrier_arrive(k_done)
+            if q_row_base + 128 <= seq_len:
+                T.mbarrier_wait_parity(q_tma_full, 0)
+                T.barrier_arrive(q_done)
+
+            for exact_iter in T.Pipelined(num_n_blocks - 1, num_stages=0):
+                next_phase = (exact_iter + 1) % 2
+                prev_phase = exact_iter % 2
+                if next_phase == 0:
+                    tma_phase0 = ((exact_iter + 1) // 2) % 2
+                    T.mbarrier_wait_parity(k_tma_full0, tma_phase0)
+                else:
+                    tma_phase1 = (exact_iter // 2) % 2
+                    T.mbarrier_wait_parity(k_tma_full1, tma_phase1)
+                T.barrier_arrive(k_done)
+                T.barrier_wait(v_transform_full, prev_phase)
+                T.barrier_arrive(v_done)
+
+            tail_phase = (last_tile_n) % 2
+            T.barrier_wait(v_transform_full, tail_phase)
+            T.barrier_arrive(v_done)
+
+        @T.prim_func
+        def main(
+            q: T.Tensor(q_shape, "float8_e4m3fn"),
+            k: T.Tensor(kv_shape, "float8_e4m3fn"),
+            v: T.Tensor(kv_shape, "float8_e4m3fn"),
+            q_descale: T.Tensor(descale_shape, "float"),
+            k_descale: T.Tensor(descale_shape, "float"),
+            v_descale: T.Tensor(descale_shape, "float"),
+            output: T.Tensor(q_shape, "bfloat16"),
+            lse: T.Tensor([batch, heads, seq_len], "float"),
+        ) -> None:
+            with T.Kernel(num_m_blocks, heads, batch, threads=384) as (_bx, _by, _bz):
+                smem = T.alloc_shared((smem_bytes,), "uint8")
+                if exact_order_shadow:
+                    shadow_q_tma_full = T.alloc_barrier(arrive_count=1)
+                    shadow_q_done = T.alloc_barrier(arrive_count=256)
+                    shadow_k_tma_full0 = T.alloc_barrier(arrive_count=1)
+                    shadow_k_tma_full1 = T.alloc_barrier(arrive_count=1)
+                    shadow_k_done = T.alloc_barrier(arrive_count=256)
+                    shadow_vt_tma_full0 = T.alloc_barrier(arrive_count=1)
+                    shadow_vt_tma_full1 = T.alloc_barrier(arrive_count=1)
+                    shadow_v_transform_full = T.alloc_barrier(arrive_count=128)
+                    shadow_v_done = T.alloc_barrier(arrive_count=256)
+                tx = T.get_thread_binding()
+                lane_id = tx % 32
+                warp_id = tx // 32
+                warpgroup_id = tx // 128
+                warpgroup_lane = tx % 128
+                producer_warp = warpgroup_lane // 32
+                producer_lane = warpgroup_lane % 32
+                tile_m = _bx
+                bidh = _by
+                bidb = _bz
+                bidh_kv = bidh // group
+
+                T.reads(
+                    q[0:batch, 0:seq_len, 0:heads, 0:dim],
+                    k[0:batch, 0:seq_len, 0:heads_kv, 0:dim],
+                    v[0:batch, 0:seq_len, 0:heads_kv, 0:dim],
+                    q_descale[0:batch, 0:heads_kv],
+                    k_descale[0:batch, 0:heads_kv],
+                    v_descale[0:batch, 0:heads_kv],
+                )
+                T.writes(
+                    output[0:batch, 0:seq_len, 0:heads, 0:dim],
+                    lse[0:batch, 0:heads, 0:seq_len],
+                    smem[0:smem_bytes],
+                )
+
+                q_tma_desc = T.create_tma_descriptor(
+                    0, 4, q.data,
+                    dim, seq_len, heads, batch,
+                    1, heads * dim, dim, seq_len * heads * dim,
+                    dim, 128, 1, 1,
+                    1, 1, 1, 1,
+                    0, 3, 2, 0,
+                )
+                k_tma_desc = T.create_tma_descriptor(
+                    0, 4, k.data,
+                    dim, seq_len, heads_kv, batch,
+                    1, heads_kv * dim, dim, seq_len * heads_kv * dim,
+                    dim, 224, 1, 1,
+                    1, 1, 1, 1,
+                    0, 3, 2, 0,
+                )
+                v_tma_desc = T.create_tma_descriptor(
+                    0, 4, v.data,
+                    dim, seq_len, heads_kv, batch,
+                    1, heads_kv * dim, dim, seq_len * heads_kv * dim,
+                    dim, 224, 1, 1,
+                    1, 1, 1, 1,
+                    0, 3, 2, 0,
+                )
+                output_tma_desc = T.create_tma_descriptor(
+                    9, 5, output.data,
+                    dim, seq_len, heads, batch, 1,
+                    2, heads * dim * 2, dim * 2, seq_len * heads * dim * 2,
+                    batch * seq_len * heads * dim * 2,
+                    64, 128, 1, 1, 1,
+                    1, 1, 1, 1, 1,
+                    0, 3, 2, 0,
+                )
+                if exact_order_shadow:
+                    if tx < 128:
+                        producer_slim_exact_shadow(
+                            q,
+                            k,
+                            v,
+                            smem,
+                            shadow_q_tma_full,
+                            shadow_q_done,
+                            shadow_k_tma_full0,
+                            shadow_k_tma_full1,
+                            shadow_k_done,
+                            shadow_vt_tma_full0,
+                            shadow_vt_tma_full1,
+                            shadow_v_transform_full,
+                            shadow_v_done,
+                            tx,
+                            tile_m,
+                            bidh,
+                            bidb,
+                            bidh_kv,
+                        )
+                    else:
+                        consumer_slim_exact_shadow(
+                            shadow_q_tma_full,
+                            shadow_q_done,
+                            shadow_k_tma_full0,
+                            shadow_k_tma_full1,
+                            shadow_k_done,
+                            shadow_v_transform_full,
+                            shadow_v_done,
+                            tile_m,
+                        )
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_prepare_params",
+                    q_tma_desc,
+                    k_tma_desc,
+                    v_tma_desc,
+                    output_tma_desc,
+                    q.data,
+                    k.data,
+                    v.data,
+                    q_descale.data,
+                    k_descale.data,
+                    v_descale.data,
+                    output.data,
+                    lse.data,
+                    tx,
+                    lane_id,
+                    warp_id,
+                    warpgroup_id,
+                    warpgroup_lane,
+                    tile_m,
+                    bidh,
+                    bidb,
+                    bidh_kv,
+                    smem.access_ptr("rw"),
+                )
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_prepare_runtime",
+                    tile_m,
+                    bidh,
+                    bidb,
+                    smem.access_ptr("rw"),
+                )
+                if tx < 128:
+                    T.dec_max_nreg(24)
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_producer_load_one_tile",
+                        0,
+                        tx,
+                        warpgroup_id,
+                        producer_warp,
+                        producer_lane,
+                        tile_m,
+                        bidh,
+                        bidb,
+                        bidh_kv,
+                        group,
+                        smem.access_ptr("rw"),
+                    )
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_producer_load_tail",
+                        0,
+                        tx,
+                        warpgroup_id,
+                        producer_warp,
+                        producer_lane,
+                        tile_m,
+                        bidh,
+                        bidb,
+                        bidh_kv,
+                        group,
+                        smem.access_ptr("rw"),
+                    )
+                elif tx < 256:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_run_consumer_wg1",
+                        1,
+                        tx,
+                        warpgroup_id,
+                        tile_m,
+                        bidh,
+                        bidb,
+                        bidh_kv,
+                        group,
+                        smem.access_ptr("rw"),
+                    )
+                else:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_run_consumer_wg2",
+                        2,
+                        tx,
+                        warpgroup_id,
+                        tile_m,
+                        bidh,
+                        bidb,
+                        bidh_kv,
+                        group,
+                        smem.access_ptr("rw"),
+                    )
+
+        return main
+
+    return func(), None
+
+
+def build_exact_order_shadow_probe_kernel(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    heads_kv: int,
+    dim: int,
+    stages: int,
+    query_smem: bool,
+    static_persistent_call_extern: bool,
+    exact_shadow_checks: str,
+):
+    if seq_len < 224:
+        raise ValueError("exact-order shadow probe requires --seq-len >= 224")
+
+    group = heads // heads_kv
+    num_m_blocks = (seq_len + 127) // 128
+    num_n_blocks = (seq_len + 223) // 224
+    trace_len = 3 * num_n_blocks + 1
+    check_all = exact_shadow_checks == "all"
+    check_q = exact_shadow_checks == "q"
+    check_k = exact_shadow_checks == "k"
+    check_vt = exact_shadow_checks == "vt"
+    check_v = exact_shadow_checks == "v"
+
+    helper_header = _write_extern_helper_header(
+        batch,
+        seq_len,
+        heads,
+        heads_kv,
+        dim,
+        stages,
+        query_smem,
+        static_persistent_call_extern,
+    )
+
+    @tilelang.jit(
+        out_idx=[6, 7],
+        execution_backend="tvm_ffi",
+        compile_flags=[
+            "-O3",
+            "-DNDEBUG",
+            "-DTILEOPS_FA3_SHAPED_LAUNCHER_TAG_exact_order_shadow",
+            "-Xptxas=-v",
+            "--expt-relaxed-constexpr",
+            "-DENABLE_BF16",
+            "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+            "-DCUTLASS_ARCH_MMA_SM90_ENABLED",
+            "-DCUTLASS_ARCH_MMA_SM90A_ENABLED",
+            f"-I{FA3_INC}",
+            "-include",
+            str(ROOT / "tileops" / "kernels" / "attention" / "_fp8_gqa_helper.h"),
+            "-include",
+            str(helper_header),
+        ],
+    )
+    def func():
+        q_shape = (batch, seq_len, heads, dim)
+        kv_shape = (batch, seq_len, heads_kv, dim)
+        status_shape = (1,)
+        trace_shape = (batch, heads, num_m_blocks, trace_len, 4)
+
+        @T.macro
+        def producer_exact_shadow(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            q_stage,
+            k_stage0,
+            k_stage1,
+            vt_stage0,
+            vt_stage1,
+            v_stage0,
+            v_stage1,
+            q_full,
+            q_done,
+            k_full,
+            k_done,
+            vt_tma_full0,
+            vt_tma_full1,
+            vt_source_full,
+            v_transform_full,
+            v_done,
+            trace_tensor,
+            tx: T.int32,
+            tile_m: T.int32,
+            bidh: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            q_row_base = tile_m * 128
+            last_tile_n = num_n_blocks - 1
+
+            vt_tma_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+
+            if tx == 0:
+                T.mbarrier_expect_tx(vt_tma_full0, dim * 224)
+                tir.call_extern(
+                    "handle",
+                    "tl::fp8_tma_load_4d_ptx",
+                    vt_tma_desc,
+                    vt_tma_full0[0],
+                    T.access_ptr(vt_stage0, "w"),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                )
+                T.barrier_arrive(vt_tma_full0)
+                trace_tensor[bidb, bidh, tile_m, 0, 0] = 1
+                trace_tensor[bidb, bidh, tile_m, 0, 1] = last_tile_n
+                trace_tensor[bidb, bidh, tile_m, 0, 2] = 0
+                trace_tensor[bidb, bidh, tile_m, 0, 3] = 0
+            T.mbarrier_wait_parity(vt_tma_full0, 0)
+            T.barrier_arrive(vt_source_full)
+
+            T.tma_copy(
+                k_tensor[
+                    bidb,
+                    last_tile_n * 224:(last_tile_n + 1) * 224,
+                    bidh_kv,
+                    0:dim,
+                ],
+                k_stage0,
+                barrier=k_full,
+            )
+            if tx == 0:
+                trace_tensor[bidb, bidh, tile_m, 1, 0] = 2
+                trace_tensor[bidb, bidh, tile_m, 1, 1] = last_tile_n
+                trace_tensor[bidb, bidh, tile_m, 1, 2] = 0
+                trace_tensor[bidb, bidh, tile_m, 1, 3] = 0
+            T.barrier_arrive(k_full)
+            T.barrier_wait(k_done, 0)
+
+            if q_row_base + 128 <= seq_len:
+                T.tma_copy(
+                    q_tensor[bidb, q_row_base:q_row_base + 128, bidh, 0:dim],
+                    q_stage,
+                    barrier=q_full,
+                )
+                if tx == 0:
+                    trace_tensor[bidb, bidh, tile_m, 2, 0] = 3
+                    trace_tensor[bidb, bidh, tile_m, 2, 1] = tile_m
+                    trace_tensor[bidb, bidh, tile_m, 2, 2] = 0
+                    trace_tensor[bidb, bidh, tile_m, 2, 3] = 0
+                T.barrier_arrive(q_full)
+                T.barrier_wait(q_done, 0)
+
+            for exact_iter in T.Pipelined(num_n_blocks - 1, num_stages=0):
+                next_tile_n = num_n_blocks - 2 - exact_iter
+                next_phase = (exact_iter + 1) % 2
+                prev_phase = exact_iter % 2
+                event_base = 3 + exact_iter * 3
+
+                if next_phase == 0:
+                    vt_tma_phase0 = ((exact_iter + 1) // 2) % 2
+                    if tx == 0:
+                        T.mbarrier_expect_tx(vt_tma_full0, dim * 224)
+                        tir.call_extern(
+                            "handle",
+                            "tl::fp8_tma_load_4d_ptx",
+                            vt_tma_desc,
+                            vt_tma_full0[0],
+                            T.access_ptr(vt_stage0, "w"),
+                            0,
+                            bidh_kv,
+                            next_tile_n * 224,
+                            bidb,
+                        )
+                        T.barrier_arrive(vt_tma_full0)
+                        trace_tensor[bidb, bidh, tile_m, event_base, 0] = 4
+                        trace_tensor[bidb, bidh, tile_m, event_base, 1] = next_tile_n
+                        trace_tensor[bidb, bidh, tile_m, event_base, 2] = next_phase
+                        trace_tensor[bidb, bidh, tile_m, event_base, 3] = prev_phase
+                    T.mbarrier_wait_parity(vt_tma_full0, vt_tma_phase0)
+                    T.barrier_arrive(vt_source_full)
+                    T.tma_copy(
+                        k_tensor[
+                            bidb,
+                            next_tile_n * 224:(next_tile_n + 1) * 224,
+                            bidh_kv,
+                            0:dim,
+                        ],
+                        k_stage0,
+                        barrier=k_full,
+                    )
+                else:
+                    vt_tma_phase1 = (exact_iter // 2) % 2
+                    if tx == 0:
+                        T.mbarrier_expect_tx(vt_tma_full1, dim * 224)
+                        tir.call_extern(
+                            "handle",
+                            "tl::fp8_tma_load_4d_ptx",
+                            vt_tma_desc,
+                            vt_tma_full1[0],
+                            T.access_ptr(vt_stage1, "w"),
+                            0,
+                            bidh_kv,
+                            next_tile_n * 224,
+                            bidb,
+                        )
+                        T.barrier_arrive(vt_tma_full1)
+                        trace_tensor[bidb, bidh, tile_m, event_base, 0] = 4
+                        trace_tensor[bidb, bidh, tile_m, event_base, 1] = next_tile_n
+                        trace_tensor[bidb, bidh, tile_m, event_base, 2] = next_phase
+                        trace_tensor[bidb, bidh, tile_m, event_base, 3] = prev_phase
+                    T.mbarrier_wait_parity(vt_tma_full1, vt_tma_phase1)
+                    T.barrier_arrive(vt_source_full)
+                    T.tma_copy(
+                        k_tensor[
+                            bidb,
+                            next_tile_n * 224:(next_tile_n + 1) * 224,
+                            bidh_kv,
+                            0:dim,
+                        ],
+                        k_stage1,
+                        barrier=k_full,
+                    )
+
+                if tx == 0:
+                    trace_tensor[bidb, bidh, tile_m, event_base + 1, 0] = 5
+                    trace_tensor[bidb, bidh, tile_m, event_base + 1, 1] = next_tile_n
+                    trace_tensor[bidb, bidh, tile_m, event_base + 1, 2] = next_phase
+                    trace_tensor[bidb, bidh, tile_m, event_base + 1, 3] = prev_phase
+                T.barrier_arrive(k_full)
+                T.barrier_wait(k_done, next_phase)
+
+                if prev_phase == 0:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_vt_to_v_boundary",
+                        vt_stage0.access_ptr("r"),
+                        v_stage0.access_ptr("w"),
+                        tx,
+                    )
+                else:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_vt_to_v_boundary",
+                        vt_stage1.access_ptr("r"),
+                        v_stage1.access_ptr("w"),
+                        tx,
+                    )
+                if tx == 0:
+                    trace_tensor[bidb, bidh, tile_m, event_base + 2, 0] = 6
+                    trace_tensor[bidb, bidh, tile_m, event_base + 2, 1] = next_tile_n + 1
+                    trace_tensor[bidb, bidh, tile_m, event_base + 2, 2] = prev_phase
+                    trace_tensor[bidb, bidh, tile_m, event_base + 2, 3] = next_phase
+                T.barrier_arrive(v_transform_full)
+                T.barrier_wait(v_done, prev_phase)
+
+            tail_phase = (num_n_blocks - 1) % 2
+            tail_event = 3 + (num_n_blocks - 1) * 3
+            if tail_phase == 0:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_vt_to_v_boundary",
+                    vt_stage0.access_ptr("r"),
+                    v_stage0.access_ptr("w"),
+                    tx,
+                )
+            else:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_vt_to_v_boundary",
+                    vt_stage1.access_ptr("r"),
+                    v_stage1.access_ptr("w"),
+                    tx,
+                )
+            if tx == 0:
+                trace_tensor[bidb, bidh, tile_m, tail_event, 0] = 7
+                trace_tensor[bidb, bidh, tile_m, tail_event, 1] = 0
+                trace_tensor[bidb, bidh, tile_m, tail_event, 2] = tail_phase
+                trace_tensor[bidb, bidh, tile_m, tail_event, 3] = 0
+            T.barrier_arrive(v_transform_full)
+            T.barrier_wait(v_done, tail_phase)
+
+        @T.macro
+        def consumer_exact_shadow_wg1(
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            q_stage,
+            k_stage0,
+            k_stage1,
+            vt_stage0,
+            vt_stage1,
+            v_stage0,
+            v_stage1,
+            q_full,
+            q_done,
+            k_full,
+            k_done,
+            vt_source_full,
+            v_transform_full,
+            v_done,
+            tx: T.int32,
+            tile_m: T.int32,
+            bidh: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            q_row_base = tile_m * 128
+            last_tile_n = num_n_blocks - 1
+
+            T.barrier_wait(vt_source_full, 0)
+            if ((check_vt) or (check_all and bidh % 4 == 2)) and tx == 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_check_vt_hlir_stage_boundary",
+                    vt_stage0.access_ptr("r"),
+                    v_tensor.data,
+                    tx,
+                    last_tile_n,
+                    bidh_kv,
+                    bidb,
+                )
+
+            T.barrier_wait(k_full, 0)
+            if ((check_k) or (check_all and bidh % 4 == 1)) and tx == 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_check_kv_hlir_consumer_tensor_boundary",
+                    0,
+                    k_stage0.access_ptr("r"),
+                    k_tensor.data,
+                    tx,
+                    last_tile_n,
+                    bidh_kv,
+                    bidb,
+                )
+            T.barrier_arrive(k_done)
+
+            if q_row_base + 128 <= seq_len:
+                T.barrier_wait(q_full, 0)
+                if ((check_q) or (check_all and bidh % 4 == 0)) and tx == 128:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_check_q_hlir_consumer_tensor_boundary",
+                        q_stage.access_ptr("r"),
+                        q_tensor.data,
+                        tx,
+                        tile_m,
+                        bidh,
+                        bidb,
+                    )
+                T.barrier_arrive(q_done)
+
+            for exact_iter in T.Pipelined(num_n_blocks - 1, num_stages=0):
+                next_tile_n = num_n_blocks - 2 - exact_iter
+                next_phase = (exact_iter + 1) % 2
+                prev_phase = exact_iter % 2
+                T.barrier_wait(vt_source_full, next_phase)
+                if ((check_vt) or (check_all and bidh % 4 == 2)) and tx == 128:
+                    if next_phase == 0:
+                        T.call_extern(
+                            "handle",
+                            "tileops_fa3_shaped_check_vt_hlir_stage_boundary",
+                            vt_stage0.access_ptr("r"),
+                            v_tensor.data,
+                            tx,
+                            next_tile_n,
+                            bidh_kv,
+                            bidb,
+                        )
+                    else:
+                        T.call_extern(
+                            "handle",
+                            "tileops_fa3_shaped_check_vt_hlir_stage_boundary",
+                            vt_stage1.access_ptr("r"),
+                            v_tensor.data,
+                            tx,
+                            next_tile_n,
+                            bidh_kv,
+                            bidb,
+                        )
+
+                T.barrier_wait(k_full, next_phase)
+                if ((check_k) or (check_all and bidh % 4 == 1)) and tx == 128:
+                    if next_phase == 0:
+                        T.call_extern(
+                            "handle",
+                            "tileops_fa3_shaped_check_kv_hlir_consumer_tensor_boundary",
+                            0,
+                            k_stage0.access_ptr("r"),
+                            k_tensor.data,
+                            tx,
+                            next_tile_n,
+                            bidh_kv,
+                            bidb,
+                        )
+                    else:
+                        T.call_extern(
+                            "handle",
+                            "tileops_fa3_shaped_check_kv_hlir_consumer_tensor_boundary",
+                            0,
+                            k_stage1.access_ptr("r"),
+                            k_tensor.data,
+                            tx,
+                            next_tile_n,
+                            bidh_kv,
+                            bidb,
+                        )
+                T.barrier_arrive(k_done)
+
+                T.barrier_wait(v_transform_full, prev_phase)
+                if ((check_v) or (check_all and bidh % 4 == 3)) and tx == 128:
+                    if prev_phase == 0:
+                        T.call_extern(
+                            "handle",
+                            "tileops_fa3_shaped_check_v_mma_layout_boundary",
+                            v_stage0.access_ptr("r"),
+                            tx,
+                        )
+                    else:
+                        T.call_extern(
+                            "handle",
+                            "tileops_fa3_shaped_check_v_mma_layout_boundary",
+                            v_stage1.access_ptr("r"),
+                            tx,
+                        )
+                T.barrier_arrive(v_done)
+
+            tail_phase = (num_n_blocks - 1) % 2
+            T.barrier_wait(v_transform_full, tail_phase)
+            if ((check_v) or (check_all and bidh % 4 == 3)) and tx == 128:
+                if tail_phase == 0:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_check_v_mma_layout_boundary",
+                        v_stage0.access_ptr("r"),
+                        tx,
+                    )
+                else:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_check_v_mma_layout_boundary",
+                        v_stage1.access_ptr("r"),
+                        tx,
+                    )
+            T.barrier_arrive(v_done)
+
+        @T.macro
+        def consumer_exact_shadow_wg2(
+            q_tensor,
+            q_stage,
+            q_full,
+            q_done,
+            k_full,
+            k_done,
+            vt_source_full,
+            v_transform_full,
+            v_done,
+            tx: T.int32,
+            tile_m: T.int32,
+            bidh: T.int32,
+            bidb: T.int32,
+        ) -> None:
+            q_row_base = tile_m * 128
+            T.barrier_wait(vt_source_full, 0)
+            T.barrier_wait(k_full, 0)
+            T.barrier_arrive(k_done)
+            if q_row_base + 128 <= seq_len:
+                T.barrier_wait(q_full, 0)
+                if ((check_q) or (check_all and bidh % 4 == 0)) and tx == 256:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_check_q_hlir_consumer_tensor_boundary",
+                        q_stage.access_ptr("r"),
+                        q_tensor.data,
+                        tx,
+                        tile_m,
+                        bidh,
+                        bidb,
+                    )
+                T.barrier_arrive(q_done)
+
+            for exact_iter in T.Pipelined(num_n_blocks - 1, num_stages=0):
+                next_phase = (exact_iter + 1) % 2
+                prev_phase = exact_iter % 2
+                T.barrier_wait(vt_source_full, next_phase)
+                T.barrier_wait(k_full, next_phase)
+                T.barrier_arrive(k_done)
+                T.barrier_wait(v_transform_full, prev_phase)
+                T.barrier_arrive(v_done)
+
+            tail_phase = (num_n_blocks - 1) % 2
+            T.barrier_wait(v_transform_full, tail_phase)
+            T.barrier_arrive(v_done)
+
+        @T.prim_func
+        def main(
+            q: T.Tensor(q_shape, "float8_e4m3fn"),
+            k: T.Tensor(kv_shape, "float8_e4m3fn"),
+            v: T.Tensor(kv_shape, "float8_e4m3fn"),
+            q_descale: T.Tensor((batch, heads_kv), "float"),
+            k_descale: T.Tensor((batch, heads_kv), "float"),
+            v_descale: T.Tensor((batch, heads_kv), "float"),
+            status: T.Tensor(status_shape, "int32"),
+            trace: T.Tensor(trace_shape, "int32"),
+        ) -> None:
+            with T.Kernel(num_m_blocks, heads, batch, threads=384) as (_bx, _by, _bz):
+                q_stage = T.alloc_shared((128, dim), "float8_e4m3fn")
+                k_stage0 = T.alloc_shared((224, dim), "float8_e4m3fn")
+                k_stage1 = T.alloc_shared((224, dim), "float8_e4m3fn")
+                vt_stage0 = T.alloc_shared((dim, 224), "float8_e4m3fn")
+                vt_stage1 = T.alloc_shared((dim, 224), "float8_e4m3fn")
+                v_stage0 = T.alloc_shared((dim, 224), "float8_e4m3fn")
+                v_stage1 = T.alloc_shared((dim, 224), "float8_e4m3fn")
+                q_full = T.alloc_barrier(arrive_count=128)
+                q_done = T.alloc_barrier(arrive_count=256)
+                k_full = T.alloc_barrier(arrive_count=128)
+                k_done = T.alloc_barrier(arrive_count=256)
+                vt_tma_full0 = T.alloc_barrier(arrive_count=1)
+                vt_tma_full1 = T.alloc_barrier(arrive_count=1)
+                vt_source_full = T.alloc_barrier(arrive_count=128)
+                v_transform_full = T.alloc_barrier(arrive_count=128)
+                v_done = T.alloc_barrier(arrive_count=256)
+
+                tx = T.get_thread_binding()
+                tile_m = _bx
+                bidh = _by
+                bidb = _bz
+                bidh_kv = bidh // group
+
+                T.reads(
+                    q[0:batch, 0:seq_len, 0:heads, 0:dim],
+                    k[0:batch, 0:seq_len, 0:heads_kv, 0:dim],
+                    v[0:batch, 0:seq_len, 0:heads_kv, 0:dim],
+                    q_descale[0:batch, 0:heads_kv],
+                    k_descale[0:batch, 0:heads_kv],
+                    v_descale[0:batch, 0:heads_kv],
+                )
+                T.writes(
+                    status[0:1],
+                    trace[0:batch, 0:heads, 0:num_m_blocks, 0:trace_len, 0:4],
+                    q_stage[0:128, 0:dim],
+                    k_stage0[0:224, 0:dim],
+                    k_stage1[0:224, 0:dim],
+                    vt_stage0[0:dim, 0:224],
+                    vt_stage1[0:dim, 0:224],
+                    v_stage0[0:dim, 0:224],
+                    v_stage1[0:dim, 0:224],
+                )
+                T.annotate_layout({
+                    q_stage: tilelang.layout.make_swizzled_layout(q_stage),
+                    k_stage0: tilelang.layout.make_swizzled_layout(k_stage0),
+                    k_stage1: tilelang.layout.make_swizzled_layout(k_stage1),
+                })
+
+                if tx == 0:
+                    status[0] = 0
+                if tx < 128:
+                    producer_exact_shadow(
+                        q,
+                        k,
+                        v,
+                        q_stage,
+                        k_stage0,
+                        k_stage1,
+                        vt_stage0,
+                        vt_stage1,
+                        v_stage0,
+                        v_stage1,
+                        q_full,
+                        q_done,
+                        k_full,
+                        k_done,
+                        vt_tma_full0,
+                        vt_tma_full1,
+                        vt_source_full,
+                        v_transform_full,
+                        v_done,
+                        trace,
+                        tx,
+                        tile_m,
+                        bidh,
+                        bidb,
+                        bidh_kv,
+                    )
+                    if tx == 0:
+                        status[0] = 1
+                elif tx < 256:
+                    consumer_exact_shadow_wg1(
+                        q,
+                        k,
+                        v,
+                        q_stage,
+                        k_stage0,
+                        k_stage1,
+                        vt_stage0,
+                        vt_stage1,
+                        v_stage0,
+                        v_stage1,
+                        q_full,
+                        q_done,
+                        k_full,
+                        k_done,
+                        vt_source_full,
+                        v_transform_full,
+                        v_done,
+                        tx,
+                        tile_m,
+                        bidh,
+                        bidb,
+                        bidh_kv,
+                    )
+                else:
+                    consumer_exact_shadow_wg2(
+                        q,
+                        q_stage,
+                        q_full,
+                        q_done,
+                        k_full,
+                        k_done,
+                        vt_source_full,
+                        v_transform_full,
+                        v_done,
+                        tx,
+                        tile_m,
+                        bidh,
+                        bidb,
+                    )
+
+        return main
+
+    return func()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=1)
@@ -3881,6 +5044,10 @@ def main() -> None:
     parser.add_argument("--producer-tma-hlir-core-shadow-kind", choices=["q", "qk", "qkv", "qkvv"], default="q")
     parser.add_argument("--producer-tma-hlir-vt-to-v-boundary-probe", action="store_true")
     parser.add_argument("--producer-tma-hlir-pv-correctness-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-slim-baseline-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-slim-exact-order-shadow-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-exact-order-shadow-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-exact-order-shadow-checks", choices=["all", "q", "k", "vt", "v", "none"], default="none")
     parser.add_argument("--legacy-raw-device", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.role_run and args.static_persistent_call_extern:
@@ -3917,6 +5084,9 @@ def main() -> None:
         bool(args.producer_tma_hlir_core_shadow_probe),
         bool(args.producer_tma_hlir_vt_to_v_boundary_probe),
         bool(args.producer_tma_hlir_pv_correctness_probe),
+        bool(args.producer_tma_hlir_slim_baseline_probe),
+        bool(args.producer_tma_hlir_slim_exact_order_shadow_probe),
+        bool(args.producer_tma_hlir_exact_order_shadow_probe),
     ])
     if producer_tma_probe_count > 1:
         raise ValueError("producer TMA HLIR probe flags are mutually exclusive")
@@ -3940,6 +5110,12 @@ def main() -> None:
         print("fa3_mode tilelang_vt_to_v_out_of_place_boundary_probe")
     elif args.producer_tma_hlir_pv_correctness_probe:
         print("fa3_mode tilelang_pv_correctness_probe_vt_to_v_out_of_place")
+    elif args.producer_tma_hlir_slim_baseline_probe:
+        print("fa3_mode tilelang_slim_role_split_baseline_probe")
+    elif args.producer_tma_hlir_slim_exact_order_shadow_probe:
+        print("fa3_mode tilelang_slim_role_split_exact_order_shadow_probe")
+    elif args.producer_tma_hlir_exact_order_shadow_probe:
+        print("fa3_mode tilelang_producer_exact_order_shadow_probe")
     elif args.producer_tma_hlir_q_boundary_probe:
         print("fa3_mode tilelang_wg_branch_fa3_prepare_runtime_producer_split_q_tma_hlir_consumer_tensor_boundary_probe")
     elif args.producer_tma_hlir_kv_boundary_probe:
@@ -4101,7 +5277,48 @@ def main() -> None:
             print(f"latency_ms={ms:.6f}")
         return
 
-    if args.producer_tma_hlir_core_shadow_probe:
+    if args.producer_tma_hlir_exact_order_shadow_probe:
+        kernel = build_exact_order_shadow_probe_kernel(
+            args.batch,
+            args.seq_len,
+            args.heads,
+            args.heads_kv,
+            args.dim,
+            args.stages,
+            args.query_smem,
+            args.static_persistent_call_extern,
+            args.producer_tma_hlir_exact_order_shadow_checks,
+        )
+        status, trace = kernel(q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale)
+        torch.cuda.synchronize()
+        print("exact_order_shadow_status", status.cpu().tolist())
+        sample = trace[0, 0, 0].cpu().tolist()
+        print("exact_order_shadow_trace_tile000", sample)
+        if args.bench:
+            ms = bench_kernel(
+                kernel,
+                args=(q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale),
+                n_warmup=args.warmup,
+                n_repeat=args.repeat,
+                n_trials=3,
+            )
+            print(f"latency_ms={ms:.6f}")
+        return
+
+    if args.producer_tma_hlir_slim_baseline_probe or args.producer_tma_hlir_slim_exact_order_shadow_probe:
+        kernel, launcher_so = build_slim_role_split_baseline_kernel(
+            args.batch,
+            args.seq_len,
+            args.heads,
+            args.heads_kv,
+            args.dim,
+            args.smem_bytes,
+            args.stages,
+            args.query_smem,
+            args.static_persistent_call_extern,
+            args.producer_tma_hlir_slim_exact_order_shadow_probe,
+        )
+    elif args.producer_tma_hlir_core_shadow_probe:
         kernel, launcher_so = build_core_shadow_kernel(
             args.batch,
             args.seq_len,
