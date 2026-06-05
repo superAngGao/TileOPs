@@ -3879,6 +3879,1442 @@ throughput ratio  = 0.113451 / 0.156368 = 72.6%
   先让 slim path 使用 exact-order Q/K/Vt->V 的一部分真实输出前置条件，
   再逐步删除 `producer_load_one_tile` / `producer_load_tail` 对应职责。
 
+B3-2a outer tail boundary（2026-06-04）：
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-no-tail-probe
+```
+
+该入口只删除 slim producer path 里 `producer_load_one_tile(...)` 后面的外层：
+
+```text
+tileops_fa3_shaped_producer_load_tail(...)
+```
+
+定位结果：
+
+```text
+tileops_fa3_shaped_producer_load_one_tile(...)
+  mainloop.load(...)
+  mainloop.load_tail(...)
+
+tileops_fa3_shaped_producer_load_tail(...)
+  role/argument boundary check only
+```
+
+因此外层 `producer_load_tail` 不是当前 runtime 必需协议，真正的 FA3 producer
+tail drain 已经包含在 `producer_load_one_tile` 内部。
+
+验证：
+
+```text
+S=896 correctness max_abs=0.000915527 cosine=0.99977273
+S=4096 correctness max_abs=0.000457764 cosine=0.99970412
+S=4096 latency_ms=0.113717 tflops=604.30
+```
+
+结论：
+
+```text
+outer producer_load_tail extern can be removed from the slim performance path.
+The real replacement target remains producer_load_one_tile.
+```
+
+B3-3 boundary-first producer replacement plan：
+
+目标不是简单拆短 C++ 函数，而是把 `producer_load_one_tile` 切成后续
+TileLang 能逐步接管的边界。每个边界必须同时满足：
+
+```text
+algorithmically natural
+FA3 pipeline protocol preserved
+TileLang API can express its side cleanly
+correctness and benchmark gated
+```
+
+边界分层：
+
+```text
+Algorithm boundary:
+  A0 producer context / state
+  A1 initial K/Vt prefetch
+  A2 Q load
+  A3 descending loop K/Vt(next)
+  A4 Vt->V(previous)
+  A5 tail drain
+
+FA3 pipeline boundary:
+  P0 pipeline object construction
+  P1 pipeline_k arrive/advance
+  P2 pipeline_vt arrive/advance
+  P3 pipeline_v arrive/advance
+  P4 barrier_Q / barrier_O
+  P5 smem_pipe_write state
+
+TileLang boundary:
+  TMA descriptors
+  TMA issue
+  phase/parity arithmetic
+  smem.access_ptr(offset=...)
+  simple barrier waits/arrives
+```
+
+所有权原则：
+
+```text
+TileLang owns:
+  descriptors, TMA issue, simple phase arithmetic, shared byte offsets
+
+tiny extern owns:
+  FA3 pipeline object construction
+  PipelineState mutation
+  CUTE typed layout/view construction
+  FA3 pipeline arrive/tail bridge
+```
+
+B3-3a: boundary naming / no-behavior refactor
+
+代码形式：
+
+```text
+producer_validate_role(...)
+producer_make_context / block state
+producer_issue_original_load(...)
+producer_tail_drain_only(...)
+```
+
+验收：
+
+```text
+S=896 correctness pass
+S=4096 correctness pass
+S=4096 latency <= 1.01x slim baseline
+```
+
+gate：
+
+```text
+slim baseline = 0.11345 ms
+B3-3a max    = 0.1146 ms
+```
+
+B3-3a 更新（2026-06-04）：
+
+已完成 no-behavior refactor：
+
+```text
+tileops_fa3_shaped_validate_producer_role(...)
+
+producer_load_one_tile:
+  producer_issue_original_load()
+  producer_tail_drain_only()
+```
+
+当前只改变代码边界命名，不改变 FA3 producer 行为：
+
+```text
+producer_issue_original_load -> mainloop.load(...)
+producer_tail_drain_only     -> mainloop.load_tail(...)
+```
+
+验证：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-baseline-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+correctness max_abs=0.000915527 cosine=0.99977273
+```
+
+benchmark：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-baseline-probe \
+  --bench --warmup 5 --repeat 20
+```
+
+结果：
+
+```text
+correctness max_abs=0.000457764 cosine=0.99970412
+latency_ms=0.113392 tflops=606.03
+```
+
+验收：
+
+```text
+gate <= 0.1146 ms
+actual = 0.113392 ms
+pass
+```
+
+B3-3b: expose TileLang-friendly FA3 stage offsets
+
+新增 tiny extern 方向：
+
+```text
+producer_smem_q_offset_bytes()
+producer_smem_k_offset_bytes(stage)
+producer_smem_vt_offset_bytes(stage)
+producer_smem_v_offset_bytes(stage)
+```
+
+验收：
+
+```text
+offsets are compile-time constants or simple int externs
+correctness unchanged
+benchmark unchanged
+```
+
+B3-3b 更新（2026-06-04）：
+
+已新增只读 offset / size tiny extern：
+
+```text
+tileops_fa3_shaped_smem_q_offset_bytes()
+tileops_fa3_shaped_smem_k_offset_bytes()
+tileops_fa3_shaped_smem_vt_offset_bytes()
+tileops_fa3_shaped_smem_v_offset_bytes()
+
+tileops_fa3_shaped_smem_q_bytes()
+tileops_fa3_shaped_smem_k_bytes()
+tileops_fa3_shaped_smem_vt_bytes()
+tileops_fa3_shaped_smem_v_bytes()
+```
+
+边界选择：
+
+```text
+Expose base offset + total bytes first.
+Do not guess per-stage stride yet.
+```
+
+原因是 `smem_k/smem_vt/smem_v` 的 stage 维度由 CUTE layout/cosize 决定，
+直接假设 `stage * 224 * D` 不够稳。后续真正 TileLang 写入 FA3 stage 时，
+再通过 layout-specific checker 或 tiny extern 暴露 stage pointer。
+
+验证：
+
+```text
+S=896 correctness max_abs=0.000915527 cosine=0.99977273
+S=4096 correctness max_abs=0.000457764 cosine=0.99970412
+S=4096 latency_ms=0.113488 tflops=605.52
+```
+
+验收：
+
+```text
+compile pass
+correctness unchanged
+benchmark unchanged relative to slim baseline
+```
+
+B3-3c: pipeline bridge boundary
+
+先不直接拆 `mainloop.load(...)` / `mainloop.load_tail(...)` 成两个 extern。
+FA3 源码确认：
+
+```text
+mainloop.load(...)
+  mutates smem_pipe_write
+  mutates work_idx
+
+mainloop.load_tail(...)
+  waits barrier_O with work_idx
+  producer_tail(smem_pipe_write)
+```
+
+所以 `load_tail` 不是一个 stateless leaf；它依赖 `load` 推进后的
+`smem_pipe_write/work_idx`。如果把二者拆成两个 TileLang-visible 调用，
+必须先设计 state carrier，或者保持一个 tiny extern 同时拥有 FA3
+PipelineState mutation + tail bridge。
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-state-boundary-probe
+```
+
+代码形式：
+
+```text
+producer_issue_original_load()
+producer_check_load_state_boundary()
+producer_tail_drain_only()
+```
+
+`producer_check_load_state_boundary` 只在该 probe 打开时启用，并且只在
+`tile_m=0,bidh=0,bidb=0,threadIdx.x=0` 检查，避免 debug guard 干扰
+performance path。检查内容：
+
+```text
+active_n_blocks = n_block_max - n_block_min
+expected work_idx = active_n_blocks > 0 ? 1 : 0
+expected count    = active_n_blocks
+expected index    = active_n_blocks % PipelineState::Stages
+expected phase    = 1 ^ ((active_n_blocks / PipelineState::Stages) & 1)
+```
+
+验收：
+
+```text
+S=896 correctness pass
+S=4096 correctness pass
+S=4096 latency <= 1.01x slim baseline
+```
+
+gate：
+
+```text
+slim baseline = 0.11345 ms
+B3-3c max    = 0.1146 ms
+```
+
+通过后，下一步真实替换的边界必须满足：
+
+```text
+TileLang may own:
+  active_n_blocks / loop index / plain phase arithmetic
+
+tiny extern still owns:
+  FA3 PipelineState construction/mutation
+  producer_acquire / producer_get_barrier / producer_commit
+  producer_tail
+```
+
+B3-3c 更新（2026-06-04）：
+
+状态边界 probe 已通过。实现形态：
+
+```text
+producer_issue_original_load()
+producer_check_load_state_boundary()  # single CTA / single thread
+producer_tail_drain_only()
+```
+
+验证：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-state-boundary-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+correctness max_abs=0.000915527 cosine=0.99977273
+```
+
+benchmark：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-state-boundary-probe \
+  --bench --warmup 5 --repeat 20
+```
+
+结果：
+
+```text
+correctness max_abs=0.000457764 cosine=0.99970412
+latency_ms=0.113669 tflops=604.56
+```
+
+验收：
+
+```text
+gate <= 0.1146 ms
+actual = 0.113669 ms
+pass
+```
+
+补充 baseline rerun：
+
+```text
+slim baseline rerun latency_ms=0.112963 tflops=608.33
+state-boundary / rerun baseline = 1.0063x
+```
+
+结论：
+
+```text
+load_tail cannot be independently HLIR-ized unless smem_pipe_write/work_idx
+state is carried across the boundary.  The next replacement step should keep
+FA3 PipelineState mutation inside a tiny bridge while TileLang owns only plain
+loop arithmetic and data movement descriptors.
+```
+
+B3-3d: first real TileLang-owned movement
+
+第一刀优先 Vt：
+
+```text
+TileLang/PTX issues Vt TMA into FA3 smem_vt stage
+tiny extern bridges FA3 pipeline_vt arrive/advance
+FA3 consumer unchanged
+tail drain unchanged
+```
+
+性能目标：
+
+```text
+shadow path = 0.15637 ms
+baseline    = 0.11345 ms
+acceptable <= 0.145 ms
+good       <= 0.130 ms
+```
+
+停止条件：
+
+```text
+consumer must change before producer step can be validated
+TileLang must construct FA3 PipelineState or CUTE typed layout objects
+benchmark exceeds shadow path
+correctness degrades
+helper copy becomes larger than the original mainloop fragment
+```
+
+B3-3d-0: FA3 stage pointer bridge（2026-06-04）
+
+在真正把 Vt TMA 写入 FA3 `smem_vt` 之前，先补一个 stage pointer
+边界。原因：
+
+```text
+B3-3b only exposed base offset + total bytes.
+Do not guess stage stride from 224 * D.
+Use FA3 CUTE layouts to compute stage offsets.
+```
+
+新增 tiny extern：
+
+```text
+tileops_fa3_shaped_smem_k_stage_offset_bytes(stage)
+tileops_fa3_shaped_smem_vt_stage_offset_bytes(stage)
+tileops_fa3_shaped_smem_v_stage_offset_bytes(stage)
+```
+
+实现原则：
+
+```text
+offset = base_offset + SmemLayout*(0, 0, stage) * sizeof(Element)
+```
+
+其中 `SmemLayout*` 分别使用 FA3 自己的：
+
+```text
+CollectiveMainloop::SmemLayoutK
+CollectiveMainloop::SmemLayoutVt
+CollectiveMainloop::SmemLayoutVtMma
+```
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-stage-offset-probe
+```
+
+probe 只在 `tile_m=0,bidh=0,bidb=0,threadIdx.x=0` 检查：
+
+```text
+stage0 == base
+stage1 > stage0
+stage offsets are inside each FA3 storage object
+stage offsets are 128B aligned
+```
+
+验证：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-stage-offset-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+correctness max_abs=0.000915527 cosine=0.99977273
+```
+
+benchmark：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-stage-offset-probe \
+  --bench --warmup 5 --repeat 20
+```
+
+结果：
+
+```text
+correctness max_abs=0.000457764 cosine=0.99970412
+latency_ms=0.112827 tflops=609.07
+```
+
+补充 baseline rerun：
+
+```text
+slim baseline rerun latency_ms=0.113042 tflops=607.91
+stage-offset / rerun baseline = 0.9981x
+```
+
+验收：
+
+```text
+compile pass
+correctness unchanged
+latency <= 1.01x slim baseline
+pass
+```
+
+结论：
+
+```text
+TileLang can now ask tiny extern for FA3 K/Vt/V per-stage destination
+offsets without constructing CUTE layouts itself.
+```
+
+下一步 B3-3d-1：
+
+```text
+Use tileops_fa3_shaped_smem_vt_stage_offset_bytes(stage)
+as the TileLang/PTX Vt TMA destination address.
+Keep FA3 PipelineState acquire/commit inside a tiny bridge.
+Do not let TileLang construct FA3 PipelineState.
+```
+
+B3-3d-1: TileLang/PTX writes one Vt tile into FA3 smem_vt（2026-06-04）
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-stage-probe
+```
+
+代码形式：
+
+```text
+producer_slim_fa3_vt_stage_probe:
+  vt_stage0_offset = tileops_fa3_shaped_smem_vt_stage_offset_bytes(0)
+  tx0 issues tl::fp8_tma_load_4d_ptx into smem + vt_stage0_offset
+  wait TMA mbarrier
+  tx128 checks tileops_fa3_shaped_check_vt_hlir_stage_boundary(...)
+  sync CTA
+  original FA3 producer_load_one_tile still runs afterwards
+```
+
+这一步已经不是 shadow buffer：TMA destination 是真实 FA3
+`SharedStorage::tensors.mainloop.smem_vt` 的 stage 0。为了不改变 consumer
+协议，FA3 原 producer 随后仍会正常执行并覆盖/生产自己的 K/Vt/V pipeline。
+
+验证：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-fa3-vt-stage-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+correctness max_abs=0.000915527 cosine=0.99977273
+```
+
+benchmark：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-fa3-vt-stage-probe \
+  --bench --warmup 5 --repeat 20
+```
+
+结果：
+
+```text
+correctness max_abs=0.000457764 cosine=0.99970412
+latency_ms=0.118467 tflops=580.07
+```
+
+对比：
+
+```text
+slim baseline rerun       = 0.113042 ms
+one FA3 Vt-stage preload  = 0.118467 ms
+ratio                     = 1.048x
+exact-order shadow        = 0.15637 ms
+```
+
+验收：
+
+```text
+compile pass
+FA3 smem_vt stage content check pass
+end-to-end correctness unchanged
+latency below 0.130 ms "good" target
+pass
+```
+
+结论：
+
+```text
+TileLang/PTX can target real FA3 smem_vt(stage) using the tiny stage-offset
+bridge.  The remaining missing piece for replacement is not the address; it is
+the FA3 pipeline acquire/commit bridge that makes consumers wait on the
+TileLang-produced stage.
+```
+
+下一步 B3-3d-2：
+
+```text
+Add a tiny extern that owns pipeline_vt producer_acquire/get_barrier/commit
+for a caller-provided PipelineState-equivalent index/phase.
+Then replace exactly one FA3 Vt TMA issue with TileLang/PTX + bridge, leaving
+the rest of mainloop.load intact if possible.
+```
+
+B3-3d-2 更新：FA3 pipeline barrier handle boundary（2026-06-04）：
+
+边界修正：
+
+```text
+旧设想:
+  TileLang issues Vt TMA with its own mbarrier
+  tiny extern does FA3 pipeline commit
+
+修正后:
+  tiny extern exposes/acquires FA3 pipeline_vt full barrier
+  TMA itself must complete_tx that FA3 barrier
+```
+
+原因：
+
+```text
+PipelineTmaAsync::producer_commit(..., bytes) is NOP in the normal TMA path.
+Consumer visibility comes from TMA complete_tx on producer_get_barrier(state).
+```
+
+已新增 helper：
+
+```text
+tileops_fa3_shaped_init_pipeline_vt_only(...)
+tileops_fa3_shaped_pipeline_vt_producer_acquire_barrier(...)
+tileops_fa3_shaped_pipeline_vt_tma_load_4d(...)
+tileops_fa3_shaped_pipeline_vt_consumer_wait_release_check(...)
+```
+
+其中：
+
+```text
+producer_acquire_barrier:
+  reconstructs MainloopPipelineVt
+  creates PipelineState(stage, phase, count)
+  calls pipeline_vt.producer_acquire(state)
+  returns pipeline_vt.producer_get_barrier(state)
+
+pipeline_vt_tma_load_4d:
+  acquires the FA3 barrier
+  issues tl::fp8_tma_load_4d_ptx with that barrier
+```
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-barrier-smoke-probe
+```
+
+但该入口当前默认禁用，需要：
+
+```text
+--allow-slow-fa3-vt-barrier-smoke
+```
+
+原因是 smoke kernel 的 TileLang lowering 形状出现 Python-side timeout：
+
+```text
+S=896, single-CTA minimized smoke:
+  no nvcc/ptxas process yet
+  python lowering process kept consuming CPU past 1-2 minutes
+  killed manually to avoid stale process
+```
+
+对照验证：
+
+```bash
+timeout 180s env CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-fa3-vt-stage-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+correctness max_abs=0.000915527 cosine=0.99977273
+```
+
+说明：
+
+```text
+The new helpers do not break the existing FA3-smem Vt stage probe.
+The unresolved issue is the standalone TileLang smoke IR/lowering shape, not
+the existing stage-offset or FA3-smem write path.
+```
+
+当前结论：
+
+```text
+方案 A 的真实边界应是 "FA3 barrier handle boundary"。
+地址、descriptor、PTX TMA 已经成立；下一步应避免 standalone smoke 的
+lowering slow path，直接在已能编译的 slim shell 中嵌入 pipeline_vt_tma_load_4d，
+或临时做一个 CUDA-side wrapper-only probe 来验证 complete_tx -> consumer_wait。
+```
+
+B3-3d-2b: slim-shell embedded barrier preload attempt（2026-06-04）：
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-barrier-preload-probe
+```
+
+尝试内容：
+
+```text
+Use the already-compiling slim role-split shell.
+After tileops_fa3_shaped_prepare_runtime(...)
+and before tileops_fa3_shaped_producer_load_one_tile(...):
+
+  tx0:
+    tileops_fa3_shaped_pipeline_vt_tma_load_4d(
+      vt_tma_desc,
+      smem,
+      smem + smem_vt_stage0_offset,
+      coords,
+      PipelineState(stage=0, phase=1, count=0))
+
+  tx128:
+    tileops_fa3_shaped_pipeline_vt_consumer_wait_release_check(
+      PipelineState(stage=0, phase=0, count=0))
+
+Then let the original FA3 producer/consumer path run.
+```
+
+这个 probe 不是最终替换：
+
+```text
+It is a preload/check/release bridge test inside the real slim shell shape.
+Original mainloop.load(...) still runs afterwards.
+```
+
+运行：
+
+```bash
+timeout 240s env CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-fa3-vt-barrier-preload-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+timeout 240s
+no nvcc/ptxas/cicc process observed for this kernel
+python lowering process consumed CPU until timeout
+```
+
+排除项：
+
+```text
+Changed wrapper call from T.call_extern(...) to tir.call_extern(...).
+Result unchanged: still Python-side lowering timeout.
+```
+
+为了避免误跑，入口默认禁用，需要显式：
+
+```text
+--allow-slow-fa3-vt-barrier-preload
+```
+
+结论：
+
+```text
+This is not a FA3 runtime/protocol failure yet.
+The replacement probe does not reach CUDA compilation.
+
+The current blocker is a TileLang lowering/codegen shape involving:
+  CUtensorMap descriptor created by TileLang
+  passed into a custom extern wrapper
+  wrapper calls tl::fp8_tma_load_4d_ptx with FA3 pipeline barrier
+
+Direct tl::fp8_tma_load_4d_ptx in TileLang still compiles.
+Custom extern helper without passing CUtensorMap should be tried next,
+or the helper should receive enough ordinary ints/pointers to reconstruct/use
+FA3's own descriptor path internally.
+```
+
+B3-3d-2c: slim-shell raw TileLang TMA with FA3 barrier（2026-06-04）：
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-barrier-tl-tma-probe
+```
+
+尝试内容：
+
+```text
+Keep the FA3 helper boundary only for pipeline_vt barrier ownership:
+
+  tx0:
+    vt_barrier =
+      tileops_fa3_shaped_pipeline_vt_producer_acquire_barrier(
+        smem, PipelineState(stage=0, phase=1, count=0))
+
+    T.tma_load(
+      vt_tma_desc,
+      vt_barrier,
+      smem + smem_vt_stage0_offset,
+      coords,
+      EVICT_NORMAL)
+
+  tx128:
+    tileops_fa3_shaped_pipeline_vt_consumer_wait_release_check(...)
+```
+
+这一步换了什么：
+
+```text
+descriptor no longer crosses a custom extern boundary.
+TMA issue is TileLang's own tl.tma_load lowering.
+The barrier argument is a raw FA3 pipeline_vt full-barrier pointer.
+```
+
+没换什么：
+
+```text
+FA3 still owns SharedStorage/pipeline_vt initialization.
+FA3 helper still owns producer_acquire and consumer_wait/release/check.
+Original FA3 producer/consumer path still runs after the probe.
+```
+
+运行：
+
+```bash
+timeout 240s env CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-fa3-vt-barrier-tl-tma-probe \
+  --warmup 1 --repeat 1
+```
+
+结果：
+
+```text
+Generated CUDA and cubin successfully.
+Generated CUDA contains:
+  void* vt_barrier = tileops_fa3_shaped_pipeline_vt_producer_acquire_barrier(...)
+  tl::tma_load(v_desc_1, vt_barrier, smem + vt_stage0_offset, 0, bidh_kv, 672, 0)
+
+But runtime timed out at 240s under CUDA_LAUNCH_BLOCKING=1.
+No leftover _probe_tilelang_fa3_shaped_shell.py/nvcc/ptxas/cicc process.
+```
+
+一个中间误区：
+
+```text
+Tried adding producer_expect_transaction after producer_acquire.
+That compiled but also timed out.
+For this PipelineTmaAsyncNoCluster<Base=PipelineTmaAsync> shape,
+producer_acquire already performs arrive_and_expect_tx(params.transaction_bytes),
+so the extra expect likely double-counted transaction bytes.
+```
+
+为了避免误跑，入口默认禁用，需要显式：
+
+```text
+--allow-slow-fa3-vt-barrier-tl-tma
+```
+
+结论：
+
+```text
+TileLang TMA itself can lower/codegen with a raw FA3 barrier pointer.
+The blocker is now runtime protocol/state matching, not CUtensorMap custom
+extern lowering.
+
+This branch is not the next mainline replacement yet. Return to the mainline:
+either replace a real FA3 Vt load in-place so the original state machine
+advances naturally, or move the whole Vt load+wait+transpose slice under one
+CUDA-side helper before peeling it back into TileLang again.
+```
+
+B3-3d-2d: next start point, move consumer wait to TileLang barrier（2026-06-04）：
+
+讨论结论：
+
+```text
+The last non-hanging/pass step was fa3_vt_stage_probe:
+  TileLang descriptor
+  TileLang-owned mbarrier
+  TileLang/PTX TMA into real FA3 smem_vt(stage0)
+  TileLang wait/check of the written smem contents
+
+The first problematic step was not "TileLang can issue TMA".
+The first problematic step was asking FA3 pipeline_vt.consumer_wait(...)
+to observe a stage produced by a TileLang-issued TMA.
+```
+
+因此明天从这个分叉继续：
+
+```text
+Keep producer TMA on TileLang.
+Move the matching consumer wait back to a TileLang-owned barrier too.
+Still write into the real FA3 smem_vt(stage0) address.
+Then call only the minimal FA3-side Vt consumer/transform/check helper.
+```
+
+目标不是最终替换，而是隔离问题：
+
+```text
+If this passes:
+  TMA descriptor, coords, FA3 smem_vt layout, and Vt data readiness are good.
+  The remaining issue is specifically FA3 pipeline_vt state/protocol matching.
+
+If this still hangs/fails:
+  The issue is lower than FA3 pipeline_vt consumer_wait, likely around
+  smem visibility, TMA completion, or the downstream Vt->V helper boundary.
+```
+
+建议新增入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-tl-barrier-consume-probe
+```
+
+预期 shape：
+
+```text
+tx0:
+  T.mbarrier_expect_tx(vt_tma_full, vt_shadow_bytes)
+  T.tma_load or tl::fp8_tma_load_4d_ptx(
+    vt_tma_desc,
+    vt_tma_full[0],
+    smem + smem_vt_stage0_offset,
+    coords)
+  T.barrier_arrive(vt_tma_full)
+
+consumer side:
+  T.mbarrier_wait_parity(vt_tma_full, 0)
+  call minimal FA3 helper to consume/check smem_vt(stage0)
+```
+
+保持不变：
+
+```text
+FA3 still owns SharedStorage layout.
+The destination is still real FA3 smem_vt(stage0).
+Original FA3 main path may still run after the probe, unless the new probe
+explicitly returns early or writes only a status buffer.
+```
+
+先不要继续深挖：
+
+```text
+Do not spend the next turn on the custom-extern CUtensorMap lowering hang.
+Do not yet try to fully replace producer_load_one_tile.
+First prove the all-TileLang-barrier Vt preload/consume slice.
+```
+
+B3-3d-2d 更新：all-TileLang-barrier Vt preload/consume passed（2026-06-05）：
+
+已实现入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-tl-barrier-consume-probe
+```
+
+实现形状：
+
+```text
+After tileops_fa3_shaped_prepare_runtime(...)
+and before original tileops_fa3_shaped_producer_load_one_tile(...):
+
+  tx0:
+    TileLang-owned vt_tma_full barrier
+    tl::fp8_tma_load_4d_ptx(
+      vt_tma_desc,
+      vt_tma_full[0],
+      real FA3 smem_vt(stage0),
+      coords for last V tile)
+    T.barrier_arrive(vt_tma_full)
+
+  all threads:
+    T.mbarrier_wait_parity(vt_tma_full, 0)
+
+  tx128:
+    check real FA3 smem_vt(stage0) against global V
+
+  tx < 128:
+    tileops_fa3_shaped_vt_to_v_boundary(
+      real FA3 smem_vt(stage0),
+      real FA3 smem_v(stage0),
+      tx)
+
+  tx128:
+    check real FA3 smem_v(stage0) is consumable as V MMA layout
+
+Then the original FA3 producer/consumer path still runs.
+```
+
+这一步换了什么：
+
+```text
+Consumer-side readiness no longer uses FA3 pipeline_vt.consumer_wait.
+Producer and matching consumer wait both use the same TileLang-owned barrier.
+The memory destination remains real FA3 SharedStorage:
+  smem_vt(stage0) for TMA destination
+  smem_v(stage0) for Vt->V transform destination
+```
+
+没换什么：
+
+```text
+The original FA3 main path still executes after the probe.
+The probe is still a preload/check slice, not yet a replacement of
+producer_load_one_tile.
+```
+
+运行结果：
+
+```bash
+timeout 180s env CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 896 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-fa3-vt-tl-barrier-consume-probe \
+  --warmup 1 --repeat 1
+```
+
+```text
+out torch.Size([1, 896, 8, 128]) torch.bfloat16 finite True
+lse torch.Size([1, 8, 896]) torch.float32 finite True
+correctness max_abs=0.000915527 cosine=0.99977273
+```
+
+```bash
+timeout 240s env CUDA_LAUNCH_BLOCKING=1 TMPDIR=/home/ga/TileOPs/.tmp/tvm_tmp \
+python _probe_tilelang_fa3_shaped_shell.py \
+  --batch 1 --seq-len 4096 --heads 8 --heads-kv 2 \
+  --producer-tma-hlir-slim-fa3-vt-tl-barrier-consume-probe \
+  --warmup 1 --repeat 1
+```
+
+```text
+out torch.Size([1, 4096, 8, 128]) torch.bfloat16 finite True
+lse torch.Size([1, 8, 4096]) torch.float32 finite True
+correctness max_abs=0.000457764 cosine=0.99970412
+```
+
+中间失败：
+
+```text
+First version used tileops_fa3_shaped_check_v_mma_hlir_stage_boundary
+to compare V MMA layout directly against global V at sampled (d,n).
+It compiled but hit CUDA_ERROR_LAUNCH_FAILED, consistent with a device trap.
+
+That checker is too strong / likely not semantically correct for the
+post-transform MMA layout.  The passing version checks:
+  Vt stage data against global V before transform
+  V MMA layout structural consumability after transform
+```
+
+结论：
+
+```text
+This isolates the previous hang.
+TileLang can:
+  issue the Vt TMA
+  use a TileLang-owned barrier for the matching wait
+  write real FA3 smem_vt(stage0)
+  call the FA3 Vt->V transform helper into real FA3 smem_v(stage0)
+
+Therefore the raw FA3-barrier runtime timeout is specifically about
+FA3 pipeline_vt protocol/state matching, not about TMA descriptor, coords,
+FA3 smem layout, TMA completion visibility under TileLang-owned barrier, or
+the Vt->V transform helper.
+```
+
+Next step:
+
+```text
+Use this passing all-TileLang-barrier slice as the scaffold for a real
+replacement attempt:
+  remove / bypass exactly one FA3 Vt load+transform in producer_load_one_tile
+  keep the TileLang-owned barrier for that slice initially
+  only after dataflow replacement passes, revisit mapping it back onto
+  FA3 pipeline_vt state.
+```
+
+B3-3d-2e: first real replacement attempts both timeout（2026-06-05）：
+
+目标：
+
+```text
+Stop merely preloading/checking.
+Actually prevent FA3 from duplicating the first V stage work.
+```
+
+尝试 1：TileLang owns first Vt TMA + Vt->V, then handoff through FA3 pipeline_v
+
+入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-tl-barrier-replace-first-probe
+```
+
+实现：
+
+```text
+TileLang:
+  TMA first/last V tile into real FA3 smem_vt(stage0)
+  TileLang barrier wait
+  Vt->V into real FA3 smem_v(stage0)
+  pipeline_v.producer_acquire/commit(stage=0, phase=1, count=0)
+
+FA3 header macro:
+  TILEOPS_FA3_SHAPED_SKIP_FIRST_V_LOAD_TRANSFORM=1
+  skips first load_V(...)
+  skips first copy_Vt_to_V(...)
+```
+
+两个 placement 都试过：
+
+```text
+pre-branch placement:
+  replacement runs before producer/consumer role branch
+  timeout 180s
+
+producer-branch placement:
+  replacement runs only in tx < 128 branch, while consumers enter FA3 helpers
+  timeout 180s
+```
+
+观察：
+
+```text
+Both variants generated CUDA/cubin successfully.
+The producer-branch CUDA showed the intended shape:
+  TileLang Vt TMA
+  TileLang barrier wait
+  pipeline_v producer_acquire
+  Vt->V
+  pipeline_v producer_commit
+  original producer_load_one_tile(...)
+
+Runtime still timed out.
+```
+
+解释：
+
+```text
+This is likely not a TileLang TMA/data-layout failure.
+The likely deadlock is pipeline_v handoff timing/state:
+  FA3 normally reaches copy_Vt_to_V only after K/Q/barrier_O scheduling.
+  Forcing pipeline_v acquire/commit before or beside that schedule can
+  wait on empty/full phases that the FA3 consumers have not released yet.
+```
+
+尝试 2：TileLang replaces only first Vt TMA, FA3 keeps copy_Vt_to_V
+
+入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-fa3-barrier-replace-first-load-probe
+```
+
+实现：
+
+```text
+TileLang, in producer branch:
+  vt_barrier =
+    tileops_fa3_shaped_pipeline_vt_producer_acquire_barrier(
+      smem, PipelineState(stage=0, phase=1, count=0))
+  T.tma_load(vt_tma_desc, vt_barrier, real FA3 smem_vt(stage0), coords)
+
+FA3 header macro:
+  TILEOPS_FA3_SHAPED_SKIP_FIRST_V_LOAD=1
+  skips first load_V(...)
+  does not skip first copy_Vt_to_V(...)
+```
+
+结果：
+
+```text
+Generated CUDA/cubin successfully.
+Runtime timed out at 180s.
+```
+
+解释：
+
+```text
+This confirms the earlier raw-FA3-barrier result in a more realistic placement:
+TileLang can codegen the TMA with a raw FA3 pipeline_vt barrier pointer, but
+the FA3 pipeline_vt protocol/state still does not close.
+```
+
+为了避免误跑，两个入口默认禁用，需要显式：
+
+```text
+--allow-slow-fa3-vt-tl-barrier-replace-first
+--allow-slow-fa3-vt-fa3-barrier-replace-first-load
+```
+
+当前工程结论：
+
+```text
+The passing slice is:
+  TileLang barrier + TileLang Vt TMA + TileLang wait + FA3 Vt->V helper.
+
+The failing boundary is any attempt to hand that first V stage back into
+FA3 pipeline_v / pipeline_vt without also changing the consumer-side protocol.
+
+Therefore the next formal engineering step should move the first V consumer
+side to the TileLang-owned barrier as well, or create a small explicit
+TileLang-owned V-ready bridge consumed by the FA3 consumer path.
+Do not keep trying to force only the producer side through FA3 pipeline_vt.
+```
+
+B3-3d-2f: inspect replace-first-data CUDA/SASS（2026-06-05）：
+
+新增入口：
+
+```text
+--producer-tma-hlir-slim-fa3-vt-tl-barrier-replace-first-data-probe
+```
+
+目标：
+
+```text
+Avoid the earlier "early pipeline_v acquire/commit" shape.
+TileLang owns only first V data movement:
+  Vt TMA -> TileLang barrier wait -> Vt->V into real FA3 smem_v(stage0)
+FA3 header, at original copy_Vt_to_V timing:
+  skip first load_V(...)
+  if smem_pipe_write.count()==0:
+    pipeline_v.producer_acquire(...)
+    fence_view_async_shared()
+    pipeline_v.producer_commit(...)
+    TransposeBarrier sync
+    return
+```
+
+第一次实现只在 `tx < 128` producer branch 中执行 TileLang prelude。
+它生成 CUDA/cubin，但 runtime timeout。
+
+随后按“可能是 consumer 太早进入 FA3 helper”修正为 CTA-wide prelude：
+
+```cuda
+fa3_vt_tl_consume_full[0].expect_transaction(28672);
+tl::fp8_tma_load_4d_ptx(..., fa3_vt_tl_consume_full[0], ...);
+fa3_vt_tl_consume_full[0].arrive();
+fa3_vt_tl_consume_full[0].wait(0);
+__syncthreads();
+if (threadIdx.x < 128) {
+  tileops_fa3_shaped_vt_to_v_boundary(...);
+}
+__syncthreads();
+```
+
+最新 generated CUDA：
+
+```text
+.tmp/tvm_tmp/tvm-debug-mode-tempdirs/2026-06-05T10-53-30___nexrzq56/00000/tvm_kernels.cu
+```
+
+SASS inspection of the previous same-shape producer-only CUDA showed the
+TileLang TMA mbarrier lowering exists:
+
+```text
+SYNCS.ARRIVE.TRANS64.RED.A0TR   // expect_tx / transaction setup
+UTMALDG.4D                      // TMA load
+SYNCS.ARRIVE.TRANS64.A1T0       // explicit arrive
+SYNCS.PHASECHK.TRANS64.TRYWAIT  // parity wait
+```
+
+PTX inspection of the latest CTA-wide generated CUDA:
+
+```text
+.tmp/tvm_tmp/tvm-debug-mode-tempdirs/2026-06-05T10-53-30___nexrzq56/00000/tvm_kernels.ptx
+```
+
+Important barrier offsets:
+
+```text
+190544 / 190552: pipeline_v.full,  init count 128
+190560 / 190568: pipeline_v.empty, init count 256
+190576 / 190584: pipeline_vt.full, init count 1
+190592 / 190600: pipeline_vt.empty, init count 1
+```
+
+The standalone TileLang-owned first Vt TMA prelude lowers to:
+
+```ptx
+mbarrier.expect_tx.shared::cta.b64 [...], 28672
+cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes ...
+mbarrier.arrive.shared::cta.b64 _, [...]
+mbarrier.try_wait.parity.shared::cta.b64 ..., phase=0
+```
+
+This is the expected `complete_tx + explicit arrive` pattern: the transaction
+bytes and the arrival count are two separate parts of the mbarrier completion.
+
+For the fake `pipeline_v` publish, PTX shows:
+
+```ptx
+mbarrier.try_wait.parity.shared::cta.b64 ..., [pipeline_v.empty[0]], phase=1
+fence.proxy.async.shared::cta
+mbarrier.arrive.shared::cta.b64 _, [pipeline_v.full[0]]
+bar.sync 2, 128
+```
+
+Cutlass `make_producer_start_state()` also sets the initial producer phase to
+`1` because the buffers are initially empty. The FA3 consumer side waits on
+`pipeline_v.full[0]` with phase `0`. Therefore the first-stage
+`pipeline_v.empty -> pipeline_v.full` handoff is directionally consistent at
+the PTX level.
+
+结论：
+
+```text
+The hang is unlikely to be "TileLang cannot lower TMA barrier arrive/wait".
+CUDA/SASS/PTX contain a consistent TileLang-owned TMA mbarrier sequence.
+CTA-wide synchronization before entering FA3 producer/consumer helpers also
+does not fix the timeout.
+
+The likely failing boundary is now narrower:
+  not the raw TileLang TMA mbarrier sequence,
+  and not the first pipeline_v full/empty phase direction by itself.
+
+Next useful probe:
+  instrument status around fake pipeline_v publish, consumer V wait, consumer
+  V release, and the named TransposeBarrier / later pipeline barriers.
+```
+
+B3-3d-2g: close skipped `pipeline_vt` epoch accounting（2026-06-05）：
+
+Root cause:
+
+```text
+The first Vt stage is supplied outside FA3 pipeline_vt.
+However, FA3's producer loop and load_tail still expect pipeline_vt to advance
+one logical epoch for that skipped stage.
+
+Skipping only load_V/copy_Vt_to_V left pipeline_vt state inconsistent:
+  pipeline_vt.full[0] never completed phase0
+  pipeline_vt.empty[0] was not released for the skipped consumer epoch
+
+This can hang:
+  S=224: tail waits on the skipped stage accounting
+  S>=672: stage0 is reused and consumer expects full[0] phase1
+```
+
+Fix in the first-data branch:
+
+```cuda
+pipeline_v.producer_acquire(smem_pipe_write);
+fence_view_async_shared();
+pipeline_v.producer_commit(smem_pipe_write);
+NamedBarrier::sync(TransposeBarrier);
+
+// Close the skipped pipeline_vt epoch as if the first Vt stage had been
+// consumed by copy_Vt_to_V.
+if (thread_idx == 0) {
+  ClusterTransactionBarrier::arrive_and_expect_tx(
+      pipeline_vt.producer_get_barrier(smem_pipe_write), 0);
+}
+pipeline_vt.consumer_release(smem_pipe_read);
+return;
+```
+
+The zero-byte `arrive_and_expect_tx` advances `pipeline_vt.full[0]` by one
+epoch without adding transaction bytes. `pipeline_vt.consumer_release` advances
+`pipeline_vt.empty[0]`. Both are needed: only releasing empty fixes S=224/S=448,
+but S=672 still hangs when stage0 is reused.
+
+Cache note:
+
+```text
+Changing .github/runner/vendor/flash-attention/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+did not reliably invalidate the TileLang JIT artifact, because the helper
+header hash does not include the transitive vendor header contents.
+```
+
+Added a dummy compile flag to the slim role-split JIT key:
+
+```text
+-DTILEOPS_FA3_SHAPED_MAINLOOP_HEADER_DIGEST_<sha16>=1
+```
+
+This forced recompilation and removed the confusing "prints fa3_mode but no
+TileLang compile log" cache artifact.
+
+Validation after cache-buster:
+
+```text
+S=224,  H=1, HKV=1: correctness max_abs=0.00152588 cosine=0.99973959
+S=448,  H=1, HKV=1: correctness max_abs=0.00108337 cosine=0.99974084
+S=672,  H=1, HKV=1: correctness max_abs=0.000915527 cosine=0.99974644
+S=896,  H=1, HKV=1: correctness max_abs=0.000915527 cosine=0.99972862
+S=4096, H=8, HKV=2: correctness max_abs=0.000457764 cosine=0.99970412
+```
+
+Benchmark:
+
+```text
+S=4096, H=8, HKV=2 replace-first-data:
+  latency_ms=0.121119 tflops=567.37
+
+S=4096, H=8, HKV=2 slim baseline, same cache-buster build:
+  latency_ms=0.112052 tflops=613.28
+
+ratio = 0.121119 / 0.112052 = 1.0809x
+```
+
+为了避免误跑，该入口也默认禁用，需要显式：
+
+```text
+--allow-slow-fa3-vt-tl-barrier-replace-first-data
+```
+
 **B4: remove producer core sub-call**
 
 边界：

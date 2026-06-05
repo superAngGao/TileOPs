@@ -57,6 +57,11 @@ TMA_OOB_FILL_NONE = 0
 EVICT_NORMAL = 0
 
 
+def _file_cache_digest(path: Path) -> str:
+    data = path.read_bytes()
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
 def _cuda_source_kernel_with_smem(
     *blocks: int,
     threads: int,
@@ -602,6 +607,8 @@ def _extern_helper_header_source(
     stages: int,
     query_smem: bool,
     static_persistent_call_extern: bool,
+    state_boundary_check: bool = False,
+    stage_offset_check: bool = False,
 ) -> str:
     if dim != 128:
         raise ValueError("probe only supports dim=128")
@@ -1068,6 +1075,250 @@ extern "C" __device__ __forceinline__ void tileops_fa3_shaped_prepare_runtime(
   }}
 }}
 
+extern "C" __device__ __forceinline__ void tileops_fa3_shaped_check_vt_hlir_stage_boundary(
+    const void* vt_stage_raw,
+    const void* v_raw,
+    int tx_tl,
+    int tile_n_tl,
+    int bidh_kv_tl,
+    int bidb_tl);
+
+extern "C" __device__ __forceinline__ void tileops_fa3_shaped_init_pipeline_vt_only(
+    void* smem_raw) {{
+  using namespace cute;
+  using namespace tileops_fa3_call_extern_detail;
+
+  if constexpr ({str(query_smem).lower()}) {{
+    return;
+  }}
+
+  char* smem_buf = reinterpret_cast<char*>(smem_raw);
+  typename AttnKernel::SharedStorage& shared_storage =
+      *reinterpret_cast<typename AttnKernel::SharedStorage*>(smem_buf);
+
+  static constexpr int NumMmaThreads =
+      AttnKernel::NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
+  using ClusterShape = typename AttnKernel::ClusterShape;
+  using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
+  using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
+  using PipelineParamsK = typename MainloopPipelineK::Params;
+  using PipelineParamsVt = typename MainloopPipelineVt::Params;
+
+  int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
+  int const warp_group_idx = cutlass::canonical_warp_group_idx();
+
+  PipelineParamsK pipeline_params_k;
+  pipeline_params_k.role = warp_group_idx == 0
+      ? MainloopPipelineK::ThreadCategory::Producer
+      : MainloopPipelineK::ThreadCategory::Consumer;
+  pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
+  pipeline_params_k.is_leader = warp_group_thread_idx == 0;
+  pipeline_params_k.num_consumers =
+      !AttnKernel::LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
+
+  static_assert(is_same_v<PipelineParamsK, PipelineParamsVt>);
+  PipelineParamsVt pipeline_params_vt = pipeline_params_k;
+  if constexpr (!AttnKernel::SameHeadDim) {{
+    pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+    if constexpr (AttnKernel::LargeHeadDimV) {{ pipeline_params_vt.num_consumers = NumMmaThreads; }}
+  }}
+  pipeline_params_vt.num_consumers = AttnKernel::NumProducerThreads;
+  MainloopPipelineVt pipeline_vt(
+      shared_storage.pipelines.pipeline_vt, pipeline_params_vt, ClusterShape{{}});
+
+  if constexpr (size(ClusterShape{{}}) > 1) {{
+    cute::cluster_arrive_relaxed();
+    cute::cluster_wait();
+  }} else {{
+    __syncthreads();
+  }}
+}}
+
+extern "C" __device__ __forceinline__ uint64_t*
+tileops_fa3_shaped_pipeline_vt_producer_acquire_barrier(
+    void* smem_raw,
+    int stage_tl,
+    int phase_tl,
+    int count_tl) {{
+  using namespace cute;
+  using namespace tileops_fa3_call_extern_detail;
+
+  char* smem_buf = reinterpret_cast<char*>(smem_raw);
+  typename AttnKernel::SharedStorage& shared_storage =
+      *reinterpret_cast<typename AttnKernel::SharedStorage*>(smem_buf);
+
+  static constexpr int NumMmaThreads =
+      AttnKernel::NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
+  using ClusterShape = typename AttnKernel::ClusterShape;
+  using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
+  using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
+  using PipelineState = typename CollectiveMainloop::PipelineState;
+  using PipelineParamsK = typename MainloopPipelineK::Params;
+  using PipelineParamsVt = typename MainloopPipelineVt::Params;
+
+  int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
+  int const warp_group_idx = cutlass::canonical_warp_group_idx();
+  PipelineParamsK pipeline_params_k;
+  pipeline_params_k.role = warp_group_idx == 0
+      ? MainloopPipelineK::ThreadCategory::Producer
+      : MainloopPipelineK::ThreadCategory::Consumer;
+  pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
+  pipeline_params_k.is_leader = warp_group_thread_idx == 0;
+  pipeline_params_k.num_consumers =
+      !AttnKernel::LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
+  PipelineParamsVt pipeline_params_vt = pipeline_params_k;
+  if constexpr (!AttnKernel::SameHeadDim) {{
+    pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+    if constexpr (AttnKernel::LargeHeadDimV) {{ pipeline_params_vt.num_consumers = NumMmaThreads; }}
+  }}
+  pipeline_params_vt.num_consumers = AttnKernel::NumProducerThreads;
+  MainloopPipelineVt pipeline_vt(
+      shared_storage.pipelines.pipeline_vt, pipeline_params_vt, ClusterShape{{}}, cute::false_type{{}});
+
+  PipelineState state(stage_tl, uint32_t(phase_tl), uint32_t(count_tl));
+  pipeline_vt.producer_acquire(state);
+  return reinterpret_cast<uint64_t*>(pipeline_vt.producer_get_barrier(state));
+}}
+
+extern "C" __device__ __forceinline__ void
+tileops_fa3_shaped_pipeline_vt_tma_load_4d(
+    const CUtensorMap& desc,
+    void* smem_raw,
+    void* vt_stage_raw,
+    int c0,
+    int c1,
+    int c2,
+    int c3,
+    int stage_tl,
+    int phase_tl,
+    int count_tl) {{
+  uint64_t* barrier = tileops_fa3_shaped_pipeline_vt_producer_acquire_barrier(
+      smem_raw, stage_tl, phase_tl, count_tl);
+  tl::fp8_tma_load_4d_ptx(desc, barrier, vt_stage_raw, c0, c1, c2, c3);
+}}
+
+extern "C" __device__ __forceinline__ void
+tileops_fa3_shaped_pipeline_vt_consumer_wait_release_check(
+    void* smem_raw,
+    void* vt_stage_raw,
+    const void* v_raw,
+    int tx_tl,
+    int tile_n_tl,
+    int bidh_kv_tl,
+    int bidb_tl,
+    int stage_tl,
+    int phase_tl,
+    int count_tl) {{
+  using namespace cute;
+  using namespace tileops_fa3_call_extern_detail;
+
+  char* smem_buf = reinterpret_cast<char*>(smem_raw);
+  typename AttnKernel::SharedStorage& shared_storage =
+      *reinterpret_cast<typename AttnKernel::SharedStorage*>(smem_buf);
+
+  static constexpr int NumMmaThreads =
+      AttnKernel::NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
+  using ClusterShape = typename AttnKernel::ClusterShape;
+  using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
+  using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
+  using PipelineState = typename CollectiveMainloop::PipelineState;
+  using PipelineParamsK = typename MainloopPipelineK::Params;
+  using PipelineParamsVt = typename MainloopPipelineVt::Params;
+
+  int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
+  int const warp_group_idx = cutlass::canonical_warp_group_idx();
+  PipelineParamsK pipeline_params_k;
+  pipeline_params_k.role = warp_group_idx == 0
+      ? MainloopPipelineK::ThreadCategory::Producer
+      : MainloopPipelineK::ThreadCategory::Consumer;
+  pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
+  pipeline_params_k.is_leader = warp_group_thread_idx == 0;
+  pipeline_params_k.num_consumers =
+      !AttnKernel::LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
+  PipelineParamsVt pipeline_params_vt = pipeline_params_k;
+  if constexpr (!AttnKernel::SameHeadDim) {{
+    pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+    if constexpr (AttnKernel::LargeHeadDimV) {{ pipeline_params_vt.num_consumers = NumMmaThreads; }}
+  }}
+  pipeline_params_vt.num_consumers = AttnKernel::NumProducerThreads;
+  MainloopPipelineVt pipeline_vt(
+      shared_storage.pipelines.pipeline_vt, pipeline_params_vt, ClusterShape{{}}, cute::false_type{{}});
+
+  PipelineState state(stage_tl, uint32_t(phase_tl), uint32_t(count_tl));
+  pipeline_vt.consumer_wait(state);
+  tileops_fa3_shaped_check_vt_hlir_stage_boundary(
+      vt_stage_raw, v_raw, tx_tl, tile_n_tl, bidh_kv_tl, bidb_tl);
+  pipeline_vt.consumer_release(state);
+}}
+
+extern "C" __device__ __forceinline__ void
+tileops_fa3_shaped_pipeline_v_producer_acquire(
+    void* smem_raw,
+    int stage_tl,
+    int phase_tl,
+    int count_tl) {{
+  using namespace cute;
+  using namespace tileops_fa3_call_extern_detail;
+
+  if constexpr ({str(query_smem).lower()}) {{
+    return;
+  }}
+
+  char* smem_buf = reinterpret_cast<char*>(smem_raw);
+  typename AttnKernel::SharedStorage& shared_storage =
+      *reinterpret_cast<typename AttnKernel::SharedStorage*>(smem_buf);
+
+  static constexpr int NumMmaThreads =
+      AttnKernel::NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
+  using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
+  using PipelineState = typename CollectiveMainloop::PipelineState;
+  using PipelineParamsV = typename MainloopPipelineV::Params;
+
+  PipelineParamsV pipeline_params_v;
+  pipeline_params_v.role = MainloopPipelineV::ThreadCategory::Producer;
+  pipeline_params_v.producer_arv_count = AttnKernel::NumProducerThreads;
+  pipeline_params_v.consumer_arv_count = NumMmaThreads;
+
+  MainloopPipelineV pipeline_v(
+      shared_storage.pipelines.pipeline_v, pipeline_params_v, cute::false_type{{}});
+  PipelineState state(stage_tl, uint32_t(phase_tl), uint32_t(count_tl));
+  pipeline_v.producer_acquire(state);
+}}
+
+extern "C" __device__ __forceinline__ void
+tileops_fa3_shaped_pipeline_v_producer_commit(
+    void* smem_raw,
+    int stage_tl,
+    int phase_tl,
+    int count_tl) {{
+  using namespace cute;
+  using namespace tileops_fa3_call_extern_detail;
+
+  if constexpr ({str(query_smem).lower()}) {{
+    return;
+  }}
+
+  char* smem_buf = reinterpret_cast<char*>(smem_raw);
+  typename AttnKernel::SharedStorage& shared_storage =
+      *reinterpret_cast<typename AttnKernel::SharedStorage*>(smem_buf);
+
+  static constexpr int NumMmaThreads =
+      AttnKernel::NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
+  using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
+  using PipelineState = typename CollectiveMainloop::PipelineState;
+  using PipelineParamsV = typename MainloopPipelineV::Params;
+
+  PipelineParamsV pipeline_params_v;
+  pipeline_params_v.role = MainloopPipelineV::ThreadCategory::Producer;
+  pipeline_params_v.producer_arv_count = AttnKernel::NumProducerThreads;
+  pipeline_params_v.consumer_arv_count = NumMmaThreads;
+
+  MainloopPipelineV pipeline_v(
+      shared_storage.pipelines.pipeline_v, pipeline_params_v, cute::false_type{{}});
+  PipelineState state(stage_tl, uint32_t(phase_tl), uint32_t(count_tl));
+  pipeline_v.producer_commit(state);
+}}
+
 extern "C" __device__ __forceinline__ void tileops_fa3_shaped_run_role(
     int role_tl,
     int tx_tl,
@@ -1382,6 +1633,71 @@ extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_q_offset_bytes
   return int(reinterpret_cast<char*>(
       reinterpret_cast<AttnKernel::SharedStorage*>(0)->tensors.mainloop.smem_q.data()) -
       reinterpret_cast<char*>(0));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_k_offset_bytes() {{
+  using namespace tileops_fa3_call_extern_detail;
+  return int(reinterpret_cast<char*>(
+      reinterpret_cast<AttnKernel::SharedStorage*>(0)->tensors.mainloop.smem_k.data()) -
+      reinterpret_cast<char*>(0));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_vt_offset_bytes() {{
+  using namespace tileops_fa3_call_extern_detail;
+  return int(reinterpret_cast<char*>(
+      reinterpret_cast<AttnKernel::SharedStorage*>(0)->tensors.mainloop.smem_vt.data()) -
+      reinterpret_cast<char*>(0));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_v_offset_bytes() {{
+  using namespace tileops_fa3_call_extern_detail;
+  return int(reinterpret_cast<char*>(
+      reinterpret_cast<AttnKernel::SharedStorage*>(0)->tensors.mainloop.smem_v.data()) -
+      reinterpret_cast<char*>(0));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_q_bytes() {{
+  using namespace tileops_fa3_call_extern_detail;
+  return int(sizeof(decltype(reinterpret_cast<AttnKernel::SharedStorage*>(0)->tensors.mainloop.smem_q)));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_k_bytes() {{
+  using namespace tileops_fa3_call_extern_detail;
+  return int(sizeof(decltype(reinterpret_cast<AttnKernel::SharedStorage*>(0)->tensors.mainloop.smem_k)));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_vt_bytes() {{
+  using namespace tileops_fa3_call_extern_detail;
+  return int(sizeof(decltype(reinterpret_cast<AttnKernel::SharedStorage*>(0)->tensors.mainloop.smem_vt)));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_v_bytes() {{
+  using namespace tileops_fa3_call_extern_detail;
+  return int(sizeof(decltype(reinterpret_cast<AttnKernel::SharedStorage*>(0)->tensors.mainloop.smem_v)));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_k_stage_offset_bytes(int stage) {{
+  using namespace cute;
+  using namespace tileops_fa3_call_extern_detail;
+  auto layout = typename CollectiveMainloop::SmemLayoutK{{}};
+  int const elem_offset = int(layout(make_coord(0, 0, stage)));
+  return tileops_fa3_shaped_smem_k_offset_bytes() + elem_offset * int(sizeof(Element));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_vt_stage_offset_bytes(int stage) {{
+  using namespace cute;
+  using namespace tileops_fa3_call_extern_detail;
+  auto layout = typename CollectiveMainloop::SmemLayoutVt{{}};
+  int const elem_offset = int(layout(make_coord(0, 0, stage)));
+  return tileops_fa3_shaped_smem_vt_offset_bytes() + elem_offset * int(sizeof(Element));
+}}
+
+extern "C" __device__ __forceinline__ int tileops_fa3_shaped_smem_v_stage_offset_bytes(int stage) {{
+  using namespace cute;
+  using namespace tileops_fa3_call_extern_detail;
+  auto layout = typename CollectiveMainloop::SmemLayoutVtMma{{}};
+  int const elem_offset = int(layout(make_coord(0, 0, stage)));
+  return tileops_fa3_shaped_smem_v_offset_bytes() + elem_offset * int(sizeof(Element));
 }}
 
 extern "C" __device__ __forceinline__ void tileops_fa3_shaped_check_q_hlir_tma_probe(
@@ -1892,6 +2208,30 @@ extern "C" __device__ __forceinline__ void tileops_fa3_shaped_check_kv_hlir_cons
       stage_kind_tl, stage_raw, global_raw, tx_tl, tile_n_tl, bidh_kv_tl, bidb_tl);
 }}
 
+extern "C" __device__ __forceinline__ void tileops_fa3_shaped_validate_producer_role(
+    int role_tl,
+    int tx_tl,
+    int warpgroup_id_tl,
+    int producer_warp_tl,
+    int producer_lane_tl,
+    int bidh_tl,
+    int bidh_kv_tl,
+    int group_tl) {{
+  int const tx_cuda = int(threadIdx.x);
+  bool const mismatch =
+      role_tl != 0 ||
+      tx_tl != tx_cuda ||
+      tx_cuda >= 128 ||
+      warpgroup_id_tl != tx_cuda / 128 ||
+      producer_warp_tl != (tx_cuda / 32) % 4 ||
+      producer_lane_tl != tx_cuda % 32 ||
+      group_tl <= 0 ||
+      bidh_kv_tl != bidh_tl / group_tl;
+  if (mismatch) {{
+    asm volatile("trap;");
+  }}
+}}
+
 extern "C" __device__ __forceinline__ void tileops_fa3_shaped_producer_load_one_tile(
     int role_tl,
     int tx_tl,
@@ -1911,19 +2251,9 @@ extern "C" __device__ __forceinline__ void tileops_fa3_shaped_producer_load_one_
     return;
   }}
 
-  int const tx_cuda = int(threadIdx.x);
-  bool const mismatch =
-      role_tl != 0 ||
-      tx_tl != tx_cuda ||
-      tx_cuda >= 128 ||
-      warpgroup_id_tl != tx_cuda / 128 ||
-      producer_warp_tl != (tx_cuda / 32) % 4 ||
-      producer_lane_tl != tx_cuda % 32 ||
-      group_tl <= 0 ||
-      bidh_kv_tl != bidh_tl / group_tl;
-  if (mismatch) {{
-    asm volatile("trap;");
-  }}
+  tileops_fa3_shaped_validate_producer_role(
+      role_tl, tx_tl, warpgroup_id_tl, producer_warp_tl, producer_lane_tl,
+      bidh_tl, bidh_kv_tl, group_tl);
 
   static constexpr int NumMmaThreads =
       AttnKernel::NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
@@ -1987,10 +2317,76 @@ extern "C" __device__ __forceinline__ void tileops_fa3_shaped_producer_load_one_
       params->mainloop.seqused_k, params->mainloop.leftpad_k,
       params->mainloop.seqlens_rotary}};
   auto scheduler_prefetch = []() {{}};
-  mainloop.load(
-      params->mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
-      shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
-  mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
+  auto producer_issue_original_load = [&]() {{
+    mainloop.load(
+        params->mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+        shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+  }};
+  auto producer_tail_drain_only = [&]() {{
+    mainloop.load_tail(
+        pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
+  }};
+  auto producer_check_load_state_boundary = [&]() {{
+    if constexpr ({str(state_boundary_check).lower()}) {{
+      if (threadIdx.x != 0 || tile_m_tl != 0 || bidh_tl != 0 || bidb_tl != 0) {{ return; }}
+      auto [n_block_min, n_block_max] = CollectiveMainloop::BlockMN_t::get_n_block_min_max(
+          seqlen_info, tile_m_tl, bidb_tl, 0, params->mainloop.num_splits,
+          params->mainloop.window_size_left, params->mainloop.window_size_right,
+          params->mainloop.attention_chunk_divmod, params->mainloop.qhead_per_khead_divmod);
+      int const active_n_blocks = n_block_max > n_block_min ? n_block_max - n_block_min : 0;
+      int const expected_work_idx = active_n_blocks > 0 ? 1 : 0;
+      uint32_t const expected_count = uint32_t(active_n_blocks);
+      int const expected_index = active_n_blocks % int(PipelineState::Stages);
+      uint32_t const expected_phase =
+          uint32_t(1) ^ uint32_t((active_n_blocks / int(PipelineState::Stages)) & 1);
+      bool const mismatch =
+          work_idx != expected_work_idx ||
+          smem_pipe_write.count() != expected_count ||
+          smem_pipe_write.index() != expected_index ||
+          smem_pipe_write.phase() != expected_phase;
+      if (mismatch) {{
+        asm volatile("trap;");
+      }}
+    }}
+  }};
+  auto producer_check_stage_offset_boundary = [&]() {{
+    if constexpr ({str(stage_offset_check).lower()}) {{
+      if (threadIdx.x != 0 || tile_m_tl != 0 || bidh_tl != 0 || bidb_tl != 0) {{ return; }}
+      int const k_base = tileops_fa3_shaped_smem_k_offset_bytes();
+      int const vt_base = tileops_fa3_shaped_smem_vt_offset_bytes();
+      int const v_base = tileops_fa3_shaped_smem_v_offset_bytes();
+      int const k_bytes = tileops_fa3_shaped_smem_k_bytes();
+      int const vt_bytes = tileops_fa3_shaped_smem_vt_bytes();
+      int const v_bytes = tileops_fa3_shaped_smem_v_bytes();
+      int const k0 = tileops_fa3_shaped_smem_k_stage_offset_bytes(0);
+      int const vt0 = tileops_fa3_shaped_smem_vt_stage_offset_bytes(0);
+      int const v0 = tileops_fa3_shaped_smem_v_stage_offset_bytes(0);
+      bool mismatch =
+          k0 != k_base || vt0 != vt_base || v0 != v_base ||
+          k0 < k_base || k0 >= k_base + k_bytes ||
+          vt0 < vt_base || vt0 >= vt_base + vt_bytes ||
+          v0 < v_base || v0 >= v_base + v_bytes ||
+          (k0 & 127) != 0 || (vt0 & 127) != 0 || (v0 & 127) != 0;
+      if constexpr (PipelineState::Stages > 1) {{
+        int const k1 = tileops_fa3_shaped_smem_k_stage_offset_bytes(1);
+        int const vt1 = tileops_fa3_shaped_smem_vt_stage_offset_bytes(1);
+        int const v1 = tileops_fa3_shaped_smem_v_stage_offset_bytes(1);
+        mismatch = mismatch ||
+            k1 <= k0 || vt1 <= vt0 || v1 <= v0 ||
+            k1 < k_base || k1 >= k_base + k_bytes ||
+            vt1 < vt_base || vt1 >= vt_base + vt_bytes ||
+            v1 < v_base || v1 >= v_base + v_bytes ||
+            (k1 & 127) != 0 || (vt1 & 127) != 0 || (v1 & 127) != 0;
+      }}
+      if (mismatch) {{
+        asm volatile("trap;");
+      }}
+    }}
+  }};
+  producer_check_stage_offset_boundary();
+  producer_issue_original_load();
+  producer_check_load_state_boundary();
+  producer_tail_drain_only();
 }}
 
 extern "C" __device__ __forceinline__ void tileops_fa3_shaped_producer_load_tail(
@@ -2012,19 +2408,9 @@ extern "C" __device__ __forceinline__ void tileops_fa3_shaped_producer_load_tail
     return;
   }}
 
-  int const tx_cuda = int(threadIdx.x);
-  bool const mismatch =
-      role_tl != 0 ||
-      tx_tl != tx_cuda ||
-      tx_cuda >= 128 ||
-      warpgroup_id_tl != tx_cuda / 128 ||
-      producer_warp_tl != (tx_cuda / 32) % 4 ||
-      producer_lane_tl != tx_cuda % 32 ||
-      group_tl <= 0 ||
-      bidh_kv_tl != bidh_tl / group_tl;
-  if (mismatch) {{
-    asm volatile("trap;");
-  }}
+  tileops_fa3_shaped_validate_producer_role(
+      role_tl, tx_tl, warpgroup_id_tl, producer_warp_tl, producer_lane_tl,
+      bidh_tl, bidh_kv_tl, group_tl);
 }}
 
 extern "C" __device__ __forceinline__ void tileops_fa3_shaped_run_consumer_wg1(
@@ -2101,6 +2487,8 @@ def _write_extern_helper_header(
     stages: int,
     query_smem: bool,
     static_persistent_call_extern: bool,
+    state_boundary_check: bool = False,
+    stage_offset_check: bool = False,
 ) -> Path:
     TMP.mkdir(exist_ok=True)
     source = _extern_helper_header_source(
@@ -2112,6 +2500,8 @@ def _write_extern_helper_header(
         stages,
         query_smem,
         static_persistent_call_extern,
+        state_boundary_check,
+        stage_offset_check,
     )
     digest = hashlib.sha256(source.encode()).hexdigest()[:16]
     path = TMP / f"tileops_fa3_shaped_extern_helper_{digest}.h"
@@ -3863,6 +4253,16 @@ def build_slim_role_split_baseline_kernel(
     query_smem: bool,
     static_persistent_call_extern: bool,
     exact_order_shadow: bool = False,
+    skip_tail_extern: bool = False,
+    state_boundary_check: bool = False,
+    stage_offset_check: bool = False,
+    fa3_vt_stage_probe: bool = False,
+    fa3_vt_barrier_preload_probe: bool = False,
+    fa3_vt_barrier_tl_tma_probe: bool = False,
+    fa3_vt_tl_barrier_consume_probe: bool = False,
+    fa3_vt_tl_barrier_replace_first_probe: bool = False,
+    fa3_vt_tl_barrier_replace_first_data_probe: bool = False,
+    fa3_vt_fa3_barrier_replace_first_load_probe: bool = False,
 ):
     group = heads // heads_kv
     num_m_blocks = (seq_len + 127) // 128
@@ -3889,6 +4289,11 @@ def build_slim_role_split_baseline_kernel(
         stages,
         query_smem,
         static_persistent_call_extern,
+        state_boundary_check,
+        stage_offset_check,
+    )
+    mainloop_header_digest = _file_cache_digest(
+        FA3_INC / "mainloop_fwd_sm90_tma_gmma_ws.hpp"
     )
 
     @tilelang.jit(
@@ -3898,6 +4303,22 @@ def build_slim_role_split_baseline_kernel(
             "-O3",
             "-DNDEBUG",
             "-DTILEOPS_FA3_SHAPED_LAUNCHER_TAG_slim_role_split_baseline",
+            f"-DTILEOPS_FA3_SHAPED_MAINLOOP_HEADER_DIGEST_{mainloop_header_digest}=1",
+            *(
+                ["-DTILEOPS_FA3_SHAPED_SKIP_FIRST_V_LOAD_TRANSFORM=1"]
+                if fa3_vt_tl_barrier_replace_first_probe
+                else []
+            ),
+            *(
+                ["-DTILEOPS_FA3_SHAPED_FIRST_V_DATA_FROM_TILELANG=1"]
+                if fa3_vt_tl_barrier_replace_first_data_probe
+                else []
+            ),
+            *(
+                ["-DTILEOPS_FA3_SHAPED_SKIP_FIRST_V_LOAD=1"]
+                if fa3_vt_fa3_barrier_replace_first_load_probe
+                else []
+            ),
             "-Xptxas=-v",
             "--expt-relaxed-constexpr",
             "-DENABLE_BF16",
@@ -4160,6 +4581,430 @@ def build_slim_role_split_baseline_kernel(
             T.barrier_wait(v_transform_full, tail_phase)
             T.barrier_arrive(v_done)
 
+        @T.macro
+        def producer_slim_fa3_vt_stage_probe(
+            v_tensor,
+            smem,
+            vt_tma_full,
+            tx: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            last_tile_n = num_n_blocks - 1
+            vt_tma_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            vt_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_vt_stage_offset_bytes",
+                0,
+            )
+            if tx == 0:
+                T.mbarrier_expect_tx(vt_tma_full, vt_shadow_bytes)
+                tir.call_extern(
+                    "handle",
+                    "tl::fp8_tma_load_4d_ptx",
+                    vt_tma_desc,
+                    vt_tma_full[0],
+                    smem.access_ptr("w", offset=vt_stage0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                )
+                T.barrier_arrive(vt_tma_full)
+            T.mbarrier_wait_parity(vt_tma_full, 0)
+            if tx == 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_check_vt_hlir_stage_boundary",
+                    smem.access_ptr("r", offset=vt_stage0_offset),
+                    v_tensor.data,
+                    tx,
+                    last_tile_n,
+                    bidh_kv,
+                    bidb,
+                )
+            T.sync_threads()
+
+        @T.macro
+        def producer_slim_fa3_vt_tl_barrier_consume_probe(
+            v_tensor,
+            smem,
+            vt_tma_full,
+            tx: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            last_tile_n = num_n_blocks - 1
+            vt_tma_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            vt_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_vt_stage_offset_bytes",
+                0,
+            )
+            v_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_v_stage_offset_bytes",
+                0,
+            )
+            if tx == 0:
+                T.mbarrier_expect_tx(vt_tma_full, vt_shadow_bytes)
+                tir.call_extern(
+                    "handle",
+                    "tl::fp8_tma_load_4d_ptx",
+                    vt_tma_desc,
+                    vt_tma_full[0],
+                    smem.access_ptr("w", offset=vt_stage0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                )
+                T.barrier_arrive(vt_tma_full)
+            T.mbarrier_wait_parity(vt_tma_full, 0)
+            if tx == 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_check_vt_hlir_stage_boundary",
+                    smem.access_ptr("r", offset=vt_stage0_offset),
+                    v_tensor.data,
+                    tx,
+                    last_tile_n,
+                    bidh_kv,
+                    bidb,
+                )
+            if fa3_vt_tl_barrier_replace_first_probe and tx < 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_pipeline_v_producer_acquire",
+                    smem.access_ptr("rw"),
+                    0,
+                    1,
+                    0,
+                )
+            if tx < 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_vt_to_v_boundary",
+                    smem.access_ptr("r", offset=vt_stage0_offset),
+                    smem.access_ptr("w", offset=v_stage0_offset),
+                    tx,
+                )
+            if fa3_vt_tl_barrier_replace_first_probe and tx < 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_pipeline_v_producer_commit",
+                    smem.access_ptr("rw"),
+                    0,
+                    1,
+                    0,
+                )
+            T.sync_threads()
+            if tx == 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_check_v_mma_layout_boundary",
+                    smem.access_ptr("r", offset=v_stage0_offset),
+                    tx,
+                )
+            T.sync_threads()
+
+        @T.macro
+        def producer_slim_fa3_vt_tl_barrier_replace_first_probe(
+            v_tensor,
+            smem,
+            vt_tma_full,
+            tx: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            last_tile_n = num_n_blocks - 1
+            vt_tma_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            vt_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_vt_stage_offset_bytes",
+                0,
+            )
+            v_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_v_stage_offset_bytes",
+                0,
+            )
+            if tx == 0:
+                T.mbarrier_expect_tx(vt_tma_full, vt_shadow_bytes)
+                tir.call_extern(
+                    "handle",
+                    "tl::fp8_tma_load_4d_ptx",
+                    vt_tma_desc,
+                    vt_tma_full[0],
+                    smem.access_ptr("w", offset=vt_stage0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                )
+                T.barrier_arrive(vt_tma_full)
+            T.mbarrier_wait_parity(vt_tma_full, 0)
+            T.call_extern(
+                "handle",
+                "tileops_fa3_shaped_pipeline_v_producer_acquire",
+                smem.access_ptr("rw"),
+                0,
+                1,
+                0,
+            )
+            T.call_extern(
+                "handle",
+                "tileops_fa3_shaped_vt_to_v_boundary",
+                smem.access_ptr("r", offset=vt_stage0_offset),
+                smem.access_ptr("w", offset=v_stage0_offset),
+                tx,
+            )
+            T.call_extern(
+                "handle",
+                "tileops_fa3_shaped_pipeline_v_producer_commit",
+                smem.access_ptr("rw"),
+                0,
+                1,
+                0,
+            )
+
+        @T.macro
+        def producer_slim_fa3_vt_tl_barrier_replace_first_data_probe(
+            v_tensor,
+            smem,
+            vt_tma_full,
+            tx: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            last_tile_n = num_n_blocks - 1
+            vt_tma_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            vt_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_vt_stage_offset_bytes",
+                0,
+            )
+            v_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_v_stage_offset_bytes",
+                0,
+            )
+            if tx == 0:
+                T.mbarrier_expect_tx(vt_tma_full, vt_shadow_bytes)
+                tir.call_extern(
+                    "handle",
+                    "tl::fp8_tma_load_4d_ptx",
+                    vt_tma_desc,
+                    vt_tma_full[0],
+                    smem.access_ptr("w", offset=vt_stage0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                )
+                T.barrier_arrive(vt_tma_full)
+            T.mbarrier_wait_parity(vt_tma_full, 0)
+            if tx < 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_vt_to_v_boundary",
+                    smem.access_ptr("r", offset=vt_stage0_offset),
+                    smem.access_ptr("w", offset=v_stage0_offset),
+                    tx,
+                )
+            T.sync_threads()
+
+        @T.macro
+        def producer_slim_fa3_vt_fa3_barrier_replace_first_load_probe(
+            v_tensor,
+            smem,
+            tx: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            last_tile_n = num_n_blocks - 1
+            vt_tma_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            vt_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_vt_stage_offset_bytes",
+                0,
+            )
+            if tx == 0:
+                vt_barrier = T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_pipeline_vt_producer_acquire_barrier",
+                    smem.access_ptr("rw"),
+                    0,
+                    1,
+                    0,
+                )
+                T.tma_load(
+                    vt_tma_desc,
+                    vt_barrier,
+                    smem.access_ptr("w", offset=vt_stage0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                    EVICT_NORMAL,
+                )
+
+        @T.macro
+        def producer_slim_fa3_vt_barrier_preload_probe(
+            v_tensor,
+            smem,
+            tx: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            last_tile_n = num_n_blocks - 1
+            vt_tma_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            vt_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_vt_stage_offset_bytes",
+                0,
+            )
+            if tx == 0:
+                tir.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_pipeline_vt_tma_load_4d",
+                    vt_tma_desc,
+                    smem.access_ptr("rw"),
+                    smem.access_ptr("w", offset=vt_stage0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                    0,
+                    1,
+                    0,
+                )
+            T.sync_threads()
+            if tx == 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_pipeline_vt_consumer_wait_release_check",
+                    smem.access_ptr("rw"),
+                    smem.access_ptr("r", offset=vt_stage0_offset),
+                    v_tensor.data,
+                    tx,
+                    last_tile_n,
+                    bidh_kv,
+                    bidb,
+                    0,
+                    0,
+                    0,
+                )
+            T.sync_threads()
+
+        @T.macro
+        def producer_slim_fa3_vt_barrier_tl_tma_probe(
+            v_tensor,
+            smem,
+            tx: T.int32,
+            bidb: T.int32,
+            bidh_kv: T.int32,
+        ) -> None:
+            last_tile_n = num_n_blocks - 1
+            vt_tma_desc = T.create_tma_descriptor(
+                TMA_DTYPE_UINT8, 4, v_tensor.data,
+                dim, heads_kv, seq_len, batch,
+                1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                dim, 1, 224, 1,
+                1, 1, 1, 1,
+                TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+            )
+            vt_stage0_offset = T.call_extern(
+                "int32",
+                "tileops_fa3_shaped_smem_vt_stage_offset_bytes",
+                0,
+            )
+            if tx == 0:
+                vt_barrier = T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_pipeline_vt_producer_acquire_barrier",
+                    smem.access_ptr("rw"),
+                    0,
+                    1,
+                    0,
+                )
+                T.tma_load(
+                    vt_tma_desc,
+                    vt_barrier,
+                    smem.access_ptr("w", offset=vt_stage0_offset),
+                    0,
+                    bidh_kv,
+                    last_tile_n * 224,
+                    bidb,
+                    EVICT_NORMAL,
+                )
+            T.sync_threads()
+            if tx == 128:
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_pipeline_vt_consumer_wait_release_check",
+                    smem.access_ptr("rw"),
+                    smem.access_ptr("r", offset=vt_stage0_offset),
+                    v_tensor.data,
+                    tx,
+                    last_tile_n,
+                    bidh_kv,
+                    bidb,
+                    0,
+                    0,
+                    0,
+                )
+            T.sync_threads()
+
         @T.prim_func
         def main(
             q: T.Tensor(q_shape, "float8_e4m3fn"),
@@ -4183,6 +5028,14 @@ def build_slim_role_split_baseline_kernel(
                     shadow_vt_tma_full1 = T.alloc_barrier(arrive_count=1)
                     shadow_v_transform_full = T.alloc_barrier(arrive_count=128)
                     shadow_v_done = T.alloc_barrier(arrive_count=256)
+                if fa3_vt_stage_probe:
+                    fa3_vt_stage_full = T.alloc_barrier(arrive_count=1)
+                if (
+                    fa3_vt_tl_barrier_consume_probe
+                    or fa3_vt_tl_barrier_replace_first_probe
+                    or fa3_vt_tl_barrier_replace_first_data_probe
+                ):
+                    fa3_vt_tl_consume_full = T.alloc_barrier(arrive_count=1)
                 tx = T.get_thread_binding()
                 lane_id = tx % 32
                 warp_id = tx // 32
@@ -4275,6 +5128,15 @@ def build_slim_role_split_baseline_kernel(
                             shadow_v_done,
                             tile_m,
                         )
+                if fa3_vt_stage_probe:
+                    producer_slim_fa3_vt_stage_probe(
+                        v,
+                        smem,
+                        fa3_vt_stage_full,
+                        tx,
+                        bidb,
+                        bidh_kv,
+                    )
                 T.call_extern(
                     "handle",
                     "tileops_fa3_shaped_prepare_params",
@@ -4309,8 +5171,59 @@ def build_slim_role_split_baseline_kernel(
                     bidb,
                     smem.access_ptr("rw"),
                 )
+                if fa3_vt_barrier_preload_probe:
+                    producer_slim_fa3_vt_barrier_preload_probe(
+                        v,
+                        smem,
+                        tx,
+                        bidb,
+                        bidh_kv,
+                    )
+                if fa3_vt_barrier_tl_tma_probe:
+                    producer_slim_fa3_vt_barrier_tl_tma_probe(
+                        v,
+                        smem,
+                        tx,
+                        bidb,
+                        bidh_kv,
+                    )
+                if fa3_vt_tl_barrier_consume_probe:
+                    producer_slim_fa3_vt_tl_barrier_consume_probe(
+                        v,
+                        smem,
+                        fa3_vt_tl_consume_full,
+                        tx,
+                        bidb,
+                        bidh_kv,
+                    )
+                if fa3_vt_tl_barrier_replace_first_data_probe:
+                    producer_slim_fa3_vt_tl_barrier_replace_first_data_probe(
+                        v,
+                        smem,
+                        fa3_vt_tl_consume_full,
+                        tx,
+                        bidb,
+                        bidh_kv,
+                    )
                 if tx < 128:
                     T.dec_max_nreg(24)
+                    if fa3_vt_tl_barrier_replace_first_probe:
+                        producer_slim_fa3_vt_tl_barrier_replace_first_probe(
+                            v,
+                            smem,
+                            fa3_vt_tl_consume_full,
+                            tx,
+                            bidb,
+                            bidh_kv,
+                        )
+                    if fa3_vt_fa3_barrier_replace_first_load_probe:
+                        producer_slim_fa3_vt_fa3_barrier_replace_first_load_probe(
+                            v,
+                            smem,
+                            tx,
+                            bidb,
+                            bidh_kv,
+                        )
                     T.call_extern(
                         "handle",
                         "tileops_fa3_shaped_producer_load_one_tile",
@@ -4326,21 +5239,22 @@ def build_slim_role_split_baseline_kernel(
                         group,
                         smem.access_ptr("rw"),
                     )
-                    T.call_extern(
-                        "handle",
-                        "tileops_fa3_shaped_producer_load_tail",
-                        0,
-                        tx,
-                        warpgroup_id,
-                        producer_warp,
-                        producer_lane,
-                        tile_m,
-                        bidh,
-                        bidb,
-                        bidh_kv,
-                        group,
-                        smem.access_ptr("rw"),
-                    )
+                    if not skip_tail_extern:
+                        T.call_extern(
+                            "handle",
+                            "tileops_fa3_shaped_producer_load_tail",
+                            0,
+                            tx,
+                            warpgroup_id,
+                            producer_warp,
+                            producer_lane,
+                            tile_m,
+                            bidh,
+                            bidb,
+                            bidh_kv,
+                            group,
+                            smem.access_ptr("rw"),
+                        )
                 elif tx < 256:
                     T.call_extern(
                         "handle",
@@ -4373,6 +5287,131 @@ def build_slim_role_split_baseline_kernel(
         return main
 
     return func(), None
+
+
+def build_fa3_vt_barrier_smoke_kernel(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    heads_kv: int,
+    dim: int,
+    smem_bytes: int,
+    stages: int,
+    query_smem: bool,
+    static_persistent_call_extern: bool,
+):
+    if seq_len < 224:
+        raise ValueError("FA3 Vt barrier smoke probe requires --seq-len >= 224")
+    num_n_blocks = (seq_len + 223) // 224
+    helper_header = _write_extern_helper_header(
+        batch,
+        seq_len,
+        heads,
+        heads_kv,
+        dim,
+        stages,
+        query_smem,
+        static_persistent_call_extern,
+    )
+
+    @tilelang.jit(
+        out_idx=[1],
+        execution_backend="tvm_ffi",
+        compile_flags=[
+            "-O3",
+            "-DNDEBUG",
+            "-DTILEOPS_FA3_SHAPED_LAUNCHER_TAG_fa3_vt_barrier_smoke",
+            "-Xptxas=-v",
+            "--expt-relaxed-constexpr",
+            "-DENABLE_BF16",
+            "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+            "-DCUTLASS_ARCH_MMA_SM90_ENABLED",
+            "-DCUTLASS_ARCH_MMA_SM90A_ENABLED",
+            f"-I{FA3_INC}",
+            "-include",
+            str(ROOT / "tileops" / "kernels" / "attention" / "_fp8_gqa_helper.h"),
+            "-include",
+            str(helper_header),
+        ],
+    )
+    def func():
+        kv_shape = (batch, seq_len, heads_kv, dim)
+        status_shape = (1,)
+
+        @T.prim_func
+        def main(
+            v: T.Tensor(kv_shape, "float8_e4m3fn"),
+            status: T.Tensor(status_shape, "int32"),
+        ) -> None:
+            with T.Kernel(1, 1, 1, threads=384) as (_bx, _by, _bz):
+                smem = T.alloc_shared((smem_bytes,), "uint8")
+                tx = T.get_thread_binding()
+                bidb = 0
+                bidh_kv = 0
+                last_tile_n = num_n_blocks - 1
+
+                T.reads(v[0:batch, 0:seq_len, 0:heads_kv, 0:dim])
+                T.writes(status[0:1], smem[0:smem_bytes])
+
+                vt_tma_desc = T.create_tma_descriptor(
+                    TMA_DTYPE_UINT8, 4, v.data,
+                    dim, heads_kv, seq_len, batch,
+                    1, dim, heads_kv * dim, seq_len * heads_kv * dim,
+                    dim, 1, 224, 1,
+                    1, 1, 1, 1,
+                    TMA_INTERLEAVE_NONE, TMA_SWIZZLE_128B,
+                    TMA_L2_PROMOTION_128B, TMA_OOB_FILL_NONE,
+                )
+                vt_stage0_offset = T.call_extern(
+                    "int32",
+                    "tileops_fa3_shaped_smem_vt_stage_offset_bytes",
+                    0,
+                )
+
+                if tx == 0:
+                    status[0] = 0
+                T.call_extern(
+                    "handle",
+                    "tileops_fa3_shaped_init_pipeline_vt_only",
+                    smem.access_ptr("rw"),
+                )
+                if tx == 0:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_pipeline_vt_tma_load_4d",
+                        vt_tma_desc,
+                        smem.access_ptr("rw"),
+                        smem.access_ptr("w", offset=vt_stage0_offset),
+                        0,
+                        bidh_kv,
+                        last_tile_n * 224,
+                        bidb,
+                        0,
+                        1,
+                        0,
+                    )
+                T.sync_threads()
+                if tx == 128:
+                    T.call_extern(
+                        "handle",
+                        "tileops_fa3_shaped_pipeline_vt_consumer_wait_release_check",
+                        smem.access_ptr("rw"),
+                        smem.access_ptr("r", offset=vt_stage0_offset),
+                        v.data,
+                        tx,
+                        last_tile_n,
+                        bidh_kv,
+                        bidb,
+                        0,
+                        0,
+                        0,
+                    )
+                    status[0] = 1
+                T.sync_threads()
+
+        return main
+
+    return func()
 
 
 def build_exact_order_shadow_probe_kernel(
@@ -5046,6 +6085,23 @@ def main() -> None:
     parser.add_argument("--producer-tma-hlir-pv-correctness-probe", action="store_true")
     parser.add_argument("--producer-tma-hlir-slim-baseline-probe", action="store_true")
     parser.add_argument("--producer-tma-hlir-slim-exact-order-shadow-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-slim-no-tail-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-slim-state-boundary-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-slim-stage-offset-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-slim-fa3-vt-stage-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-slim-fa3-vt-barrier-preload-probe", action="store_true")
+    parser.add_argument("--allow-slow-fa3-vt-barrier-preload", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--producer-tma-hlir-slim-fa3-vt-barrier-tl-tma-probe", action="store_true")
+    parser.add_argument("--allow-slow-fa3-vt-barrier-tl-tma", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--producer-tma-hlir-slim-fa3-vt-tl-barrier-consume-probe", action="store_true")
+    parser.add_argument("--producer-tma-hlir-slim-fa3-vt-tl-barrier-replace-first-probe", action="store_true")
+    parser.add_argument("--allow-slow-fa3-vt-tl-barrier-replace-first", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--producer-tma-hlir-slim-fa3-vt-tl-barrier-replace-first-data-probe", action="store_true")
+    parser.add_argument("--allow-slow-fa3-vt-tl-barrier-replace-first-data", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--producer-tma-hlir-slim-fa3-vt-fa3-barrier-replace-first-load-probe", action="store_true")
+    parser.add_argument("--allow-slow-fa3-vt-fa3-barrier-replace-first-load", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--producer-tma-hlir-slim-fa3-vt-barrier-smoke-probe", action="store_true")
+    parser.add_argument("--allow-slow-fa3-vt-barrier-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--producer-tma-hlir-exact-order-shadow-probe", action="store_true")
     parser.add_argument("--producer-tma-hlir-exact-order-shadow-checks", choices=["all", "q", "k", "vt", "v", "none"], default="none")
     parser.add_argument("--legacy-raw-device", action="store_true", help=argparse.SUPPRESS)
@@ -5086,6 +6142,17 @@ def main() -> None:
         bool(args.producer_tma_hlir_pv_correctness_probe),
         bool(args.producer_tma_hlir_slim_baseline_probe),
         bool(args.producer_tma_hlir_slim_exact_order_shadow_probe),
+        bool(args.producer_tma_hlir_slim_no_tail_probe),
+        bool(args.producer_tma_hlir_slim_state_boundary_probe),
+        bool(args.producer_tma_hlir_slim_stage_offset_probe),
+        bool(args.producer_tma_hlir_slim_fa3_vt_stage_probe),
+        bool(args.producer_tma_hlir_slim_fa3_vt_barrier_preload_probe),
+        bool(args.producer_tma_hlir_slim_fa3_vt_barrier_tl_tma_probe),
+        bool(args.producer_tma_hlir_slim_fa3_vt_tl_barrier_consume_probe),
+        bool(args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_probe),
+        bool(args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_data_probe),
+        bool(args.producer_tma_hlir_slim_fa3_vt_fa3_barrier_replace_first_load_probe),
+        bool(args.producer_tma_hlir_slim_fa3_vt_barrier_smoke_probe),
         bool(args.producer_tma_hlir_exact_order_shadow_probe),
     ])
     if producer_tma_probe_count > 1:
@@ -5114,6 +6181,28 @@ def main() -> None:
         print("fa3_mode tilelang_slim_role_split_baseline_probe")
     elif args.producer_tma_hlir_slim_exact_order_shadow_probe:
         print("fa3_mode tilelang_slim_role_split_exact_order_shadow_probe")
+    elif args.producer_tma_hlir_slim_no_tail_probe:
+        print("fa3_mode tilelang_slim_role_split_no_tail_probe")
+    elif args.producer_tma_hlir_slim_state_boundary_probe:
+        print("fa3_mode tilelang_slim_role_split_state_boundary_probe")
+    elif args.producer_tma_hlir_slim_stage_offset_probe:
+        print("fa3_mode tilelang_slim_role_split_stage_offset_probe")
+    elif args.producer_tma_hlir_slim_fa3_vt_stage_probe:
+        print("fa3_mode tilelang_slim_role_split_fa3_vt_stage_probe")
+    elif args.producer_tma_hlir_slim_fa3_vt_barrier_preload_probe:
+        print("fa3_mode tilelang_slim_role_split_fa3_vt_barrier_preload_probe")
+    elif args.producer_tma_hlir_slim_fa3_vt_barrier_tl_tma_probe:
+        print("fa3_mode tilelang_slim_role_split_fa3_vt_barrier_tl_tma_probe")
+    elif args.producer_tma_hlir_slim_fa3_vt_tl_barrier_consume_probe:
+        print("fa3_mode tilelang_slim_role_split_fa3_vt_tl_barrier_consume_probe")
+    elif args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_probe:
+        print("fa3_mode tilelang_slim_role_split_fa3_vt_tl_barrier_replace_first_probe")
+    elif args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_data_probe:
+        print("fa3_mode tilelang_slim_role_split_fa3_vt_tl_barrier_replace_first_data_probe")
+    elif args.producer_tma_hlir_slim_fa3_vt_fa3_barrier_replace_first_load_probe:
+        print("fa3_mode tilelang_slim_role_split_fa3_vt_fa3_barrier_replace_first_load_probe")
+    elif args.producer_tma_hlir_slim_fa3_vt_barrier_smoke_probe:
+        print("fa3_mode tilelang_slim_role_split_fa3_vt_barrier_smoke_probe")
     elif args.producer_tma_hlir_exact_order_shadow_probe:
         print("fa3_mode tilelang_producer_exact_order_shadow_probe")
     elif args.producer_tma_hlir_q_boundary_probe:
@@ -5305,7 +6394,113 @@ def main() -> None:
             print(f"latency_ms={ms:.6f}")
         return
 
-    if args.producer_tma_hlir_slim_baseline_probe or args.producer_tma_hlir_slim_exact_order_shadow_probe:
+    if args.producer_tma_hlir_slim_fa3_vt_barrier_smoke_probe:
+        if not args.allow_slow_fa3_vt_barrier_smoke:
+            raise RuntimeError(
+                "FA3 Vt barrier smoke probe is disabled by default: this TileLang IR shape "
+                "timed out in Python lowering. Re-run with --allow-slow-fa3-vt-barrier-smoke "
+                "only when debugging the lowering issue."
+            )
+        kernel = build_fa3_vt_barrier_smoke_kernel(
+            args.batch,
+            args.seq_len,
+            args.heads,
+            args.heads_kv,
+            args.dim,
+            args.smem_bytes,
+            args.stages,
+            args.query_smem,
+            args.static_persistent_call_extern,
+        )
+        status = kernel(v_fp8)
+        torch.cuda.synchronize()
+        status_cpu = status.cpu()
+        print(
+            "fa3_vt_barrier_smoke_status",
+            "shape",
+            tuple(status_cpu.shape),
+            "sum",
+            int(status_cpu.sum().item()),
+            "numel",
+            status_cpu.numel(),
+            "all_pass",
+            bool((status_cpu == 1).all().item()),
+        )
+        if args.bench:
+            ms = bench_kernel(
+                kernel,
+                args=(v_fp8,),
+                n_warmup=args.warmup,
+                n_repeat=args.repeat,
+                n_trials=3,
+            )
+            print(f"latency_ms={ms:.6f}")
+        return
+
+    if args.producer_tma_hlir_slim_fa3_vt_barrier_preload_probe and not args.allow_slow_fa3_vt_barrier_preload:
+        raise RuntimeError(
+            "FA3 Vt barrier preload probe is disabled by default: embedding the "
+            "pipeline_vt TMA wrapper in the slim shell timed out in Python lowering. "
+            "Re-run with --allow-slow-fa3-vt-barrier-preload only when debugging "
+            "the lowering issue."
+        )
+    if args.producer_tma_hlir_slim_fa3_vt_barrier_tl_tma_probe and not args.allow_slow_fa3_vt_barrier_tl_tma:
+        raise RuntimeError(
+            "FA3 Vt barrier TileLang TMA probe is disabled by default: raw "
+            "T.tma_load with a FA3 pipeline_vt barrier compiles to CUDA/cubin, "
+            "but the slim-shell runtime timed out waiting on the pipeline. "
+            "Re-run with --allow-slow-fa3-vt-barrier-tl-tma only when debugging "
+            "the runtime wait issue."
+        )
+    if (
+        args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_probe
+        and not args.allow_slow_fa3_vt_tl_barrier_replace_first
+    ):
+        raise RuntimeError(
+            "FA3 Vt TileLang-barrier replace-first probe is disabled by default: "
+            "it compiles to CUDA/cubin, but runtime timed out while trying to "
+            "handoff the precomputed first V stage through FA3 pipeline_v. "
+            "Re-run with --allow-slow-fa3-vt-tl-barrier-replace-first only "
+            "when debugging the pipeline_v handoff."
+        )
+    if (
+        args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_data_probe
+        and not args.allow_slow_fa3_vt_tl_barrier_replace_first_data
+    ):
+        raise RuntimeError(
+            "FA3 Vt TileLang-barrier replace-first-data probe is disabled by default: "
+            "TileLang TMA mbarrier lowering generated plausible CUDA/SASS and a "
+            "CTA-synchronized prelude, but runtime still timed out after FA3 "
+            "pipeline_v was asked to publish the precomputed first V stage. "
+            "Re-run with --allow-slow-fa3-vt-tl-barrier-replace-first-data "
+            "only when debugging pipeline_v phase/accounting."
+        )
+    if (
+        args.producer_tma_hlir_slim_fa3_vt_fa3_barrier_replace_first_load_probe
+        and not args.allow_slow_fa3_vt_fa3_barrier_replace_first_load
+    ):
+        raise RuntimeError(
+            "FA3 Vt FA3-barrier replace-first-load probe is disabled by default: "
+            "it compiles to CUDA/cubin, but runtime timed out after replacing "
+            "the first FA3 Vt TMA with TileLang T.tma_load targeting pipeline_vt. "
+            "Re-run with --allow-slow-fa3-vt-fa3-barrier-replace-first-load "
+            "only when debugging the pipeline_vt handoff."
+        )
+
+    if (
+        args.producer_tma_hlir_slim_baseline_probe
+        or args.producer_tma_hlir_slim_exact_order_shadow_probe
+        or args.producer_tma_hlir_slim_no_tail_probe
+        or args.producer_tma_hlir_slim_state_boundary_probe
+        or args.producer_tma_hlir_slim_stage_offset_probe
+        or args.producer_tma_hlir_slim_fa3_vt_stage_probe
+        or args.producer_tma_hlir_slim_fa3_vt_barrier_preload_probe
+        or args.producer_tma_hlir_slim_fa3_vt_barrier_tl_tma_probe
+        or args.producer_tma_hlir_slim_fa3_vt_tl_barrier_consume_probe
+        or args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_probe
+        or args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_data_probe
+        or args.producer_tma_hlir_slim_fa3_vt_fa3_barrier_replace_first_load_probe
+    ):
         kernel, launcher_so = build_slim_role_split_baseline_kernel(
             args.batch,
             args.seq_len,
@@ -5317,6 +6512,16 @@ def main() -> None:
             args.query_smem,
             args.static_persistent_call_extern,
             args.producer_tma_hlir_slim_exact_order_shadow_probe,
+            args.producer_tma_hlir_slim_no_tail_probe,
+            args.producer_tma_hlir_slim_state_boundary_probe,
+            args.producer_tma_hlir_slim_stage_offset_probe,
+            args.producer_tma_hlir_slim_fa3_vt_stage_probe,
+            args.producer_tma_hlir_slim_fa3_vt_barrier_preload_probe,
+            args.producer_tma_hlir_slim_fa3_vt_barrier_tl_tma_probe,
+            args.producer_tma_hlir_slim_fa3_vt_tl_barrier_consume_probe,
+            args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_probe,
+            args.producer_tma_hlir_slim_fa3_vt_tl_barrier_replace_first_data_probe,
+            args.producer_tma_hlir_slim_fa3_vt_fa3_barrier_replace_first_load_probe,
         )
     elif args.producer_tma_hlir_core_shadow_probe:
         kernel, launcher_so = build_core_shadow_kernel(
