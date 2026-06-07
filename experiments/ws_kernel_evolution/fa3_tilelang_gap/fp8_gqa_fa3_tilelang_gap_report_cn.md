@@ -158,19 +158,6 @@ loop n + 1:
 ptxas 看到的可能不再是 FA3 mainloop 中同一个 register fragment 的稳定 def/use
 和 layout 语义。
 
-当前 TileOps/TileLang 实验中使用的 `p_smem` 不是 FA3 标准术语，而是替代实现路径。
-例如 `GQAFwdFP8Fa3ContractPtxAccBN224WsOverlapStreamingPPlainWaitKernel`
-分配：
-
-```python
-p_smem_1 = T.alloc_shared([half_m, block_n], fp8_dtype)
-p_smem_2 = T.alloc_shared([half_m, block_n], fp8_dtype)
-```
-
-该 kernel 在 softmax 后用 helper 将 P 写入 shared memory，下一轮 PV helper 再从
-shared memory 读取 P。该路径可以用于获得数值正确的实现，但不等价于 FA3 的
-register `tOrP` contract。
-
 ### 2.4 Shared Layout 与 TMA Destination
 
 FP8 FA3 对 K/V shared layout、V transpose / VtMma layout，以及 TMA destination
@@ -440,6 +427,17 @@ fragment-P。这不是一个独立的 TileLang 能力缺口，而是当前样例
 消费的 FA3-equivalent RS-A register operand。因此，当前样例保留 `p_smem`，避免将
 “P 存储介质从 shared memory 改为 fragment”和“FA3 `tOrP` 寄存器布局契约
 是否成立”混在同一个样例中。
+
+当前 `p_smem` 替代路径的具体形式如下：
+
+```python
+p_smem_1 = T.alloc_shared([half_m, block_n], fp8_dtype)
+p_smem_2 = T.alloc_shared([half_m, block_n], fp8_dtype)
+```
+
+能力边界样例在 softmax 后用 helper 将 P 写入 shared memory，下一轮 PV helper 再从
+shared memory 读取 P。该路径可以用于获得数值正确的实现，但不等价于 FA3 的 register
+`tOrP` contract。
 
 因此，该 kernel 的定位是：
 
