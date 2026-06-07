@@ -192,8 +192,13 @@ FP8 FA3 对 K/V shared layout、V transpose / VtMma layout，以及 TMA destinat
 ## 3. TileLang 当前能力评估
 
 本节直接列出当前实现 FA3-equivalent FP8 GQA mainloop 所需、但 TileLang 尚未完整
-提供的能力。DeepWiki 对 TileLang 现有能力的解释见附录 A；TMA destination 与
-CUTE layout 的验证问题见附录 B。
+提供的能力。这些判断已经通过与 TileLang DeepWiki 的逐项讨论进行了核对：DeepWiki
+确认了 loop-external `T.alloc_fragment` 生命周期可用，同时确认当前 TileLang
+高级 API 中不存在 FA3 FP8 所需的 in-register fragment reinterpret / layout
+conversion、跨 loop register layout contract、跨 QK/PV 的 grouped WGMMA scoreboard
+window API，以及 CUTE layout 逐元素等价性 checker。DeepWiki 查询和回复原文见附录 C；
+对 TileLang 现有能力的归纳见附录 A；TMA destination 与 CUTE layout 的验证问题见
+附录 B。
 
 ### 3.1 缺口总览
 
