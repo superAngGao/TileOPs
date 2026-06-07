@@ -166,7 +166,8 @@ FP8 FA3 对 K/V shared layout、V transpose / VtMma layout，以及 TMA destinat
 
 ### 2.5 需要的 DSL / Lowering 抽象
 
-一个 FA3-equivalent TileLang FP8 GQA kernel 至少需要以下抽象或验证能力：
+一个 FA3-equivalent TileLang FP8 GQA kernel 涉及以下抽象或验证能力。其中部分能力
+TileLang 已经具备，后续第 3 节会进一步区分“已支持能力”和“缺失能力”。
 
 | 能力 | 作用 |
 | --- | --- |
@@ -195,12 +196,12 @@ window API，以及 CUTE layout 逐元素等价性 checker。DeepWiki 查询和�
 | B | in-register fragment reinterpret / layout conversion | 缺失 | 无法表达 FA3 `tSrS -> tOrP` 寄存器契约 |
 | C | 跨 loop register fragment layout / swizzle contract | 缺失 | 无法声明上一轮 QK C accumulator 的同一组物理 registers 是下一轮 PV RS-A operand |
 | D | 跨 QK/PV 的 FA3-style grouped WGMMA mainloop contract | 缺失 | 单个 `T.gemm` grouped WGMMA 已支持；跨 GEMM scoreboard window 缺少高层 API |
-| E | exact CUTE smem/TMA layout 验证 | 次级缺口 | 影响完整 FA3-equivalent kernel 的最终验证，当前 boundary sample 不作为主问题 |
+| E | exact CUTE smem/TMA layout 验证 | 次级缺口 | 影响完整 FA3-equivalent kernel 的最终验证，当前能力边界样例不作为主问题 |
 
 后续小节只展开 B、C、D。A 的结论是“已支持，不是主要阻塞项”；E 的验证细节放入
 附录 B。tail fence / atom-level 控制不作为独立缺口列出，而作为 D 的诊断变量处理。
 
-### 3.2 缺口 B/C：In-register Fragment Reinterpret 与跨迭代 Layout Contract
+### 3.2 缺口 B/C：寄存器片段重解释与跨迭代布局契约
 
 TileLang 目前缺少 FA3 FP8 mainloop 所需的寄存器级 fragment reinterpret 能力。具体
 表现为：无法以高层 API 表达 `permute_Cregs_fp8 + convert_layout_acc_Aregs +
@@ -223,25 +224,10 @@ fragment 之间赋值。但此类赋值会依据两个 fragment 各自的 thread
 跨 loop 的 register fragment layout / swizzle contract
 ```
 
-建议的 API 方向：
+对应的 API 需求在第 5.1 和第 5.2 节展开。这里的核心判断是：当前 TileLang 可以表达
+fragment lifetime，但不能表达 FA3 FP8 所需的 same-register layout reinterpret。
 
-```text
-T.reinterpret_fragment(src, dst_layout, dst_dtype)
-T.convert_fragment_layout(src, dst_fragment)
-```
-
-这些 API 需要表达寄存器片段契约，而不是普通 elementwise copy。
-
-当前缺口导致的替代路径是：
-
-```text
-softmax 后将 P pack 到 p_smem
-PV helper 从 p_smem 读取 P
-```
-
-该路径可以数值正确，但不等价于 FA3 register `tOrP` contract。
-
-### 3.3 缺口 D：跨 QK/PV 的 FA3-style WGMMA Mainloop Contract
+### 3.3 缺口 D：跨 QK/PV 的 FA3-style WGMMA 主循环契约
 
 该问题不是 PTX injection gap。TileLang 支持 inline PTX，当前实验也可以在
 source/PTX intent 层表达：
@@ -292,15 +278,9 @@ SASS 仍可能退化为 per-QGMMA WARPGROUP.ARRIVE / DEPBAR
 DSL expressiveness gap / lowering contract gap
 ```
 
-需要 TileLang 提供或澄清的能力：
-
-1. `T.gemm(..., wg_wait=-1)` 是否足以表达 full-context FA3 grouped overlap。
-2. 是否需要 `T.gemm_overlap(qk, pv, inter_wait=1)` 这样的高层 API。
-3. 是否需要公开 atom-level WGMMA recipe，说明 issue/fence/commit/wait 与
-   fragment lifetime 的合法组合方式。
-4. TileLang 如何保持 QK/PV WGMMA groups、accumulator def/use、operand fences、
-   waits、softmax consumption 和 PV fragment lifetime 在同一个主循环契约中
-   对 ptxas 可见。
+对应的 API 需求在第 5.3 和第 5.4 节展开。这里的核心判断是：`T.gemm` 内部 grouping
+已经支持，但跨 QK/PV 两个 GEMM 的 scoreboard window 仍缺少高级 API 或公开的
+atom-level recipe。
 
 在当前能力边界样例中，`plain-wait` 路径试图表达 FA3 steady-state 的
 `QK[n] + PV[n-1] + wait_group<1> + softmax + wait_group<0>`。性能结果表明该
@@ -313,23 +293,12 @@ DeepWiki 将 `wgmma_rs()` / `body_rs()` 中 commit 后无条件执行的 operand
 方向一致：需要 `no_tail_fence` 或 atom-level API 做最小差异 A/B，以确认该机制在
 当前能力边界样例中是否是直接触发因素。
 
-相关调试能力需求包括：
+因此，tail fence / atom-level 控制在正文中作为诊断变量处理；具体 feature request
+见第 5.4 节。
 
-```text
-T.gemm(..., no_tail_fence=True)
-T.wgmma_group_begin/end
-documented atom-level WGMMA recipe
-```
-
-### 3.4 汇总
-
-| TileLang 功能点 | 当前判断 | 对 kernel 的影响 |
-| --- | --- | --- |
-| loop 外 `T.alloc_fragment` 生命周期 | 已支持或理论上支持 | 可表达 persistent fragment lifetime，不是主要阻塞项 |
-| QK C-layout -> PV RS-A in-register reinterpret | 缺失 | 可实现 `p_smem` 替代路径或 fragment-P probe，但无法证明为 FA3-equivalent `tOrP` |
-| grouped WGMMA mainloop contract | 单个 `T.gemm` grouped WGMMA 已支持；跨 QK/PV scoreboard window 缺失 | source/PTX intent 可接近 FA3，SASS 仍可能 per-QGMMA scoreboard |
-| `wg_wait=-1` / tail fence / atom-level 控制 | 作为 grouped WGMMA contract 的诊断变量 | 需要 A/B 和文档化 atom recipe；不是已证实独立根因 |
-| exact CUTE smem/TMA layout | 需要独立验证 | 当前样例中作为次级问题；验证细节见附录 B |
+本节结论是：TileLang 已支持 loop-external fragment lifetime 和单个 `T.gemm` 内部的
+grouped WGMMA；当前阻塞 FA3-equivalent FP8 GQA 的主缺口集中在 B/C/D。第 5 节将这些
+缺口转化为具体高级 API feature requests。
 
 ## 4. 能力边界样例状态
 
@@ -344,8 +313,14 @@ documented atom-level WGMMA recipe
 GQAFwdFP8Fa3ContractPtxAccBN224WsOverlapStreamingPPlainWaitKernel
 ```
 
-该 kernel 的目的不是提供最终高性能实现，而是构造一个数值正确、source schedule
-接近 FA3、但仍暴露 TileLang 能力边界的样例。
+代码入口：
+
+- 能力边界样例封装：
+  [boundary_demo_kernel.py](https://github.com/superAngGao/TileOPs/blob/share/fp8-gqa-fa3-tilelang-gap/experiments/ws_kernel_evolution/fa3_tilelang_gap/boundary_demo_kernel.py)
+- 实际 TileOps kernel class：
+  [GQAFwdFP8Fa3ContractPtxAccBN224WsOverlapStreamingPPlainWaitKernel](https://github.com/superAngGao/TileOPs/blob/share/fp8-gqa-fa3-tilelang-gap/tileops/kernels/attention/gqa_fwd_fp8.py#L6442)
+- 性能对照 serial baseline class：
+  [GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel](https://github.com/superAngGao/TileOPs/blob/share/fp8-gqa-fa3-tilelang-gap/tileops/kernels/attention/gqa_fwd_fp8.py#L6264)
 
 ### 4.1 Correctness 与最小测试形状
 
@@ -395,7 +370,7 @@ SASS 层则已通过性能结果和历史统计显示 grouped scoreboard 未能�
 | P handoff intent | 当前通过 `p_smem` 保存上一轮 P，下一轮 PV helper 消费 |
 | 能力边界样例价值 | 展示 source intent 接近 FA3 但 SASS/性能未达到 FA3 |
 
-建议按层级表述当前状态：
+按层级划分，当前状态如下：
 
 ```text
 source/generated CUDA layer:
@@ -697,7 +672,7 @@ PV operand fragment lifetime
 3. 对 FP8 K-major 与 VtMma layout 给出可重复的等价性验证方法。
 ```
 
-## 6. 后续 Boundary Sample 升级条件
+## 6. 后续完整样例升级条件
 
 若要将当前能力边界样例升级为完整 FA3 FP8 contract 样例，需要同时满足以下条件：
 
