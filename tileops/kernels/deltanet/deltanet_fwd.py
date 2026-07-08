@@ -13,6 +13,7 @@ Unlike gated DeltaNet, there is no gate parameter g:
   - Output: o = q @ h + causal_attn @ v_new (no Gamma weighting)
 """
 import functools
+import math
 from typing import Optional, Tuple
 
 import tilelang
@@ -23,7 +24,16 @@ from tileops.kernels.kernel_base import Kernel
 
 from .fused_prepare_compute_w_u import fused_prepare_compute_w_u_tl
 
-__all__ = ["DeltaNetFwdKernel"]
+__all__ = ["DeltaNetFwdKernel", "DeltaNetPrefillFwdKernel"]
+
+
+def _normalize_prefill_layout(layout: str) -> str:
+    layout = layout.lower()
+    if layout == "bhsd":
+        return "bhtd"
+    if layout in ("bhtd", "bthd"):
+        return layout
+    raise ValueError(f"Unsupported layout: {layout}")
 
 
 # =============================================================================
@@ -208,6 +218,343 @@ def _output_o_tl(
     return _func
 
 
+@functools.lru_cache(maxsize=32)
+def _prefill_prepare_w_u_bhtd_tl(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str = "float32",
+):
+    """Compute DeltaNet prefill ``w`` and ``u`` without global Aw/Au."""
+    accum_dtype = "float32"
+    block_C = chunk_size
+    num_rounds = int(math.ceil(math.log2(chunk_size))) if chunk_size > 1 else 0
+
+    @tilelang.jit(
+        out_idx=[-2, -1],
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False},
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _fused_func(num_stages, threads=128):
+        @T.prim_func
+        def prefill_prepare_w_u_bhtd(
+            k: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            v: T.Tensor([batch, head, seq_len, dim_v], dtype),
+            beta: T.Tensor([batch, head, seq_len], dtype),
+            w: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            u: T.Tensor([batch, head, seq_len, dim_v], dtype),
+        ):
+            with T.Kernel(batch, head, seq_len // block_C, threads=threads) as (bid, hid, by):
+                k_shared = T.alloc_shared([block_C, dim_k], dtype)
+                v_shared = T.alloc_shared([block_C, dim_v], dtype)
+                beta_shared = T.alloc_shared([block_C], dtype)
+                k_beta_shared = T.alloc_shared([block_C, dim_k], dtype)
+                v_beta_shared = T.alloc_shared([block_C, dim_v], dtype)
+                S_shared = T.alloc_shared([block_C, block_C], dtype)
+                P_shared = T.alloc_shared([block_C, block_C], dtype)
+
+                gram_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
+                temp_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
+                w_frag = T.alloc_fragment([block_C, dim_k], accum_dtype)
+                u_frag = T.alloc_fragment([block_C, dim_v], accum_dtype)
+
+                T.copy(
+                    k[bid, hid, by * block_C : (by + 1) * block_C, :],
+                    k_shared,
+                    disable_tma=True,
+                )
+                T.copy(
+                    v[bid, hid, by * block_C : (by + 1) * block_C, :],
+                    v_shared,
+                    disable_tma=True,
+                )
+                T.copy(
+                    beta[bid, hid, by * block_C : (by + 1) * block_C],
+                    beta_shared,
+                    disable_tma=True,
+                )
+
+                T.clear(gram_frag)
+                T.gemm(k_shared, k_shared, gram_frag, transpose_B=True)
+                for i, j in T.Parallel(block_C, block_C):
+                    P_shared[i, j] = T.if_then_else(
+                        i > j,
+                        -gram_frag[i, j] * beta_shared[i],
+                        T.float32(0.0),
+                    )
+                    S_shared[i, j] = T.if_then_else(
+                        i == j, T.float32(1.0), T.float32(0.0)
+                    )
+
+                for _r in T.Serial(num_rounds):
+                    T.clear(temp_frag)
+                    T.gemm(P_shared, S_shared, temp_frag)
+                    for i, j in T.Parallel(block_C, block_C):
+                        S_shared[i, j] = S_shared[i, j] + temp_frag[i, j]
+                    T.clear(temp_frag)
+                    T.gemm(P_shared, P_shared, temp_frag)
+                    T.copy(temp_frag, P_shared)
+
+                for i, d in T.Parallel(block_C, dim_k):
+                    k_beta_shared[i, d] = k_shared[i, d] * beta_shared[i]
+                T.clear(w_frag)
+                T.gemm(S_shared, k_beta_shared, w_frag)
+                T.copy(
+                    w_frag,
+                    w[bid, hid, by * block_C : (by + 1) * block_C, :],
+                    disable_tma=True,
+                )
+
+                for i, d in T.Parallel(block_C, dim_v):
+                    v_beta_shared[i, d] = v_shared[i, d] * beta_shared[i]
+                T.clear(u_frag)
+                T.gemm(S_shared, v_beta_shared, u_frag)
+                T.copy(
+                    u_frag,
+                    u[bid, hid, by * block_C : (by + 1) * block_C, :],
+                    disable_tma=True,
+                )
+
+        return prefill_prepare_w_u_bhtd
+
+    return _fused_func
+
+
+@functools.lru_cache(maxsize=32)
+def _prefill_prepare_w_u_bthd_tl(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str = "float32",
+):
+    """BTHD DeltaNet prefill prepare kernel without global Aw/Au."""
+    accum_dtype = "float32"
+    block_C = chunk_size
+    num_rounds = int(math.ceil(math.log2(chunk_size))) if chunk_size > 1 else 0
+
+    @tilelang.jit(
+        out_idx=[-2, -1],
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False},
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _fused_func(num_stages, threads=128):
+        @T.prim_func
+        def prefill_prepare_w_u_bthd(
+            k: T.Tensor([batch, seq_len, head, dim_k], dtype),
+            v: T.Tensor([batch, seq_len, head, dim_v], dtype),
+            beta: T.Tensor([batch, seq_len, head], dtype),
+            w: T.Tensor([batch, seq_len, head, dim_k], dtype),
+            u: T.Tensor([batch, seq_len, head, dim_v], dtype),
+        ):
+            with T.Kernel(batch, head, seq_len // block_C, threads=threads) as (
+                bid,
+                hid,
+                by,
+            ):
+                base = by * block_C
+                k_shared = T.alloc_shared([block_C, dim_k], dtype)
+                v_shared = T.alloc_shared([block_C, dim_v], dtype)
+                beta_shared = T.alloc_shared([block_C], dtype)
+                k_beta_shared = T.alloc_shared([block_C, dim_k], dtype)
+                v_beta_shared = T.alloc_shared([block_C, dim_v], dtype)
+                S_shared = T.alloc_shared([block_C, block_C], dtype)
+                P_shared = T.alloc_shared([block_C, block_C], dtype)
+
+                gram_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
+                temp_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
+                w_frag = T.alloc_fragment([block_C, dim_k], accum_dtype)
+                u_frag = T.alloc_fragment([block_C, dim_v], accum_dtype)
+
+                for i, d in T.Parallel(block_C, dim_k):
+                    k_shared[i, d] = k[bid, base + i, hid, d]
+                for i, d in T.Parallel(block_C, dim_v):
+                    v_shared[i, d] = v[bid, base + i, hid, d]
+                for i in T.Parallel(block_C):
+                    beta_shared[i] = beta[bid, base + i, hid]
+
+                T.clear(gram_frag)
+                T.gemm(k_shared, k_shared, gram_frag, transpose_B=True)
+                for i, j in T.Parallel(block_C, block_C):
+                    P_shared[i, j] = T.if_then_else(
+                        i > j,
+                        -gram_frag[i, j] * beta_shared[i],
+                        T.float32(0.0),
+                    )
+                    S_shared[i, j] = T.if_then_else(
+                        i == j, T.float32(1.0), T.float32(0.0)
+                    )
+
+                for _r in T.Serial(num_rounds):
+                    T.clear(temp_frag)
+                    T.gemm(P_shared, S_shared, temp_frag)
+                    for i, j in T.Parallel(block_C, block_C):
+                        S_shared[i, j] = S_shared[i, j] + temp_frag[i, j]
+                    T.clear(temp_frag)
+                    T.gemm(P_shared, P_shared, temp_frag)
+                    T.copy(temp_frag, P_shared)
+
+                for i, d in T.Parallel(block_C, dim_k):
+                    k_beta_shared[i, d] = k_shared[i, d] * beta_shared[i]
+                T.clear(w_frag)
+                T.gemm(S_shared, k_beta_shared, w_frag)
+                for i, d in T.Parallel(block_C, dim_k):
+                    w[bid, base + i, hid, d] = w_frag[i, d]
+
+                for i, d in T.Parallel(block_C, dim_v):
+                    v_beta_shared[i, d] = v_shared[i, d] * beta_shared[i]
+                T.clear(u_frag)
+                T.gemm(S_shared, v_beta_shared, u_frag)
+                for i, d in T.Parallel(block_C, dim_v):
+                    u[bid, base + i, hid, d] = u_frag[i, d]
+
+        return prefill_prepare_w_u_bthd
+
+    return _fused_func
+
+
+@functools.lru_cache(maxsize=32)
+def _prefill_h_recurrence_bthd_tl(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str = "float32",
+    block_v: int = 0,
+):
+    accum_dtype = "float32"
+    block_C = chunk_size
+    num_chunks = seq_len // block_C
+    BV = dim_v if block_v <= 0 else block_v
+    num_v_tiles = dim_v // BV
+
+    @tilelang.jit(
+        out_idx=[-2, -1],
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False},
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _func(num_stages, threads=128):
+        @T.prim_func
+        def h_recurrence_bthd(
+            k: T.Tensor([batch, seq_len, head, dim_k], dtype),
+            w: T.Tensor([batch, seq_len, head, dim_k], dtype),
+            u: T.Tensor([batch, seq_len, head, dim_v], dtype),
+            S_0: T.Tensor([batch, head, dim_k, dim_v], dtype),
+            S: T.Tensor([batch, head, num_chunks + 1, dim_k, dim_v], accum_dtype),
+            v_new: T.Tensor([batch, seq_len, head, dim_v], dtype),
+        ):
+            with T.Kernel(num_v_tiles, batch, head, threads=threads) as (vid, bid, hid):
+                k_c = T.alloc_shared([block_C, dim_k], dtype)
+                w_c = T.alloc_shared([block_C, dim_k], dtype)
+                u_c = T.alloc_shared([block_C, BV], dtype)
+                h_c = T.alloc_shared([dim_k, BV], dtype)
+                v_new_c = T.alloc_shared([block_C, BV], dtype)
+
+                ws_frag = T.alloc_fragment([block_C, BV], accum_dtype)
+                h_fp32 = T.alloc_fragment([dim_k, BV], accum_dtype)
+                v_offset = vid * BV
+
+                T.copy(S_0[bid, hid, :, v_offset : v_offset + BV], h_c, disable_tma=True)
+                for i, j in T.Parallel(dim_k, BV):
+                    h_fp32[i, j] = T.cast(h_c[i, j], accum_dtype)
+                    S[bid, hid, 0, i, v_offset + j] = h_fp32[i, j]
+
+                for t in T.Pipelined(num_chunks, num_stages=num_stages):
+                    base = t * block_C
+                    for i, d in T.Parallel(block_C, dim_k):
+                        k_c[i, d] = k[bid, base + i, hid, d]
+                        w_c[i, d] = w[bid, base + i, hid, d]
+                    for i, d in T.Parallel(block_C, BV):
+                        u_c[i, d] = u[bid, base + i, hid, v_offset + d]
+
+                    T.copy(h_fp32, h_c)
+                    T.clear(ws_frag)
+                    T.gemm(w_c, h_c, ws_frag)
+                    for i, j in T.Parallel(block_C, BV):
+                        v_new_c[i, j] = u_c[i, j] - ws_frag[i, j]
+                        v_new[bid, base + i, hid, v_offset + j] = v_new_c[i, j]
+
+                    T.gemm(k_c, v_new_c, h_fp32, transpose_A=True)
+                    for i, j in T.Parallel(dim_k, BV):
+                        S[bid, hid, t + 1, i, v_offset + j] = h_fp32[i, j]
+
+        return h_recurrence_bthd
+
+    return _func
+
+
+@functools.lru_cache(maxsize=32)
+def _prefill_output_o_bthd_tl(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str = "float32",
+):
+    accum_dtype = "float32"
+    block_C = chunk_size
+    num_chunks = seq_len // block_C
+
+    @tilelang.jit(
+        out_idx=[-1],
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False},
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _func(threads=128):
+        @T.prim_func
+        def output_o_bthd(
+            q: T.Tensor([batch, seq_len, head, dim_k], dtype),
+            k: T.Tensor([batch, seq_len, head, dim_k], dtype),
+            S: T.Tensor([batch, head, num_chunks + 1, dim_k, dim_v], accum_dtype),
+            v_new: T.Tensor([batch, seq_len, head, dim_v], dtype),
+            o: T.Tensor([batch, seq_len, head, dim_v], dtype),
+        ):
+            with T.Kernel(num_chunks, batch, head, threads=threads) as (tid, bid, hid):
+                base = tid * block_C
+                q_c = T.alloc_shared([block_C, dim_k], dtype)
+                k_c = T.alloc_shared([block_C, dim_k], dtype)
+                h_c = T.alloc_shared([dim_k, dim_v], dtype)
+                v_new_c = T.alloc_shared([block_C, dim_v], dtype)
+                attn = T.alloc_shared([block_C, block_C], dtype)
+
+                o_frag = T.alloc_fragment([block_C, dim_v], accum_dtype)
+                attn_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
+
+                for i, d in T.Parallel(block_C, dim_k):
+                    q_c[i, d] = q[bid, base + i, hid, d]
+                    k_c[i, d] = k[bid, base + i, hid, d]
+                T.copy(S[bid, hid, tid, :, :], h_c, disable_tma=True)
+                for i, d in T.Parallel(block_C, dim_v):
+                    v_new_c[i, d] = v_new[bid, base + i, hid, d]
+
+                T.clear(o_frag)
+                T.gemm(q_c, h_c, o_frag)
+                T.clear(attn_frag)
+                T.gemm(q_c, k_c, attn_frag, transpose_B=True)
+                for i, j in T.Parallel(block_C, block_C):
+                    attn[i, j] = T.if_then_else(
+                        i >= j,
+                        attn_frag[i, j],
+                        T.float32(0.0),
+                    )
+                T.gemm(attn, v_new_c, o_frag)
+                for i, d in T.Parallel(block_C, dim_v):
+                    o[bid, base + i, hid, d] = o_frag[i, d]
+
+        return output_o_bthd
+
+    return _func
+
+
 @torch.library.custom_op("tileops::deltanet_fwd_kernel", mutates_args=())
 def _deltanet_fwd_wrapped_kernel(
     batch: int, head: int, seq_len: int, chunk_size: int, dim_k: int, dim_v: int,
@@ -253,6 +600,90 @@ def _deltanet_fwd_wrapped_kernel_fake(
     w = torch.empty(batch, head, seq_len, dim_k, dtype=q.dtype, device=q.device)
     u = torch.empty(batch, head, seq_len, dim_v, dtype=q.dtype, device=q.device)
     return o, S, Aw, Au, w, u
+
+
+@torch.library.custom_op("tileops::deltanet_prefill_fwd_kernel", mutates_args=())
+def _deltanet_prefill_fwd_wrapped_kernel(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str,
+    fused_num_stages: int,
+    fused_threads: int,
+    h_num_stages: int,
+    h_threads: int,
+    h_block_v: int,
+    o_threads: int,
+    layout: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    layout = _normalize_prefill_layout(layout)
+    S_0 = torch.zeros(batch, head, dim_k, dim_v, dtype=q.dtype, device=q.device)
+    if layout == "bthd":
+        prepare_fn = _prefill_prepare_w_u_bthd_tl(
+            batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
+        )(fused_num_stages, fused_threads)
+        h_fn = _prefill_h_recurrence_bthd_tl(
+            batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
+            block_v=h_block_v,
+        )(h_num_stages, h_threads)
+        o_fn = _prefill_output_o_bthd_tl(
+            batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
+        )(o_threads)
+    else:
+        prepare_fn = _prefill_prepare_w_u_bhtd_tl(
+            batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
+        )(fused_num_stages, fused_threads)
+        h_fn = _h_recurrence_tl(
+            batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
+            block_v=h_block_v,
+        )(h_num_stages, h_threads)
+        o_fn = _output_o_tl(
+            batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
+        )(o_threads)
+    w, u = prepare_fn(k, v, beta)
+    S_buf, v_new = h_fn(k, w, u, S_0)
+    o = o_fn(q, k, S_buf, v_new)
+    final_state = S_buf[:, :, -1, :, :].contiguous().to(q.dtype)
+    return o, final_state
+
+
+@_deltanet_prefill_fwd_wrapped_kernel.register_fake
+def _deltanet_prefill_fwd_wrapped_kernel_fake(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str,
+    fused_num_stages: int,
+    fused_threads: int,
+    h_num_stages: int,
+    h_threads: int,
+    h_block_v: int,
+    o_threads: int,
+    layout: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    del dtype, fused_num_stages, fused_threads, h_num_stages, h_threads
+    del h_block_v, o_threads, k, v, beta, chunk_size
+    layout = _normalize_prefill_layout(layout)
+    if layout == "bthd":
+        o = torch.empty(batch, seq_len, head, dim_v, dtype=q.dtype, device=q.device)
+    else:
+        o = torch.empty(batch, head, seq_len, dim_v, dtype=q.dtype, device=q.device)
+    final_state = torch.empty(batch, head, dim_k, dim_v, dtype=q.dtype, device=q.device)
+    return o, final_state
 
 
 class DeltaNetFwdKernel(Kernel):
@@ -389,5 +820,71 @@ class DeltaNetFwdKernel(Kernel):
             self.config["h_num_stages"], self.config["h_threads"],
             self.config.get("h_block_v", 0),
             self.config["o_threads"],
+            q, k, v, beta,
+        )
+
+
+class DeltaNetPrefillFwdKernel(Kernel):
+    """DeltaNet zero-state serving prefill kernel.
+
+    The public serving contract returns only ``(o, final_state)``. Training
+    artifacts such as Aw/Au/w/u stay internal to the kernel pipeline and are
+    not exposed by the op surface.
+    """
+
+    supported_archs: list[int] = [80, 89, 90]
+
+    def __init__(
+        self,
+        batch: int,
+        head: int,
+        seq_len: int,
+        chunk_size: int,
+        dim_k: int,
+        dim_v: int,
+        dtype: str = "float32",
+        config: Optional[dict] = None,
+        layout: str = "bthd",
+        tune: bool = False,
+    ):
+        super().__init__()
+        self.batch = batch
+        self.head = head
+        self.seq_len = seq_len
+        self.chunk_size = chunk_size
+        self.dim_k = dim_k
+        self.dim_v = dim_v
+        self.dtype = dtype
+        self.layout = _normalize_prefill_layout(layout)
+        self.init_config(config, tune)
+
+    @property
+    def default_config(self) -> dict:
+        h_block_v = 32 if self.chunk_size >= 64 and self.dim_v % 32 == 0 else 0
+        h_threads = 128 if self.layout == "bthd" and self.batch * self.head <= 32 else 256
+        return {
+            "fused_num_stages": 2,
+            "fused_threads": 128,
+            "h_num_stages": 2,
+            "h_threads": h_threads,
+            "h_block_v": h_block_v,
+            "o_threads": 256,
+        }
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cfg = self.config
+        return _deltanet_prefill_fwd_wrapped_kernel(
+            self.batch, self.head, self.seq_len, self.chunk_size,
+            self.dim_k, self.dim_v, self.dtype_str,
+            cfg["fused_num_stages"], cfg["fused_threads"],
+            cfg["h_num_stages"], cfg["h_threads"],
+            cfg.get("h_block_v", 0),
+            cfg["o_threads"], self.layout,
             q, k, v, beta,
         )

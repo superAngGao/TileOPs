@@ -29,6 +29,7 @@ __all__ = [
     "deepseek_dsa_decode_roofline",
     "deepseek_mla_decode_roofline",
     "deltanet_decode_roofline",
+    "deltanet_prefill_fwd_roofline",
     "div_fwd_roofline",
     "dropout_roofline",
     "engram_decode_roofline",
@@ -45,6 +46,7 @@ __all__ = [
     "ge_fwd_roofline",
     "gemm_fwd_roofline",
     "gla_decode_roofline",
+    "gla_prefill_fwd_roofline",
     "gqa_bwd_roofline",
     "gqa_decode_paged_roofline",
     "gqa_decode_roofline",
@@ -285,6 +287,88 @@ def gated_deltanet_prefill_fwd_roofline(op: Any | None = None, **kwargs: Any) ->
     output_elems = batch * heads * seq_len * dim_v + batch * heads * dim_k * dim_v
     nbytes = (input_elems + output_elems) * elem_bytes
     return int(flops), int(nbytes)
+
+
+def deltanet_prefill_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Approximate roofline for DeltaNet zero-state serving prefill."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        layout = str(data.get("layout", "bthd")).lower()
+        q_shape = data["q_shape"]
+        v_shape = data["v_shape"]
+        if layout == "bthd":
+            batch, seq_len, heads, dim_k = q_shape
+            _, v_seq_len, v_heads, dim_v = v_shape
+        elif layout in ("bhtd", "bhsd"):
+            batch, heads, seq_len, dim_k = q_shape
+            _, v_heads, v_seq_len, dim_v = v_shape
+        else:
+            raise ValueError(f"Unsupported DeltaNet prefill layout: {layout}")
+        if v_seq_len != seq_len or v_heads != heads:
+            raise ValueError(
+                "DeltaNet prefill q_shape and v_shape must share seq_len and heads"
+            )
+        chunk_size = data.get("chunk_size", 64) or 64
+    else:
+        batch, heads, seq_len, dim_k, dim_v, chunk_size = (
+            data["batch"],
+            data["heads"],
+            data["seq_len"],
+            data["dim_k"],
+            data["dim_v"],
+            data["chunk_size"] or 64,
+        )
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    num_chunks = seq_len // chunk_size
+    state_flops = 4 * batch * heads * num_chunks * chunk_size * dim_k * dim_v
+    intra_flops = 4 * batch * heads * num_chunks * chunk_size * chunk_size * (
+        dim_k + dim_v
+    )
+    flops = state_flops + intra_flops
+
+    input_elems = (
+        3 * batch * heads * seq_len * dim_k
+        + batch * heads * seq_len * dim_v
+        + batch * heads * seq_len
+    )
+    output_elems = batch * heads * seq_len * dim_v + batch * heads * dim_k * dim_v
+    return int(flops), int((input_elems + output_elems) * elem_bytes)
+
+
+def gla_prefill_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Approximate roofline for GLA zero-state serving prefill."""
+    data = _shape_or_attrs(op, kwargs)
+    if "q_shape" in data:
+        batch, seq_len, heads, dim_k = data["q_shape"]
+        _, v_seq_len, v_heads, dim_v = data["v_shape"]
+        if v_seq_len != seq_len or v_heads != heads:
+            raise ValueError("GLA prefill q_shape and v_shape must share seq_len and heads")
+        chunk_size = data.get("chunk_size", 64) or 64
+    else:
+        batch, seq_len, heads, dim_k, dim_v, chunk_size = (
+            data["batch"],
+            data["seq_len"],
+            data["heads"],
+            data["dim_k"],
+            data["dim_v"],
+            data["chunk_size"] or 64,
+        )
+    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+
+    num_chunks = seq_len // chunk_size
+    state_flops = 4 * batch * heads * num_chunks * chunk_size * dim_k * dim_v
+    intra_flops = 4 * batch * heads * num_chunks * chunk_size * chunk_size * (
+        dim_k + dim_v
+    )
+    flops = state_flops + intra_flops
+
+    input_elems = (
+        3 * batch * seq_len * heads * dim_k
+        + batch * seq_len * heads * dim_v
+    )
+    output_elems = batch * seq_len * heads * dim_v + batch * heads * dim_k * dim_v
+    return int(flops), int((input_elems + output_elems) * elem_bytes)
 
 
 def _linear_attention_decode_dims(data: dict[str, Any]) -> tuple[int, int, int, int]:

@@ -7,7 +7,7 @@ from tileops.kernels.kernel_base import Kernel
 
 from .op_base import Op
 
-__all__ = ["GLABwdOp", "GLAFwdOp"]
+__all__ = ["GLABwdOp", "GLAFwdOp", "GLAPrefillFwdOp"]
 
 
 class GLAFwdOp(Op):
@@ -97,6 +97,140 @@ class GLAFwdOp(Op):
             Tuple of (o, final_state). final_state is None if output_final_state=False.
         """
         return self.kernel(q, k, v, g, initial_state)
+
+
+class GLAPrefillFwdOp(Op):
+    """GLA inference prefill operator.
+
+    Public serving contract: ``(q, k, v, g) -> (o, final_state)`` with a
+    zero initial recurrent state. This keeps the manifest-facing entry free of
+    optional initial-state and output-final-state switches.
+    """
+
+    def __init__(
+        self,
+        batch: int,
+        seq_len: int,
+        heads: int,
+        dim_k: int,
+        dim_v: int,
+        chunk_size: int = 64,
+        scale: float = -1.0,
+        dtype: torch.dtype = torch.float16,
+        kernel_map: Optional[Dict[str, Kernel]] = None,
+        tune: bool = False,
+        layout: str = "bthd",
+    ) -> None:
+        layout = self._normalize_layout(layout)
+        self.batch = batch
+        self.seq_len = seq_len
+        self.heads = heads
+        self.dim_k = dim_k
+        self.dim_v = dim_v
+        self.chunk_size = chunk_size
+        self.scale = scale
+        self.dtype = dtype
+        self.layout = layout
+
+        if seq_len % chunk_size != 0:
+            raise ValueError(
+                f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})"
+            )
+
+        self.dispatch_kernel(kernel_map)
+        kernel_cls = self.kernel_map["GLAFwdKernel"]
+        self.kernel = kernel_cls(
+            batch,
+            seq_len,
+            heads,
+            dim_k,
+            dim_v,
+            chunk_size,
+            scale=scale,
+            output_final_state=True,
+            dtype=dtype,
+            tune=tune,
+        )
+
+    @property
+    def default_kernel_map(self) -> Dict[str, Kernel]:
+        return {
+            "GLAFwdKernel": GLAFwdKernel,
+        }
+
+    @staticmethod
+    def _normalize_layout(layout: str) -> str:
+        layout = layout.lower()
+        if layout != "bthd":
+            raise ValueError("GLAPrefillFwdOp currently supports layout='bthd' only")
+        return layout
+
+    def _infer_output_shapes(
+        self,
+        q_shape: tuple[int, ...],
+        k_shape: tuple[int, ...],
+        v_shape: tuple[int, ...],
+        g_shape: tuple[int, ...],
+    ) -> dict[str, tuple[int, ...]]:
+        del k_shape, g_shape
+        return {
+            "o": (q_shape[0], q_shape[1], q_shape[2], v_shape[-1]),
+            "final_state": (q_shape[0], q_shape[2], q_shape[-1], v_shape[-1]),
+        }
+
+    def _validate_dtypes(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+    ) -> None:
+        if self.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            raise ValueError(f"Unsupported dtype: {self.dtype}")
+        for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g)):
+            if tensor.dtype != self.dtype:
+                raise ValueError(f"{name}.dtype must be {self.dtype}, got {tensor.dtype}")
+
+    def _validate_shapes(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+    ) -> None:
+        q_shape = (self.batch, self.seq_len, self.heads, self.dim_k)
+        v_shape = (self.batch, self.seq_len, self.heads, self.dim_v)
+        if tuple(q.shape) != q_shape:
+            raise ValueError(f"q must have shape {q_shape}, got {tuple(q.shape)}")
+        if tuple(k.shape) != q_shape:
+            raise ValueError(f"k must have shape {q_shape}, got {tuple(k.shape)}")
+        if tuple(v.shape) != v_shape:
+            raise ValueError(f"v must have shape {v_shape}, got {tuple(v.shape)}")
+        if tuple(g.shape) != q_shape:
+            raise ValueError(f"g must have shape {q_shape}, got {tuple(g.shape)}")
+        if not all(tensor.is_cuda for tensor in (q, k, v, g)):
+            raise ValueError("q, k, v, and g must be CUDA tensors")
+
+    def eval_roofline(self) -> tuple[int, int]:
+        from tileops.perf.formulas import gla_prefill_fwd_roofline
+
+        return gla_prefill_fwd_roofline(self)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        g = g.contiguous()
+        self._validate_dtypes(q, k, v, g)
+        self._validate_shapes(q, k, v, g)
+        o, final_state = self.kernel(q, k, v, g, None)
+        return o, final_state.to(self.dtype)
 
 
 class GLABwdOp(Op):

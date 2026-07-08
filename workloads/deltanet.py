@@ -32,6 +32,23 @@ class DeltaNetFwdTest(WorkloadBase):
         return q, k, v, beta
 
 
+class DeltaNetPrefillFwdTest(DeltaNetFwdTest):
+    """Inference prefill workload for DeltaNet."""
+
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        seq_len: int,
+        dim_k: int,
+        dim_v: int,
+        chunk_size: int,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__(batch, heads, seq_len, dim_k, dim_v, chunk_size, dtype)
+        self.shape = (batch, heads, seq_len, dim_k)
+
+
 class DeltaNetDecodeTest(WorkloadBase):
 
     def __init__(

@@ -28,7 +28,7 @@ from .convolution import (
     Conv3dFwdOp,
 )
 from .da_cumsum import DaCumsumFwdOp
-from .deltanet import DeltaNetBwdOp, DeltaNetFwdOp, DeltaNetOp
+from .deltanet import DeltaNetBwdOp, DeltaNetFwdOp, DeltaNetOp, DeltaNetPrefillFwdOp
 from .deltanet_recurrence import DeltaNetDecodeOp
 from .dropout import DropoutOp
 from .elementwise import BinaryOp, FusedGatedOp, UnaryOp
@@ -44,7 +44,7 @@ from .gated_deltanet import (
 )
 from .gated_linear_attn import GLADecodeOp
 from .gemm import GemmOp
-from .gla import GLABwdOp, GLAFwdOp
+from .gla import GLABwdOp, GLAFwdOp, GLAPrefillFwdOp
 from .grouped_gemm import GroupedGemmOp
 from .mamba2_fwd import Mamba2FwdOp
 from .mhc import MHCPostOp, MHCPreOp
@@ -132,6 +132,7 @@ __all__ = [
     "DeltaNetDecodeOp",
     "DeltaNetFwdOp",
     "DeltaNetOp",
+    "DeltaNetPrefillFwdOp",
     "GatedDeltaNetBwdOp",
     "GatedDeltaNetDecodeOp",
     "GatedDeltaNetFwdOp",
@@ -140,6 +141,7 @@ __all__ = [
     "GLABwdOp",
     "GLADecodeOp",
     "GLAFwdOp",
+    "GLAPrefillFwdOp",
     "GemmOp",
     "GroupedQueryAttentionSlidingWindowFwdOp",
     "GroupedQueryAttentionSlidingWindowVarlenFwdOp",

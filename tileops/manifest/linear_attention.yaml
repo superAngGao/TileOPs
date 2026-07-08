@@ -61,6 +61,107 @@ GatedDeltaNetPrefillFwdOp:
     bench: benchmarks/ops/bench_gated_deltanet_prefill.py
     bench_manifest_driven: true
 
+DeltaNetPrefillFwdOp:
+  # Inference prefill for ungated DeltaNet. This is separate from
+  # DeltaNetFwdOp, which exposes training-forward artifacts needed by
+  # backward. Prefill is zero-state and returns only prompt output plus the
+  # recurrent state consumed by decode.
+  ref_api: "none"
+  family: linear_attention
+  status: implemented
+
+  signature:
+    inputs:
+      q: {dtype: "float16 | bfloat16 | float32", shape: "[B, S, H, DK]"}
+      k: {dtype: "same_as(q)", shape: "[B, S, H, DK]"}
+      v: {dtype: "same_as(q)", shape: "[B, S, H, DV]"}
+      beta: {dtype: "same_as(q)", shape: "[B, S, H]"}
+    outputs:
+      o: {dtype: "same_as(q)", shape: "[B, S, H, DV]"}
+      final_state: {dtype: "same_as(q)", shape: "[B, H, DK, DV]"}
+    params:
+      chunk_size: {type: "int | None", default: null}
+      layout: {type: str, default: "bthd"}
+    shape_rules:
+      - "layout in ('bhtd', 'bhsd', 'bthd')"
+      - "layout == 'bthd' or q.shape == (B, H, S, DK)"
+      - "layout == 'bthd' or k.shape == (B, H, S, DK)"
+      - "layout == 'bthd' or v.shape == (B, H, S, DV)"
+      - "layout == 'bthd' or beta.shape == (B, H, S)"
+      - "layout == 'bthd' or o.shape == (B, H, S, DV)"
+      - "layout != 'bthd' or q.shape == (B, S, H, DK)"
+      - "layout != 'bthd' or k.shape == (B, S, H, DK)"
+      - "layout != 'bthd' or v.shape == (B, S, H, DV)"
+      - "layout != 'bthd' or beta.shape == (B, S, H)"
+      - "layout != 'bthd' or o.shape == (B, S, H, DV)"
+      - "final_state.shape == (B, H, DK, DV)"
+      - "chunk_size is None or S % chunk_size == 0"
+
+  workloads:
+    - {q_shape: [1, 512, 16, 128], k_shape: [1, 512, 16, 128], v_shape: [1, 512, 16, 128], beta_shape: [1, 512, 16], chunk_size: 64, dtypes: [float16, bfloat16], label: "delta-prefill-b1-s512-h16-d128"}
+    - {q_shape: [4, 2048, 16, 64], k_shape: [4, 2048, 16, 64], v_shape: [4, 2048, 16, 128], beta_shape: [4, 2048, 16], chunk_size: 64, dtypes: [float16, bfloat16], label: "delta-prefill-b4-s2k-h16-dk64-dv128"}
+    - {q_shape: [1, 8192, 16, 128], k_shape: [1, 8192, 16, 128], v_shape: [1, 8192, 16, 128], beta_shape: [1, 8192, 16], chunk_size: 64, dtypes: [float16, bfloat16], label: "delta-prefill-b1-s8k-h16-d128"}
+
+  roofline:
+    func: "tileops.perf.formulas.deltanet_prefill_fwd_roofline"
+
+  source:
+    kernel: tileops/kernels/deltanet/deltanet_fwd.py
+    kernel_map:
+      DeltaNetPrefillFwdKernel: DeltaNetPrefillFwdKernel
+    op: tileops/ops/deltanet.py
+    test: tests/ops/test_deltanet_prefill.py
+    bench: benchmarks/ops/bench_deltanet_prefill.py
+    bench_manifest_driven: true
+
+GLAPrefillFwdOp:
+  # Inference prefill for GLA. The manifest-facing contract is zero-state and
+  # always returns final_state; optional initial-state ownership stays out of
+  # the serving prefill entry.
+  ref_api: "none"
+  family: linear_attention
+  status: implemented
+
+  signature:
+    inputs:
+      q: {dtype: "float16 | bfloat16 | float32", shape: "[B, S, H, DK]"}
+      k: {dtype: "same_as(q)", shape: "[B, S, H, DK]"}
+      v: {dtype: "same_as(q)", shape: "[B, S, H, DV]"}
+      g: {dtype: "same_as(q)", shape: "[B, S, H, DK]"}
+    outputs:
+      o: {dtype: "same_as(q)", shape: "[B, S, H, DV]"}
+      final_state: {dtype: "same_as(q)", shape: "[B, H, DK, DV]"}
+    params:
+      chunk_size: {type: int, default: 64}
+      scale: {type: float, default: -1.0}
+      layout: {type: str, default: "bthd"}
+    shape_rules:
+      - "layout == 'bthd'"
+      - "q.shape == (B, S, H, DK)"
+      - "k.shape == (B, S, H, DK)"
+      - "v.shape == (B, S, H, DV)"
+      - "g.shape == (B, S, H, DK)"
+      - "o.shape == (B, S, H, DV)"
+      - "final_state.shape == (B, H, DK, DV)"
+      - "S % chunk_size == 0"
+
+  workloads:
+    - {q_shape: [1, 512, 16, 128], k_shape: [1, 512, 16, 128], v_shape: [1, 512, 16, 128], g_shape: [1, 512, 16, 128], chunk_size: 64, scale: 0.08838834764831845, dtypes: [float16, bfloat16], label: "gla-prefill-b1-s512-h16-d128"}
+    - {q_shape: [4, 2048, 16, 64], k_shape: [4, 2048, 16, 64], v_shape: [4, 2048, 16, 128], g_shape: [4, 2048, 16, 64], chunk_size: 64, scale: 0.125, dtypes: [float16, bfloat16], label: "gla-prefill-b4-s2k-h16-dk64-dv128"}
+    - {q_shape: [1, 8192, 16, 128], k_shape: [1, 8192, 16, 128], v_shape: [1, 8192, 16, 128], g_shape: [1, 8192, 16, 128], chunk_size: 64, scale: 0.08838834764831845, dtypes: [float16, bfloat16], label: "gla-prefill-b1-s8k-h16-d128"}
+
+  roofline:
+    func: "tileops.perf.formulas.gla_prefill_fwd_roofline"
+
+  source:
+    kernel: tileops/kernels/gla/gla_fwd.py
+    kernel_map:
+      GLAFwdKernel: GLAFwdKernel
+    op: tileops/ops/gla.py
+    test: tests/ops/test_gla_prefill.py
+    bench: benchmarks/ops/bench_gla_prefill.py
+    bench_manifest_driven: true
+
 GatedDeltaNetDecodeOp:
   # Single-token serving decode. The input state is read-only from the public
   # contract perspective; the op returns a fresh new_state tensor.

@@ -44,7 +44,7 @@ from .convolution import (
     GroupConv2dKernel,
     GroupConv3dKernel,
 )
-from .deltanet import DeltaNetBwdKernel, DeltaNetFwdKernel
+from .deltanet import DeltaNetBwdKernel, DeltaNetFwdKernel, DeltaNetPrefillFwdKernel
 from .deltanet_recurrence import DeltaNetDecodeFP32Kernel, DeltaNetDecodeKernel
 from .dropout import DropoutKernel
 from .elementwise import BinaryKernel, FusedGatedKernel, UnaryKernel
@@ -105,6 +105,7 @@ __all__ = [
     "DeltaNetDecodeFP32Kernel",
     "DeltaNetDecodeKernel",
     "DeltaNetFwdKernel",
+    "DeltaNetPrefillFwdKernel",
     "DropoutKernel",
     "EngramDecodeKernel",
     "EngramGateConvBwdKernel",
