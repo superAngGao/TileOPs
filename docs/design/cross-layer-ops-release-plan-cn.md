@@ -117,6 +117,8 @@ x_res   = h_res @ reshape(x, [B, n_expand, C])
 x_layer = h_pre @ reshape(x, [B, n_expand, C])
 ```
 
+这里的公式只用于说明 MHC 为什么属于 `cross_layer`：它显式操作 `n_expand` 这个 expanded residual-channel axis。完整的 shape contract、`phi @ x + b` 的中间拆分、`h_res` 的 Sinkhorn normalization 细节，以及对应 shape rules，会在 MHC manifest PR 中写清楚。
+
 MHCPost 的实际接口是：
 
 ```text
@@ -162,10 +164,13 @@ M = B * S
 L = number of source blocks/states, with the current partial block included by caller
 softmax axis = L
 norm axis = H
+query is a shared projection vector [H], applied after RMSNorm to produce one logit per source state
 output uses original states, not normalized states
 logits accumulation = fp32
 weighted accumulation = fp32 or explicitly documented mixed precision
 ```
+
+这里的 `query` 不是 per-token query tensor，而是第一版 kernel boundary 里的共享 projection weight。也就是说，每个 `(batch, token)` 会用同一组 `[H]` projection 计算 depth logits。如果后续 official contract 需要 input-dependent query，可以在 tracking issue 中把 query 生成放到 caller 侧或扩展 op signature；这不会影响第一版 strawman 想表达的核心边界：RMSNorm + projection + depth softmax + weighted sum。
 
 第一版倾向使用连续 workspace：
 
@@ -202,7 +207,7 @@ output = sum_l weights[l, m] * states[l, m, :]
 
 ### Phase 0：Taxonomy
 
-新增本文档，确立 `cross_layer` 的 family 边界和 admission rule。
+在 `docs/design/` 新增本文档，确立 `cross_layer` 的 family 边界和 admission rule。本文档是讨论用 release plan，不是 manifest spec。
 
 ### Phase 1：MHC Manifest Alignment
 
@@ -219,7 +224,19 @@ MHCPreOp
 MHCPostOp
 ```
 
-具体 status 根据现有 wrapper、kernel、test、benchmark、source metadata 与 CI 情况确定。由于 MHC 现在没有 manifest，工作量是从零补完整 spec，而不是改一个 `family` 字段。
+这个阶段分两步推进。
+
+Phase 1a 先补完整 manifest spec，并保持 `spec-only`：
+
+```text
+signature
+shape_rules
+workloads
+roofline
+source metadata
+```
+
+Phase 1b 对齐现有 tests / benchmarks / source metadata。MHC 现有测试以 cosine similarity 为主；如果要把 status 提升到 `implemented`，需要先补齐更严格的数值 gate。通过改进后的测试和 CI 后，再单独提交 status promotion。如果发现 kernel 或 wrapper 需要修复，则保持 `spec-only`，由后续 implementation PR 处理。
 
 ### Phase 2：Block AttnRes Tracking Issue
 
@@ -232,6 +249,10 @@ fusion boundary
 correctness reference
 benchmark workloads
 dtype / accumulation policy
+workspace append/update ownership
+contiguous vs non-contiguous state storage
+causal depth mask representation
+sequence-parallel compatibility
 ```
 
 这个阶段不改主仓实现，也不把半定稿 API 写进 manifest。
@@ -331,6 +352,25 @@ roofline 需要区分：
 algorithmic bytes
 materialized implementation bytes
 ```
+
+例如朴素 composition 可能需要多次 HBM 往返：
+
+```text
+states [L,M,H] read -> RMSNorm -> temp [L,M,H] write
+temp read -> projection -> logits [L,M] write
+logits read -> softmax -> weights [L,M] write
+weights + states read -> weighted sum -> output [M,H] write
+```
+
+而 fused kernel 的目标是把这些阶段压进一个 kernel boundary，在 tile 内尽量保留中间量：
+
+```text
+states [L,M,H] tiled read
+query/rms_weight read
+output [M,H] write
+```
+
+`algorithmic bytes` 表示公式层面的理论下界；`materialized implementation bytes` 表示实际 kernel 因临时张量、layout、spill 或多 kernel composition 产生的 HBM traffic，后者需要通过 profiler 校验。
 
 因为 fused kernel 如果在片上保留 state tile，实际 memory traffic 会和朴素多 kernel composition 不同。
 
