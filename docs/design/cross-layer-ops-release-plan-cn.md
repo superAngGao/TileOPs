@@ -51,7 +51,6 @@ cross_layer operator:
 | --- | --- | --- |
 | Expanded residual-channel mixing | MHC / Hyper-Connection | 显式维护 `n_expand` residual channels，并生成 mixing matrix 做通道间传递 |
 | Depth-wise residual aggregation | Kimi AttnRes / Block AttnRes | 显式对 preceding layer/block outputs 做 softmax attention aggregation |
-| Layer / block weighted aggregation | layer scalar mix, block state weighted sum | 显式读取多个 layer/block states 并合成一个表示 |
 | Depth selection / gather-scatter | future depth routing kernels | 如果出现独立 kernel boundary，可以纳入 |
 
 ### 3.2 Adjacent Architecture Mechanisms
@@ -63,6 +62,7 @@ cross_layer operator:
 | Cross-layer KV ownership / reuse | CLA, LCKV, YOCO-style KV reuse | 更像 model graph / KV cache lifecycle policy，不一定对应独立 kernel |
 | Layer skipping / dynamic depth | Mixture-of-Depths, dynamic layer routing | 更像 runtime scheduling、token dispatch、graph execution policy |
 | Cross-layer attention variants inside attention | Depth-Attention, cross-layer value mixing | 可能更适合作为 attention op 配置或后续 hybrid family |
+| Simple layer weighted aggregation | ELMo scalar mix, BERT layer pooling, sentence-transformer weighted layer pooling | 常见于表征抽取、下游 pooling 或研究工具；可以作为 reference pattern，但不是第一批 release target |
 
 这类机制会继续作为参考，但不会直接把 `CrossLayerKVShareOp` 之类的抽象塞进第一版计划。
 
@@ -184,7 +184,7 @@ workspace 的生命周期由模型/runtime 管理。operator 不负责 append/up
 
 ### 4.3 Depth Weighted Sum：内部垫脚石，不作为第一批公开目标
 
-`CrossLayerWeightedSumFwdOp` 这种形式：
+`CrossLayerWeightedSumFwdOp` 或 `DepthWeightedSum` 这种形式：
 
 ```text
 states:  [L, M, H]
@@ -192,7 +192,9 @@ weights: [L, M]
 output = sum_l weights[l, m] * states[l, m, :]
 ```
 
-很适合作为 PyTorch reference、prototype benchmark 或 Block AttnRes 的分解 baseline。但它本身太接近 fused weighted reduction，不足以单独证明新 family 的必要性。
+很适合作为 PyTorch reference、prototype benchmark 或 Block AttnRes 的分解 baseline。类似思想在 ELMo scalar mix、BERT layer pooling、sentence-transformer weighted layer pooling 里出现过，但这些更多是表征抽取或下游 pooling 场景，不是现代 LLM 推理主路径中明确的性能热点。
+
+因此它本身太接近 fused weighted reduction，不足以单独证明新 family 的必要性。
 
 第一批计划不把它作为公开 manifest 目标。只有当它被 MHC、AttnRes 或后续 op 真实复用，或者有明确独立用户时，再考虑进入 manifest。
 
