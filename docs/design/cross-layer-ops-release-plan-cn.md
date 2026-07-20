@@ -6,7 +6,7 @@
 
 这里的立场是：`cross_layer` 值得建立，但它应该是一个窄边界的 operator family，而不是所有“跨层架构机制”的集合。第一批工作聚焦两件事：
 
-1. 把 TileOps 已有的 MHC / Hyper-Connection 纳入统一分类和 manifest 管理。
+1. 对齐 TileOps 已有的 MHC / Hyper-Connection taxonomy。本文倾向将它归入 `cross_layer.connection`；如果既有 missing-ops / manifest 计划已先把 MHC 放入 `sequence_modeling`，第一步应先在 tracking issue 中完成 family reconciliation，避免重复 manifest 条目。
 2. 为 Kimi Attention Residuals，尤其是 Block AttnRes，建立清晰的后续落地路径。
 
 ## 2. 为什么需要 Cross-Layer
@@ -51,7 +51,7 @@ cross_layer operator:
 
 | 子类 | 代表模型 / 工作 | 模型里的功能 | TileOps 中可复用的算子边界 |
 | --- | --- | --- | --- |
-| `cross_layer.connection` | MHC / Hyper-Connection | 扩展 residual stream，并学习跨 residual-channel 的 mixing / projection | `MHCPreOp`、`MHCPostOp` 这类 expanded-residual mixing kernel |
+| `cross_layer.connection` | MHC / Hyper-Connection | 扩展 residual stream，并学习跨 residual-channel 的 mixing / projection | `MHCPreFwdOp`、`MHCPostFwdOp` 这类 expanded-residual mixing kernel；现有 wrapper 名称可通过 alias 兼容 |
 | `cross_layer.aggregation` | Kimi Attention Residuals / Block AttnRes | 显式读取多个前序 layer/block states，并沿 depth axis 做 attention-style aggregation | `BlockAttnResFwdOp`，以及内部 weighted-sum reference |
 | `cross_layer.scheduling` | Mixture-of-Depths, LayerSkip / self-speculative decoding, early-exit routing | 在模型深度方向决定哪些 token/layer/block 继续计算，或者在较浅层提前退出 | token-depth routing、layer execution mask、gather/scatter/compaction；更多是 runtime scheduling + data movement，第一批不直接做 manifest |
 | `cross_layer.cache_sharing` | CLA, LCKV, YOCO-style KV/state reuse | 跨层共享、选择、复用或重排 KV/cache/state | `LayerKVSelect`、`LayerKVGather`、`CrossLayerCacheRemap`、`SharedKVRead/Write`、可选 `CrossLayerKVMix`；纯指针 alias 仍属于 runtime policy |
@@ -80,7 +80,7 @@ cross_layer operator:
 | --- | --- | --- |
 | Cross-layer scheduling | Mixture-of-Depths, LayerSkip, early-exit routing | 需要先明确 runtime execution mask、token compaction、verification / rollback 和 graph boundary |
 | Cross-layer cache/state sharing | CLA, LCKV, YOCO-style KV reuse | 需要先拆清 cache select/gather/remap/read/write/mix 哪些是真 kernel，哪些只是 runtime alias |
-| Cross-layer attention variants inside attention | Depth-Attention, cross-layer value mixing | 可能更适合作为 attention op 配置或后续 hybrid family |
+| Cross-layer attention variants inside attention | Depth-Attention, cross-layer value mixing | 可能更适合作为 attention op 配置或后续 hybrid family；公开实现和 contract 成熟度需要单独评估 |
 | Simple layer weighted aggregation | ELMo scalar mix, BERT layer pooling, sentence-transformer weighted layer pooling | 常见于表征抽取、下游 pooling 或研究工具；可以作为 reference pattern，但不是第一批 release target |
 
 这类机制会继续作为参考，但不会直接把 `DepthRoutingOp` 或 `CrossLayerKVShareOp` 之类的宽泛抽象塞进第一版计划。后续如果出现明确的 kernel boundary，应该按更具体的名字进入，例如 `LayerKVGather`、`CrossLayerCacheRemap`、`DepthExecutionMaskPack`，而不是按模型结构命名为 `CLAOp`、`LCKVOp` 或 `YOCOOp`。
@@ -93,6 +93,7 @@ cross_layer operator:
 | FusedAddRMSNorm / FusedAddLayerNorm | `normalization` | residual add 是 norm fusion 的一部分，不做跨 layer/block 混合 |
 | 普通 sequence attention | `attention` | attention axis 是 token sequence，不是 layer/block depth |
 | MoE expert combine | `moe` | 聚合轴是 expert/route，不是 layer/block |
+| TopK selector / attention indexing | `attention_indexing` | selection axis 是 attention candidate / index，不是模型 depth；只有 depth execution mask / token-depth routing 才进入 `cross_layer.scheduling` |
 | Engram GateConv | `sequence_modeling` / model-specific fused op | 使用当前 hidden stream 和 n-gram memory，不显式聚合多个 layer/block states |
 
 Engram 的边界尤其重要。Engram 会利用当前 hidden stream 中已经累积的前层信息，也包含 local residual path；但它的主计算是 n-gram memory lookup、gating、causal/depthwise conv 和 local residual add，并没有在算子接口中暴露多个 layer/block states 作为待混合对象。因此它是 cross-layer-adjacent，但不是 `cross_layer` family 的核心成员。
@@ -113,7 +114,18 @@ benchmarks/ops/bench_mhc_pre.py
 benchmarks/ops/bench_mhc_post.py
 ```
 
-但 MHC 当前还没有进入 `tileops/manifest/*.yaml`。第一批工作不是迁移 family 字段，而是从零补齐 manifest 条目，并检查它是否满足 `implemented` 状态。
+MHC 的计划状态需要先和现有 missing-ops / manifest 计划对齐。若 MHC 已经在 upstream 计划或 PR 中进入 `sequence_modeling`，本计划不应再创建重复 manifest 条目；第一步是开 tracking issue 明确最终 taxonomy：
+
+```text
+preferred final taxonomy: cross_layer.connection
+existing/planned taxonomy: sequence_modeling, if already landed through missing-ops work
+allowed resolution:
+  1. migrate or retag MHC into cross_layer.connection, if maintainers agree;
+  2. keep manifest family as sequence_modeling for compatibility, but document cross-layer semantics;
+  3. defer MHC manifest changes and use it only as taxonomy evidence for Block AttnRes.
+```
+
+本文倾向第一种长期归属，因为 MHC 的稳定算子语义是 expanded residual-channel mixing，而不是 sequence-axis modeling。实际 PR scope 以后续 tracking issue 结论为准。
 
 MHCPre 的实际接口是：
 
@@ -150,7 +162,7 @@ forward(x_layer_out, h_post, x_res)
 x_out = h_post[:, :, None] @ x_layer_out[:, None, :] + x_res
 ```
 
-MHC 的公开 Python API 先保持 `MHCPreOp` / `MHCPostOp`。如果未来要改成 `MHCPreFwdOp` / `MHCPostFwdOp`，那会是单独的 API 规范化 PR，需要 alias wrapper 和 deprecation 说明。
+Manifest 命名应优先遵循 TileOps 的 `*FwdOp` 约定，倾向使用 `MHCPreFwdOp` / `MHCPostFwdOp` 作为 manifest-facing 名字。现有 Python wrapper 如果已经公开为 `MHCPreOp` / `MHCPostOp`，则由 Phase 1 tracking issue 决定是否保留 alias；manifest PR 不应在没有兼容策略时顺手破坏已有 API。
 
 ### 4.2 Block AttnRes：第一个新 Op 目标
 
@@ -170,7 +182,7 @@ RMSNorm over H
 ```text
 BlockAttnResFwdOp(
     states:     Tensor[L, M, H],
-    query:      Tensor[H],
+    score_weight: Tensor[H],
     rms_weight: Tensor[H],
     rms_eps:    float,
 ) -> output: Tensor[M, H]
@@ -183,13 +195,20 @@ M = B * S
 L = number of source blocks/states, with the current partial block included by caller
 softmax axis = L
 norm axis = H
-query is a shared projection vector [H], applied after RMSNorm to produce one logit per source state
+score_weight is a shared learned projection vector [H], broadcast over M after RMSNorm to produce one logit per source state
 output uses original states, not normalized states
 logits accumulation = fp32
 weighted accumulation = fp32 or explicitly documented mixed precision
 ```
 
-这里的 `query` 不是 per-token query tensor，而是第一版 kernel boundary 里的共享 projection weight。也就是说，每个 `(batch, token)` 会用同一组 `[H]` projection 计算 depth logits。如果后续 official contract 需要 input-dependent query，可以在 tracking issue 中把 query 生成放到 caller 侧或扩展 op signature；这不会影响第一版 strawman 想表达的核心边界：RMSNorm + projection + depth softmax + weighted sum。
+这里不使用 `query: [H]` 这个名字，是为了避免把共享投影权重误读成 per-sample / per-token query。第一版 strawman 假设每个 `(batch, token)` 使用同一个 `[H]` scoring vector 计算 depth logits。如果 official Kimi contract 需要 batch-varying 或 token-varying query，则 tracking issue 需要在两个方案中选择：
+
+```text
+1. caller 先生成 logits: [L, M]，TileOps op 只做 depth softmax + weighted aggregation；
+2. op signature 扩展为 query: [M, H] 或 query/state-dependent projection。
+```
+
+这两种方案都比含糊的 `query: [H]` 更清楚。当前 strawman 只表达第一版最小 kernel boundary：RMSNorm + shared projection + depth softmax + weighted sum。
 
 第一版倾向使用连续 workspace：
 
@@ -198,6 +217,8 @@ states: contiguous [L, M, H]
 ```
 
 workspace 的生命周期由模型/runtime 管理。operator 不负责 append/update history，也不接收 Python list of tensors。pointer array 和 paged/indexed state store 可以等第一版跑通后再评估。
+
+这里的 `L` 是运行时 source-state 数量，不要求 compile-time constant。第一版 op 只消费 caller 已经准备好的 compact contiguous `[L, M, H]` view，不负责把每一层 / 每个 block 的历史 state append 到 workspace。若 prefill 中 `L` 随 depth 从 1, 2, 3... 增长，朴素 contiguous rebuild 可能产生额外拷贝；这属于 runtime state-store 设计问题，必须在 Phase 2 tracking issue 中作为 known limitation 记录。后续可以评估 ring buffer、paged state store、index array 或 pointer-array kernel boundary，但不在第一版 contract 中提前承诺。
 
 这个 contract 不是 manifest freeze。它是我们拿去开 tracking issue 和同事讨论的起点。最终 contract 由 tracking issue 收敛后，再进入 spec-only manifest PR。
 
@@ -232,22 +253,22 @@ output = sum_l weights[l, m] * states[l, m, :]
 
 ### Phase 1：MHC Manifest Alignment
 
-新增：
+Phase 1 先处理 MHC family reconciliation，再决定是否新增：
 
 ```text
 tileops/manifest/cross_layer.yaml
 ```
 
-第一批只放 MHC：
+如果 tracking issue 决定迁移或新增 `cross_layer` manifest，第一批只放 MHC：
 
 ```text
-MHCPreOp
-MHCPostOp
+MHCPreFwdOp
+MHCPostFwdOp
 ```
 
 这个阶段分两步推进。
 
-Phase 1a 先补完整 manifest spec，并保持 `spec-only`：
+Phase 1a 先补完整 manifest spec，并保持 `spec-only`。如果 MHC 已经以 `sequence_modeling` family 在其他计划中落地，则这个阶段必须明确是 migration、retag，还是只补 semantic note：
 
 ```text
 signature
@@ -256,6 +277,8 @@ workloads
 roofline
 source metadata
 ```
+
+MHCPre 的 `sinkhorn_repeat` 和 `sinkhorn_eps` 不能藏在 prose 里。manifest workload / roofline 需要把 Sinkhorn 迭代次数作为 workload descriptor 或 shape parameter 记录，否则 flop / byte 估算会漂移。`n_expand`、`C`、`sinkhorn_repeat` 应共同决定 MHCPre 的 roofline entry。
 
 Phase 1b 对齐现有 tests / benchmarks / source metadata。MHC 现有测试以 cosine similarity 为主；如果要把 status 提升到 `implemented`，需要先补齐更严格的数值 gate。通过改进后的测试和 CI 后，再单独提交 status promotion。如果发现 kernel 或 wrapper 需要修复，则保持 `spec-only`，由后续 implementation PR 处理。
 
@@ -270,8 +293,10 @@ fusion boundary
 correctness reference
 benchmark workloads
 dtype / accumulation policy
+dtype_combos for states / score_weight / rms_weight / output
 workspace append/update ownership
 contiguous vs non-contiguous state storage
+dynamic L and compact workspace rebuild cost
 causal depth mask representation
 sequence-parallel compatibility
 ```
@@ -345,6 +370,18 @@ states 中存在大幅值差异
 bf16/fp16 input + fp32 reference
 ```
 
+dtype contract 需要在 tracking issue 中收敛成表格，而不是只写一句 mixed precision。至少要明确：
+
+```text
+states dtype
+score_weight dtype
+rms_weight dtype
+logits accumulation dtype
+weighted accumulation dtype
+output dtype
+whether fp8 states are out of scope, reference-only, or a future extension
+```
+
 额外检查：
 
 ```text
@@ -389,7 +426,7 @@ weights + states read -> weighted sum -> output [M,H] write
 
 ```text
 states [L,M,H] tiled read
-query/rms_weight read
+score_weight/rms_weight read
 output [M,H] write
 ```
 
