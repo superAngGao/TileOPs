@@ -53,15 +53,15 @@ cross_layer operator:
 | --- | --- | --- | --- |
 | `cross_layer.connection` | MHC / Hyper-Connection | 扩展 residual stream，并学习跨 residual-channel 的 mixing / projection | `MHCPreFwdOp`、`MHCPostFwdOp` 这类 expanded-residual mixing kernel；现有 wrapper 名称可通过 alias 兼容 |
 | `cross_layer.aggregation` | Kimi Attention Residuals / Block AttnRes | 显式读取多个前序 layer/block states，并沿 depth axis 做 attention-style aggregation | `BlockAttnResFwdOp`，以及内部 weighted-sum reference |
-| `cross_layer.scheduling` | Mixture-of-Depths, LayerSkip / self-speculative decoding, early-exit routing | 在模型深度方向决定哪些 token/layer/block 继续计算，或者在较浅层提前退出 | token-depth routing、layer execution mask、gather/scatter/compaction；更多是 runtime scheduling + data movement，第一批不直接做 manifest |
-| `cross_layer.cache_sharing` | CLA, LCKV, YOCO-style KV/state reuse | 跨层共享、选择、复用或重排 KV/cache/state | `LayerKVSelect`、`LayerKVGather`、`CrossLayerCacheRemap`、`SharedKVRead/Write`、可选 `CrossLayerKVMix`；纯指针 alias 仍属于 runtime policy |
+| `cross_layer.scheduling` | Mixture-of-Depths, LayerSkip / self-speculative decoding, early-exit routing | 在模型深度方向决定哪些 token/layer/block 继续计算，或者在较浅层提前退出 | 机制属于 cross-layer；常见 token compact / unpack kernel 不满足 `cross_layer` op 边界，通常应归入 routing / indexing |
+| `cross_layer.cache_sharing` | CLA, LCKV, YOCO-style KV/state reuse | 跨层共享、选择、复用或重排 KV/cache/state | 机制属于 cross-layer；纯 KV alias / gather / remap 是 cache/layout work。只有明确的跨层数值 mixing / projection 才可能进入 `cross_layer` |
 
 这里的分类回答两个不同问题：
 
 1. 现代模型是否已经使用这种 cross-layer 机制。
 2. TileOps 是否已经能抽象出稳定、可测试、可 benchmark 的算子边界。
 
-例如 Mixture-of-Depths 和 LayerSkip 明确属于 `cross_layer.scheduling`，因为它们的核心就是沿模型深度方向调度 token 或提前退出；但它们第一阶段更像 runtime policy、token compaction、execution mask 和 graph integration，不适合直接写成一个泛化 `DepthRoutingOp`。CLA、LCKV、YOCO-style 机制也属于 cross-layer 版图，但如果实现只是“当前层读另一个层的 KV 指针”，那不是 TileOps kernel；只有发生 layout movement、packing、projection、numerical mixing 或 shared cache read/write 时，才形成明确的算子目标。
+例如 Mixture-of-Depths 和 LayerSkip 明确属于 `cross_layer.scheduling`，因为它们的核心就是沿模型深度方向调度 token 或提前退出；但 `TokenCompact(hidden: [M,H], mask: [M])` 这类 kernel 本身不消费多层 states，只是 routing / indexing primitive。CLA、LCKV、YOCO-style 机制也属于 cross-layer 版图；但如果实现只是“当前层读另一个层的 KV 指针”或“把某几层 KV gather 成连续 buffer”，那是 cache/layout work，不是 `cross_layer` op。
 
 ### 3.2 Core Operator Candidates
 
@@ -74,16 +74,16 @@ cross_layer operator:
 
 ### 3.3 Adjacent / Future Tracks
 
-这些方向属于 `cross_layer` 版图，但第一版不作为 operator manifest 目标：
+这些方向属于 cross-layer 模型机制版图，但第一版不作为 `cross_layer` manifest 目标。原因不是它们不重要，而是当前可拆出的 kernel primitive 要么属于 routing / indexing / cache / layout，要么 contract 尚未稳定。
 
-| 方向 | 代表 | 为什么先不放入 manifest |
+| 方向 | 代表机制 | 当前处理 |
 | --- | --- | --- |
-| Cross-layer scheduling | Mixture-of-Depths, LayerSkip, early-exit routing | 需要先明确 runtime execution mask、token compaction、verification / rollback 和 graph boundary |
-| Cross-layer cache/state sharing | CLA, LCKV, YOCO-style KV reuse | 需要先拆清 cache select/gather/remap/read/write/mix 哪些是真 kernel，哪些只是 runtime alias |
-| Cross-layer attention variants inside attention | Depth-Attention, cross-layer value mixing | 可能更适合作为 attention op 配置或后续 hybrid family；公开实现和 contract 成熟度需要单独评估 |
-| Simple layer weighted aggregation | ELMo scalar mix, BERT layer pooling, sentence-transformer weighted layer pooling | 常见于表征抽取、下游 pooling 或研究工具；可以作为 reference pattern，但不是第一批 release target |
+| Cross-layer scheduling | Mixture-of-Depths, LayerSkip, early-exit routing | 这些机制沿模型 depth 调度 token / layer；但常见 kernel primitive 是 token compact / unpack，签名不暴露多个 layer/block states，因此属于 routing / indexing / runtime track。只有未来出现直接消费 depth-indexed states 并沿 depth axis 做 combine / transform 的 op，才进入 `cross_layer`。 |
+| Cross-layer cache/state sharing | CLA, LCKV, YOCO-style KV/state reuse | 纯 KV alias、gather、remap 是 cache/layout work，不是 `cross_layer` op。只有跨多个 source layers 的数值 mixing / projection 才可能进入，而且需要明确模型 contract。 |
+| Cross-layer attention variants inside attention | Depth-Attention, cross-layer value mixing | 如果主计算仍是 sequence attention，应作为 `attention` family 的 mode 或 workload descriptor，不作为独立 `cross_layer` op。公开实现和 contract 成熟度需要单独评估。 |
+| Simple layer weighted aggregation | ELMo scalar mix, BERT layer pooling, sentence-transformer weighted layer pooling | 可作为 reference、prototype benchmark 或 Block AttnRes 的 internal helper；不作为第一批公开 manifest target。 |
 
-这类机制会继续作为参考，但不会直接把 `DepthRoutingOp` 或 `CrossLayerKVShareOp` 之类的宽泛抽象塞进第一版计划。后续如果出现明确的 kernel boundary，应该按更具体的名字进入，例如 `LayerKVGather`、`CrossLayerCacheRemap`、`DepthExecutionMaskPack`，而不是按模型结构命名为 `CLAOp`、`LCKVOp` 或 `YOCOOp`。
+第二轮不预设新的 `cross_layer` op。后续只有当某个机制形成稳定 tensor signature、独立 correctness reference、独立 benchmark workload，并且算子签名中显式包含多个 layer / block / source states 时，才进入 `cross_layer` tracking issue。
 
 ### 3.4 Out of Scope
 
@@ -336,9 +336,11 @@ shared benchmark helpers
 
 ### Phase 6：Adjacent Architecture Follow-Up
 
-`cross_layer.scheduling` 和 `cross_layer.cache_sharing` 后续分别开独立 tracking issue。前者围绕 Mixture-of-Depths、LayerSkip、early-exit routing 这类 depth execution policy，先明确 execution mask、token compaction、verification / rollback 和 graph boundary；后者围绕 CLA、LCKV、YOCO-style KV/state reuse，先明确 cache select、gather、remap、shared read/write 和 optional numerical mix 哪些是真正的 kernel boundary。
+`cross_layer.scheduling` 和 `cross_layer.cache_sharing` 后续可以分别开 architecture tracking issue，但这些 issue 的目标不是立即产出 `cross_layer` manifest 条目，而是先确认是否存在满足 admission rule 的 operator。
 
-这两个方向都属于 `cross_layer` 大类，但不在第一批 manifest PR 中提前创造宽泛 op。后续进入 manifest 时，应使用具体算子名，例如 `DepthExecutionMaskPack`、`LayerKVGather` 或 `CrossLayerCacheRemap`，而不是按模型结构命名。
+对 scheduling 来说，MoD / LayerSkip 这类机制常见的 token compact、unpack、mask-to-indices 更适合 routing / indexing / runtime track。它们只有在 op 签名直接包含 depth-indexed states，并沿 depth axis 做 combine / transform 时，才回到 `cross_layer`。
+
+对 cache/state sharing 来说，CLA / LCKV / YOCO-style 机制常见的 KV alias、gather、remap 更适合 cache / layout track。它们只有在 op 对多个 source-layer states 做数值 mixing / projection，并且模型 contract 足够明确时，才回到 `cross_layer`。
 
 ## 6. 测试与 Benchmark
 
