@@ -1,0 +1,1 @@
+{"attempt_id":"env-001","counted_round":false,"reason":"Direct environment Python selected system CUDA 11.5 nvcc and CUDA runtime ordinal 2 mapped to A100 without CUDA_DEVICE_ORDER=PCI_BUS_ID","resolution":"Use conda run plus CUDA_DEVICE_ORDER=PCI_BUS_ID and CUDA_VISIBLE_DEVICES=2 for every command"}

@@ -1,0 +1,167 @@
+{
+  "gpu": "NVIDIA H200 NVL",
+  "benchmark_protocol": "TileOps cold-cache bench_kernel, confirmation 10/50/3",
+  "early_stop_metric": "dram__throughput.avg.pct_of_peak_sustained_elapsed >= 80",
+  "campaigns": [
+    {
+      "shape": [1, 8192, 16384],
+      "valid_rounds": 75,
+      "stopped_early": false,
+      "tileops_baseline_ms": 0.041613,
+      "marlin_fp32_ms": 0.037883,
+      "marlin_fp16_ms": 0.037956,
+      "winner": {
+        "candidate_id": "s1-r074-k512-cache-act-fp32-s3-n112",
+        "latency_ms": 0.0339168,
+        "dram_pct_peak": 35.76,
+        "config_hash": "1ea562fd212aaafd844810813f9ef3a00622362d2c862f4dbc27ede0e3ed92a9",
+        "source_hash": "63581a32719c142d9510dfdfd285ce0b25882adab84dd0f6740498eafb71cfa4",
+        "config": {
+          "block_k": 512,
+          "num_stages": 3,
+          "outputs_per_warp": 8,
+          "split_k_warps": 2,
+          "consumer_warpgroups": 4,
+          "consumer_max_nreg": 112,
+          "tma_activation": false,
+          "tma_weight": true,
+          "group_post_scale": true,
+          "cache_activation_fp32": true
+        }
+      }
+    },
+    {
+      "shape": [1, 8192, 8192],
+      "valid_rounds": 75,
+      "stopped_early": false,
+      "tileops_baseline_ms": 0.0238433,
+      "marlin_fp32_ms": 0.021715,
+      "marlin_fp16_ms": 0.021759,
+      "winner": {
+        "candidate_id": "s2-r044-k512-4wg-split2-o8-s4-n104-copya",
+        "latency_ms": 0.02000382,
+        "dram_pct_peak": 31.32,
+        "config_hash": "16aaeeaca6afd7c236a207e06e4fba9f907e6ea74eab38abfa8f459304edb829",
+        "source_hash": "131bb4ab239a24546dc7c05ca73a7befab9c6b0e6e5d145985625894e9b8e1bc",
+        "config": {
+          "block_k": 512,
+          "num_stages": 4,
+          "outputs_per_warp": 8,
+          "split_k_warps": 2,
+          "consumer_warpgroups": 4,
+          "consumer_max_nreg": 104,
+          "tma_activation": false,
+          "tma_weight": true,
+          "group_post_scale": true,
+          "cache_activation_fp32": false
+        }
+      }
+    },
+    {
+      "shape": [1, 7168, 20480],
+      "valid_rounds": 75,
+      "stopped_early": false,
+      "tileops_baseline_ms": 0.05015874,
+      "marlin_fp32_ms": 0.040786,
+      "marlin_fp16_ms": 0.040785,
+      "winner": {
+        "candidate_id": "s3-r041-k512-4wg-split2-o8-s3-n104-copya",
+        "latency_ms": 0.0388556,
+        "dram_pct_peak": 33.54,
+        "config_hash": "ba7112937428ca2bf3bb5dcf81fe21c06b83ed8555e1b7657718d63fb8c54f65",
+        "source_hash": "cd82a2d22d68d373cb6050cc4f4eee71f37049f70b07316967f18ca249ba4e48",
+        "config": {
+          "block_k": 512,
+          "num_stages": 3,
+          "outputs_per_warp": 8,
+          "split_k_warps": 2,
+          "consumer_warpgroups": 4,
+          "consumer_max_nreg": 104,
+          "tma_activation": false,
+          "tma_weight": true,
+          "group_post_scale": true,
+          "cache_activation_fp32": false
+        }
+      }
+    },
+    {
+      "shape": [1, 8192, 81920],
+      "valid_rounds": 75,
+      "stopped_early": false,
+      "tileops_baseline_ms": 0.17948054,
+      "marlin_fp32_ms": 0.135729,
+      "marlin_fp16_ms": 0.135641,
+      "winner": {
+        "candidate_id": "s4-r042-k512-4wg-split2-o8-s3-n112-copya",
+        "latency_ms": 0.13901478,
+        "dram_pct_peak": 41.33,
+        "config_hash": "b9ff112d7cabda5b4eb6437280a98554936c56a7167f75b1d21690b519e6d908",
+        "source_hash": "4578e689d6e8630a2b148d1f95c254a84cf894aae2fb98bfb208f8d08bc7b185",
+        "config": {
+          "block_k": 512,
+          "num_stages": 3,
+          "outputs_per_warp": 8,
+          "split_k_warps": 2,
+          "consumer_warpgroups": 4,
+          "consumer_max_nreg": 112,
+          "tma_activation": false,
+          "tma_weight": true,
+          "group_post_scale": true,
+          "cache_activation_fp32": false
+        }
+      }
+    }
+  ],
+  "shape4_structural_campaign": {
+    "shape": [1, 8192, 81920],
+    "requested_rounds": 300,
+    "valid_structural_rounds": 300,
+    "unique_structural_signatures": 300,
+    "unique_generated_source_hashes": 300,
+    "all_rounds_correct": true,
+    "stopped_early": false,
+    "early_stop_threshold_dram_pct_peak": 80.0,
+    "frozen_parameters": {
+      "block_n": 64,
+      "block_k": 512,
+      "num_stages": 3,
+      "outputs_per_warp": 8,
+      "split_k_warps": 2,
+      "consumer_warpgroups": 4,
+      "consumer_max_nreg": 112,
+      "tma_activation": false,
+      "tma_weight": true,
+      "group_post_scale": true
+    },
+    "winner": {
+      "candidate_id": "confirm-schedule-175",
+      "scalar_schedule_id": 175,
+      "confirmation_latency_ms": 0.1361794,
+      "correct": true,
+      "max_abs_error": 0.125,
+      "mean_abs_error": 0.011833456344902515,
+      "config_hash": "c8c2400620cfb1a9133a34a55402a5d600d0b1618caabe7ae080656ed2fb03d8",
+      "source_hash": "512dfe07933272829b9b1251ca4d5ff55e3e9ba8d92070691da42ddece30ab95",
+      "logical_effective_gbps": 2810.60589193373,
+      "logical_pct_h200_nominal": 58.554289415286
+    },
+    "ncu": {
+      "dram_pct_peak": 43.36,
+      "sm_pct_peak": 78.06,
+      "issue_active_pct": 83.08,
+      "registers_per_thread": 96,
+      "occupancy_limit_registers_blocks": 1,
+      "occupancy_limit_shared_memory_blocks": 1
+    },
+    "comparisons": {
+      "tileops_scalar_baseline_ms": 0.17948054,
+      "speedup_over_scalar_baseline": 1.31797129374927,
+      "latency_reduction_vs_scalar_baseline_percent": 24.1258133054425,
+      "prior_75_point_best_ms": 0.13901478,
+      "speedup_over_prior_75_point_best": 1.02082091711375,
+      "latency_reduction_vs_prior_75_point_best_percent": 2.03962485140069,
+      "marlin_fp16_ms": 0.135641,
+      "latency_slower_than_marlin_percent": 0.396930131744822
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "round_number": 0,
+  "round_id": "shape4-baseline-scalar-tma-ring",
+  "counted_round": false,
+  "latency_ms": 0.13901478,
+  "candidate_id": "s4-r042-k512-4wg-split2-o8-s3-n112-copya",
+  "structure_signature": "30c5ce9a222e75c1b96d44452d807eae7768e60870f35dd7d3a659f6f0efd6b5",
+  "structure": {
+    "load_pipeline": "one-producer-wg-staged-ring",
+    "buffer_handoff": "ready-after-all-copies_empty-after-register-capture",
+    "activation_path": "cooperative-global-to-shared_then-vector-register-cache",
+    "weight_path": "tma-packed-w4-to-shared_then-output-major-register-cache",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-register",
+    "decode_schedule": "output-serial_lop3-full-thread-fragment",
+    "compute_instruction": "scalar-fp32-fma",
+    "accumulator_path": "eight-output-register-array-per-warp",
+    "reduction_path": "warp-shuffle-then-shared-split-k-reduction",
+    "output_schedule": "one-cta-n64_split-k2",
+    "weight_layout": "tilelang-lop3-interleaved-row-major"
+  }
+}

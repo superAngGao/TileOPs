@@ -1,0 +1,56 @@
+version: 1
+gpu:
+  model: NVIDIA H200 NVL
+  cuda_device_order: PCI_BUS_ID
+  visible_device: 2
+benchmark:
+  cache: cold
+  screening:
+    n_warmup: 3
+    n_repeat: 10
+    n_trials: 1
+early_stop:
+  metric: dram__throughput.avg.pct_of_peak_sustained_elapsed
+  threshold_percent: 80.0
+campaign:
+  name: shape4-transposed-mma-ako
+  shape: [1, 8192, 81920]
+  structural_round_budget: 100
+  round_definition:
+    counted_when:
+      - compile-time MMA fragment/dataflow schedule has a unique structural signature
+      - generated CUDA source hash is unique
+      - candidate compiles and passes affine W4A16 correctness
+      - candidate completes the TileOps cold-cache screening benchmark
+    not_counted:
+      - changing block sizes, stages, warp counts, register limits, or split-K alone
+      - compile, correctness, launch, timeout, or benchmark failures
+      - duplicate structure or generated source
+  records:
+    rounds: shape4_tensorcore_rounds.jsonl
+    trials: shape4_tensorcore_trials.jsonl
+    attempts: shape4_tensorcore_attempts.jsonl
+  frozen_inner_parameters:
+    block_n: 64
+    block_k: 256
+    num_stages: 3
+    outputs_per_warp: 16
+    split_k_warps: 4
+    consumer_warpgroups: 4
+    global_split_k: 1
+    consumer_max_nreg: 96
+    tma_activation: false
+    tma_weight: true
+    group_post_scale: true
+  frozen_baselines:
+    scalar_schedule_175_ms: 0.1361794
+    marlin_fp16_ms: 0.135641
+semantics:
+  activation_dtype: float16
+  output_dtype: float16
+  weight_storage: uint4
+  quantization: affine
+  group_size: 128
+  accumulator_dtype: float32
+  atol: 0.05
+  rtol: 0.03

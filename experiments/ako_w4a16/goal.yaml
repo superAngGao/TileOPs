@@ -1,0 +1,52 @@
+version: 2
+gpu:
+  model: NVIDIA H200 NVL
+  cuda_device_order: PCI_BUS_ID
+  visible_device: 2
+benchmark:
+  cache: cold
+  screening:
+    n_warmup: 3
+    n_repeat: 10
+    n_trials: 1
+  confirmation:
+    n_warmup: 10
+    n_repeat: 50
+    n_trials: 3
+early_stop:
+  metric: dram__throughput.avg.pct_of_peak_sustained_elapsed
+  threshold_percent: 80.0
+campaign:
+  name: shape4-structural-ako
+  shape: [1, 8192, 81920]
+  structural_round_budget: 300
+  round_definition:
+    counted_when:
+      - kernel pipeline or dataflow structure has a unique structural signature
+      - at least one parameter trial compiles and passes correctness
+      - the winning parameter trial completes the cold-cache TileOps benchmark
+    not_counted:
+      - changing block sizes, stages, warp counts, register limits, or split-K alone
+      - a compile failure, correctness failure, timeout, or benchmark failure
+      - a source change that does not change the declared pipeline/dataflow signature
+    inner_search:
+      unit: parameter_trial
+      minimum_trials: 1
+      recommended_trials: 6
+      selection_metric: latency_ms
+  records:
+    rounds: shape4_structural_rounds.jsonl
+    trials: shape4_structural_trials.jsonl
+    attempts: shape4_structural_attempts.jsonl
+  frozen_baselines:
+    tileops_scalar_ms: 0.17948054
+    prior_75_point_best_ms: 0.13901478
+    marlin_fp16_ms: 0.135641
+semantics:
+  activation_dtype: float16
+  output_dtype: float16
+  weight_storage: uint4
+  quantization: affine
+  group_size: 128
+  atol: 0.05
+  rtol: 0.03

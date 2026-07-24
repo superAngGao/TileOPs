@@ -1,0 +1,30 @@
+{
+  "round_id": "shape4-sr009-mma-n128-activation-reuse",
+  "parent_id": "shape4-sr001-fragment-mma-sync",
+  "hypothesis": "The current N16-per-warp mapping prepares each activation fragment repeatedly and uses too many consumer warps. Marlin's N128 CTA reuses one A fragment across several B fragments and obtains latency hiding from independent N accumulators.",
+  "transform": "Expand the CTA from N64 to N128 and change each warp from two n8 output fragments to four or eight. Hoist A-fragment preparation outside the N loop and issue multiple independently accumulated B-fragment MMAs per K16.",
+  "structure": {
+    "load_pipeline": "one-producer-wg-staged-ring",
+    "buffer_handoff": "ready-after-all-copies_empty-after-n-reuse-fragment-mma",
+    "activation_path": "cooperative-global-to-shared_then-one-a-fragment-reused-across-four-or-eight-b-fragments",
+    "weight_path": "tma-packed-w4-n128-fragment-layout-to-shared_then-n-loop-register-pairs",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-hoisted-n-fragment-half2-registers",
+    "decode_schedule": "per-k16-a-load_then-n-fragment-dequant-scale-mma-loop",
+    "compute_instruction": "mma.sync.m16n8k16-n32-or-n64-per-warp",
+    "accumulator_path": "four-or-eight-independent-n8-persistent-fragments-per-warp",
+    "reduction_path": "shared-split-k-fragment-owner-reduction",
+    "output_schedule": "one-cta-n128_with-n32-or-n64-per-warp",
+    "weight_layout": "offline-mma-sync-b-fragment-major-n128"
+  },
+  "runner_flags": ["--family", "mma-sync", "--no-tma-activation", "--mma-n-reuse"],
+  "parameter_trials": [
+    {"block_n": 128, "block_k": 256, "num_stages": 2, "outputs_per_warp": 32, "split_k_warps": 1, "consumer_warpgroups": 1, "consumer_max_nreg": 160},
+    {"block_n": 128, "block_k": 256, "num_stages": 3, "outputs_per_warp": 32, "split_k_warps": 1, "consumer_warpgroups": 1, "consumer_max_nreg": 160},
+    {"block_n": 128, "block_k": 256, "num_stages": 2, "outputs_per_warp": 64, "split_k_warps": 2, "consumer_warpgroups": 1, "consumer_max_nreg": 192},
+    {"block_n": 128, "block_k": 256, "num_stages": 3, "outputs_per_warp": 64, "split_k_warps": 2, "consumer_warpgroups": 1, "consumer_max_nreg": 192},
+    {"block_n": 128, "block_k": 256, "num_stages": 2, "outputs_per_warp": 32, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 160},
+    {"block_n": 128, "block_k": 256, "num_stages": 3, "outputs_per_warp": 32, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 160},
+    {"block_n": 128, "block_k": 256, "num_stages": 2, "outputs_per_warp": 64, "split_k_warps": 4, "consumer_warpgroups": 2, "consumer_max_nreg": 192},
+    {"block_n": 128, "block_k": 256, "num_stages": 3, "outputs_per_warp": 64, "split_k_warps": 4, "consumer_warpgroups": 2, "consumer_max_nreg": 192}
+  ]
+}

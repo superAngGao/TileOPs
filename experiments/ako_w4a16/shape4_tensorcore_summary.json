@@ -1,0 +1,60 @@
+{
+  "gpu": "NVIDIA H200 NVL",
+  "shape": [1, 8192, 81920],
+  "campaign": {
+    "requested_structural_rounds": 100,
+    "valid_structural_rounds": 100,
+    "unique_structural_signatures": 100,
+    "unique_generated_source_hashes": 100,
+    "all_counted_rounds_correct": true,
+    "failed_counted_rounds": 0,
+    "stopped_early": false,
+    "early_stop_threshold_dram_pct_peak": 80.0
+  },
+  "kernel_structure": {
+    "weight_layout": "offline row-major mma.m16n8k16 A-fragment layout",
+    "weight_pipeline": "TMA packed W4 to shared, LOP3 direct to registers",
+    "mma_mapping": "W[N16,K16] as A times padded activation[K16,8] as B",
+    "compute": "mma.sync.m16n8k16.f32.f16.f16",
+    "group_arithmetic": "affine UINT4, group size 128, FP32 temporary and final accumulators",
+    "cta_mapping": "N64, four N16 output warps, CTA-local split-K4",
+    "shared_pipeline": "one producer warpgroup, four consumer warpgroups, three stages"
+  },
+  "winner": {
+    "candidate_id": "tc-confirm-92",
+    "schedule_id": 92,
+    "confirmation_latency_ms": 0.16867074,
+    "correct": true,
+    "max_abs_error": 0.125,
+    "mean_abs_error": 0.011837555095553398,
+    "config_hash": "093bd3c8d0b8a3f370d02d79f7724d09169b78c2ee3d1bc02b594356dd386a6f",
+    "source_hash": "91a5f8fa4c4e9286afcaddae1636ab5e3407c03b12a3898d0a115a49f1f31d6b",
+    "fragment_schedule": "half-xor K16 traversal, predecode 8 fragments",
+    "group_schedule": "forward K128 groups",
+    "scale_handoff": "buffer two group accumulators, then apply scale",
+    "logical_effective_gbps": 2269.19395741075,
+    "logical_pct_h200_nominal": 47.274874112724
+  },
+  "ncu": {
+    "dram_pct_peak": 35.23,
+    "sm_pct_peak": 77.45,
+    "issue_active_pct": 81.86,
+    "tensor_pipe_active_pct": 11.84,
+    "registers_per_thread": 96,
+    "occupancy_limit_registers_blocks": 1,
+    "occupancy_limit_shared_memory_blocks": 1
+  },
+  "comparisons": {
+    "first_fragment_mma_ms": 0.2063778,
+    "speedup_over_first_fragment_mma": 1.22355424538957,
+    "latency_reduction_vs_first_fragment_mma_percent": 18.2708896014978,
+    "prior_group_post_scale_mma_ms": 0.1971783,
+    "speedup_over_prior_group_post_scale_mma": 1.1690130724511,
+    "latency_reduction_vs_prior_group_post_scale_mma_percent": 14.4577572684215,
+    "scalar_schedule_175_ms": 0.1361794,
+    "latency_slower_than_scalar_percent": 23.8592180608814,
+    "marlin_fp16_ms": 0.135641,
+    "latency_slower_than_marlin_percent": 24.3508526183086
+  },
+  "bottleneck": "Consumer-side LOP3, FP16x2 zero removal, fragment preparation, and group-scale handoff are issue-bound. Tensor pipe and DRAM are both underutilized."
+}

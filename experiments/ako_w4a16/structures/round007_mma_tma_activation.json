@@ -1,0 +1,28 @@
+{
+  "round_id": "shape4-sr007-mma-tma-activation",
+  "parent_id": "shape4-sr002-mma-group-post-scale",
+  "hypothesis": "The round-2 producer performs a synchronous cooperative activation copy before weight consumption. Adding activation to the TMA transaction set may overlap that copy with the packed-weight and metadata transfers.",
+  "transform": "Replace producer-thread activation loads/stores with per-split TMA copies into the shared activation ring; consumers retain the same immediate fragment decode/MMA group-post-scale schedule.",
+  "structure": {
+    "load_pipeline": "one-producer-wg-multi-tma-staged-ring",
+    "buffer_handoff": "ready-after-activation-weight-metadata-tma-and-zero-copy_empty-after-fragment-mma",
+    "activation_path": "tma-global-to-shared_then-mma-a-fragment",
+    "weight_path": "tma-packed-w4-fragment-layout-to-shared_then-register-pairs",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-half2-zero-and-fp32-scale-register",
+    "decode_schedule": "lop3-and-zero-direct-to-b-fragment_interleaved-with-mma_then-group-scale",
+    "compute_instruction": "mma.sync.m16n8k16-group-fp32-post-scale",
+    "accumulator_path": "temporary-k128-fragments_scaled-into-persistent-fragments",
+    "reduction_path": "shared-split-k-fragment-owner-reduction",
+    "output_schedule": "one-cta-n64_split-k-per-consumer-warp",
+    "weight_layout": "offline-mma-sync-b-fragment-major"
+  },
+  "runner_flags": ["--family", "mma-sync", "--group-post-scale"],
+  "parameter_trials": [
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112}
+  ]
+}

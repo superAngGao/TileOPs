@@ -1,0 +1,29 @@
+{
+  "round_id": "shape4-sr012-scalar-half2-accum8",
+  "parent_id": "shape4-sr011-scalar-half2-accum4",
+  "hypothesis": "A full eight-pair half2 dot minimizes issue pressure to one pair of FP16 partials per lane; this establishes the performance ceiling and the exact accuracy cost of the most aggressive short-group accumulation.",
+  "transform": "Accumulate all eight half2 pairs for the lane's sixteen K values into one half2 register, then convert its two lanes once before FP32 affine group accumulation.",
+  "structure": {
+    "load_pipeline": "one-producer-wg-staged-ring",
+    "buffer_handoff": "ready-after-all-copies_empty-after-register-capture",
+    "activation_path": "cooperative-global-to-shared_then-vector-register-cache",
+    "weight_path": "tma-packed-w4-to-shared_then-output-major-register-cache",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-register",
+    "decode_schedule": "output-serial-lop3_then-one-eight-pair-half2-dot-segment",
+    "compute_instruction": "hfma2-full-lane-segment_then-fp32-affine-group-accumulate",
+    "accumulator_path": "fp16-eight-pair-segment_into-eight-fp32-output-accumulators",
+    "reduction_path": "warp-shuffle-then-shared-split-k-reduction",
+    "output_schedule": "one-cta-n64_split-k2",
+    "weight_layout": "tilelang-lop3-interleaved-row-major"
+  },
+  "runner_flags": ["--family", "tma", "--group-post-scale", "--no-tma-activation", "--half2-accum-pairs", "8"],
+  "parameter_grid": {
+    "block_n": [64],
+    "block_k": [512],
+    "num_stages": [2, 3, 4],
+    "outputs_per_warp": [8],
+    "split_k_warps": [2],
+    "consumer_warpgroups": [4],
+    "consumer_max_nreg": [104, 112]
+  }
+}

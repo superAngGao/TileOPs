@@ -1,0 +1,29 @@
+{
+  "round_id": "shape4-sr010-scalar-half2-product-fp32-sum",
+  "parent_id": "shape4-baseline-scalar-tma-ring",
+  "hypothesis": "The scalar incumbent is issue-bound on sixteen FP32 multiply-add chains per output and lane. Vectorizing each pair of products as one half2 instruction while retaining FP32 summation may reduce multiply issue pressure without cross-term FP16 accumulation error.",
+  "transform": "Replace pairs of FP32 multiplies with one half2 multiply-equivalent hfma2 from zero, immediately convert both lanes to FP32, and retain the original FP32 affine correction, scale, and persistent accumulation.",
+  "structure": {
+    "load_pipeline": "one-producer-wg-staged-ring",
+    "buffer_handoff": "ready-after-all-copies_empty-after-register-capture",
+    "activation_path": "cooperative-global-to-shared_then-vector-register-cache",
+    "weight_path": "tma-packed-w4-to-shared_then-output-major-register-cache",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-register",
+    "decode_schedule": "output-serial-lop3_then-eight-independent-half2-products",
+    "compute_instruction": "half2-product_then-per-lane-fp32-sum-and-affine-group-accumulate",
+    "accumulator_path": "no-cross-term-fp16-accumulation_into-eight-fp32-output-accumulators",
+    "reduction_path": "warp-shuffle-then-shared-split-k-reduction",
+    "output_schedule": "one-cta-n64_split-k2",
+    "weight_layout": "tilelang-lop3-interleaved-row-major"
+  },
+  "runner_flags": ["--family", "tma", "--group-post-scale", "--no-tma-activation", "--half2-accum-pairs", "1"],
+  "parameter_grid": {
+    "block_n": [64],
+    "block_k": [512],
+    "num_stages": [2, 3, 4],
+    "outputs_per_warp": [8],
+    "split_k_warps": [2],
+    "consumer_warpgroups": [4],
+    "consumer_max_nreg": [104, 112]
+  }
+}

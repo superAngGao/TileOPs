@@ -1,0 +1,38 @@
+{
+  "round_id": "shape4-sr001-fragment-mma-sync",
+  "parent_id": "shape4-baseline-scalar-tma-ring",
+  "hypothesis": "Moving W4 decode directly into tensor-core B fragments and issuing mma.sync will replace the long FP32 scalar-FMA dependency chains with tensor instructions; the internal search determines whether two or four consumer warpgroups hide decode latency better.",
+  "transform": "Replace output-major scalar decode/FMA with an offline fragment-major W4 layout, per-lane LOP3 plus half2 affine dequantization, and interleaved mma.sync.m16n8k16 instructions.",
+  "structure": {
+    "load_pipeline": "one-producer-wg-staged-ring",
+    "buffer_handoff": "ready-after-all-copies_empty-after-fragment-mma",
+    "activation_path": "cooperative-global-to-shared_then-mma-a-fragment",
+    "weight_path": "tma-packed-w4-fragment-layout-to-shared_then-register-pairs",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-half2-register",
+    "decode_schedule": "lop3-direct-to-b-fragment_interleaved-with-mma",
+    "compute_instruction": "mma.sync.m16n8k16.f32.f16.f16",
+    "accumulator_path": "two-n8-tensorcore-fragments-per-warp",
+    "reduction_path": "shared-split-k-fragment-owner-reduction",
+    "output_schedule": "one-cta-n64_split-k-per-consumer-warp",
+    "weight_layout": "offline-mma-sync-b-fragment-major"
+  },
+  "runner_flags": [
+    "--family",
+    "mma-sync",
+    "--no-tma-activation"
+  ],
+  "parameter_trials": [
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 4, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 4, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 4, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 4, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112}
+  ]
+}

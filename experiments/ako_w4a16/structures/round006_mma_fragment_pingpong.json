@@ -1,0 +1,28 @@
+{
+  "round_id": "shape4-sr006-mma-fragment-pingpong",
+  "parent_id": "shape4-sr005-mma-fragment-group-buffer",
+  "hypothesis": "Decode-first batches lengthen fragment live ranges without sustained overlap. A two-slot prologue/steady-state/epilogue schedule should interleave preparation of sub k+1 with MMA consumption of sub k.",
+  "transform": "Introduce a consumer fragment ping-pong pipeline: prefill slot 0, repeatedly prepare the next K16 fragment into the alternate slot before consuming the current slot, swap ownership, and drain the final slot.",
+  "structure": {
+    "load_pipeline": "one-producer-wg-staged-ring",
+    "buffer_handoff": "ready-after-all-copies_empty-after-fragment-mma",
+    "activation_path": "cooperative-global-to-shared_then-two-slot-steady-state-a-fragment-pingpong",
+    "weight_path": "tma-packed-w4-fragment-layout-to-shared_then-two-slot-steady-state-b-fragment-pingpong",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-half2-zero-and-fp32-scale-register",
+    "decode_schedule": "prologue_prepare_then-alternating-next-decode-current-mma_then-epilogue",
+    "compute_instruction": "software-pipelined-mma.sync.m16n8k16-group-fp32-post-scale",
+    "accumulator_path": "temporary-k128-fragments_scaled-into-persistent-fragments",
+    "reduction_path": "shared-split-k-fragment-owner-reduction",
+    "output_schedule": "one-cta-n64_split-k-per-consumer-warp",
+    "weight_layout": "offline-mma-sync-b-fragment-major"
+  },
+  "runner_flags": ["--family", "mma-sync", "--no-tma-activation", "--group-post-scale", "--mma-pingpong"],
+  "parameter_trials": [
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112}
+  ]
+}

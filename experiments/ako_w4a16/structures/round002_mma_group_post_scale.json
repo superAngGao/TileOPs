@@ -1,0 +1,36 @@
+{
+  "round_id": "shape4-sr002-mma-group-post-scale",
+  "parent_id": "shape4-sr001-fragment-mma-sync",
+  "hypothesis": "The fragment pipeline is dominated by half2 scale multiplication before every K16 MMA. Accumulating one K128 quant group in FP32 and applying each output scale once should shorten the hot decode chain.",
+  "transform": "Move scale application out of the per-K16 B-fragment decode loop: decode q-zero, issue eight mma.sync operations into temporary group accumulators, then use FP32 FMA to scale and merge the group into persistent accumulators.",
+  "structure": {
+    "load_pipeline": "one-producer-wg-staged-ring",
+    "buffer_handoff": "ready-after-all-copies_empty-after-fragment-mma",
+    "activation_path": "cooperative-global-to-shared_then-mma-a-fragment",
+    "weight_path": "tma-packed-w4-fragment-layout-to-shared_then-register-pairs",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-half2-zero-and-fp32-scale-register",
+    "decode_schedule": "lop3-and-zero-direct-to-b-fragment_interleaved-with-mma_then-group-scale",
+    "compute_instruction": "mma.sync.m16n8k16-group-fp32-post-scale",
+    "accumulator_path": "temporary-k128-fragments_scaled-into-persistent-fragments",
+    "reduction_path": "shared-split-k-fragment-owner-reduction",
+    "output_schedule": "one-cta-n64_split-k-per-consumer-warp",
+    "weight_layout": "offline-mma-sync-b-fragment-major"
+  },
+  "runner_flags": [
+    "--family",
+    "mma-sync",
+    "--no-tma-activation",
+    "--group-post-scale"
+  ],
+  "parameter_trials": [
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 4, "outputs_per_warp": 16, "split_k_warps": 2, "consumer_warpgroups": 2, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 4, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 104},
+    {"block_n": 64, "block_k": 256, "num_stages": 2, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 3, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112},
+    {"block_n": 64, "block_k": 256, "num_stages": 4, "outputs_per_warp": 16, "split_k_warps": 4, "consumer_warpgroups": 4, "consumer_max_nreg": 112}
+  ]
+}

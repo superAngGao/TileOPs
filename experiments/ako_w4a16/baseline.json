@@ -1,0 +1,14 @@
+{
+  "shape": [1, 8192, 16384],
+  "tileops": {
+    "direct_split8_n1_o4_ms": 0.042654,
+    "double_buffer_5wg_split4_o16_ms": 0.041613
+  },
+  "frozen_incumbent_ms": 0.041613,
+  "marlin": {
+    "fp32_reduce_ms": 0.037883,
+    "fp16_reduce_ms": 0.037956
+  },
+  "benchmark_protocol": "cold-cache 10/50/3",
+  "gpu": "NVIDIA H200 NVL"
+}

@@ -1,0 +1,29 @@
+{
+  "round_id": "shape4-sr011-scalar-half2-accum4",
+  "parent_id": "shape4-sr010-scalar-half2-accum2",
+  "hypothesis": "Four-pair half2 segments halve the horizontal conversion and FP32-add count again; a four-term FP16 partial may remain inside the W4A16 correctness tolerance.",
+  "transform": "Increase the raw-q dot segment from two to four half2 pairs, yielding two hfma2 segments and four FP16-to-FP32 lane conversions per output and lane.",
+  "structure": {
+    "load_pipeline": "one-producer-wg-staged-ring",
+    "buffer_handoff": "ready-after-all-copies_empty-after-register-capture",
+    "activation_path": "cooperative-global-to-shared_then-vector-register-cache",
+    "weight_path": "tma-packed-w4-to-shared_then-output-major-register-cache",
+    "metadata_path": "tma-scale-plus-cooperative-zero_to-shared_then-register",
+    "decode_schedule": "output-serial-lop3_then-two-four-pair-half2-dot-segments",
+    "compute_instruction": "hfma2-medium-segments_then-fp32-affine-group-accumulate",
+    "accumulator_path": "fp16-four-pair-segments_into-eight-fp32-output-accumulators",
+    "reduction_path": "warp-shuffle-then-shared-split-k-reduction",
+    "output_schedule": "one-cta-n64_split-k2",
+    "weight_layout": "tilelang-lop3-interleaved-row-major"
+  },
+  "runner_flags": ["--family", "tma", "--group-post-scale", "--no-tma-activation", "--half2-accum-pairs", "4"],
+  "parameter_grid": {
+    "block_n": [64],
+    "block_k": [512],
+    "num_stages": [2, 3, 4],
+    "outputs_per_warp": [8],
+    "split_k_warps": [2],
+    "consumer_warpgroups": [4],
+    "consumer_max_nreg": [104, 112]
+  }
+}
