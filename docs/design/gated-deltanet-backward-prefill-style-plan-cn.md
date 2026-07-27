@@ -53,9 +53,9 @@ differentiable reference 的结果为：
 
 | sequence | TileOps complete bwd | FLA 0.5.1 bwd | TileOps speedup |
 | ---: | ---: | ---: | ---: |
-| 4K | `0.580968 ms` | `0.830285 ms` | `1.43x` |
-| 8K | `1.078452 ms` | `1.100744 ms` | `1.02x` |
-| 16K | `2.048846 ms` | `2.137829 ms` | `1.04x` |
+| 4K | `0.573292 ms` | `0.830285 ms` | `1.45x` |
+| 8K | `1.063436 ms` | `1.100744 ms` | `1.04x` |
+| 16K | `2.022947 ms` | `2.137829 ms` | `1.06x` |
 
 合同为 `B=1,H=16,DK=DV=128,chunk=64,fp16,BHSD`，
 `warmup=5,repeat=20,trials=3`。旧的 `0.620904/1.148775/2.112842 ms`
