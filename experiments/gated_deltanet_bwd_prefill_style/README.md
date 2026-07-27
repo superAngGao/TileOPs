@@ -32,6 +32,36 @@ The `layout=bthd` mode generates BTHD inputs and times the explicit wrapper
 conversion into the current BHSD-only backward path. It is a baseline for
 layout overhead, not a BTHD-native optimized kernel.
 
+## Complete-gradient baseline
+
+The current path includes the future-carry correction to `dw` and the complete
+backward of the chunk-local inverse:
+
+```text
+dw_corr = -(du_corr @ S_start^T) * exp(g_i + g_last)
+dL      = -A^T @ dA @ A^T
+dL -> dk_A, dbeta_A, dg_A
+```
+
+Run the per-gradient diagnostic with:
+
+```bash
+python experiments/gated_deltanet_bwd_prefill_style/check_backward_accuracy.py \
+  --seq-len 128 --heads 2 --dim 128 --chunk-size 64 --seed 42
+```
+
+The archived accuracy and timing rows are:
+
+```text
+results/complete_bwd_accuracy_d128_20260727.jsonl
+results/complete_bwd_vs_fla051_d128_20260727.jsonl
+```
+
+The older config-search and FLA comparison files below predate this correctness
+closure. They remain useful for carry-path attribution, but their full-backward
+latencies describe an incomplete-gradient historical implementation and must
+not be used as the final backward performance claim.
+
 ## AKO config search
 
 The first AKO loop searches low-risk launch and V-tiling choices around the

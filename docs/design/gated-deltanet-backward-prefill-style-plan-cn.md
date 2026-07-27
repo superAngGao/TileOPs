@@ -8,13 +8,59 @@
 
 1. `fused_prepare_compute_w_u`: 重算 forward 中的 `w` / `u`。
 2. `bwd_parallel`: 按 chunk 并行计算不依赖跨 chunk `dh` 的局部梯度。
-3. `dh_recurrence_bwd`: 从最后一个 chunk 反向串行传播 `dh_buf`，并计算依赖后继 chunk 的 correction。
-4. `compute_w_u_bwd`: 把 `dw` / `du` 传回 `dk` / `dv` / `dbeta`。
-5. merge: 合并 `dk_partial`、`dk_correction` 和 `dk_wu`。
+3. segment-carry path: 生成每个 chunk 的 successor-side `dh` carry，并行计算
+   `dk_corr` / `du_corr` / `dg_corr`。
+4. `compute_dw_correction`: 把 future-state `du_corr` 传回 `w`。
+5. `compute_w_u_bwd_full`: 完整反传 `w/u` 和 chunk-local
+   `A=(I+L)^{-1}`，得到 `dk_prepare` / `dv` / `dbeta` / `dg_prepare`。
+6. merge: 合并各路 `dk`，并对 `dg_cum` 做 chunk-local reverse cumsum。
 
-这里的主要长依赖在第 3 步。`bwd_parallel` 已经是 `num_chunks x B x H` 的并行 grid；真正像旧 prefill wall 的，是 `dh_recurrence_bwd` 对每个 `(B,H)` stream 做完整反向 chunk loop。
+这里原来的主要长依赖在第 3 步。`bwd_parallel` 已经是
+`num_chunks x B x H` 的并行 grid；旧实现像 prefill wall 的部分，是
+`dh_recurrence_bwd` 对每个 `(B,H)` stream 做完整反向 chunk loop。当前
+segment-carry path 已经把它拆成 segment summary、boundary scan、local expansion
+和 chunk-parallel correction。
 
 初始 smoke 也支持这个判断。当前本地 H200 环境下，`B=1,S=4096,H=16,DK=DV=64,chunk=64,fp16,BTHD-wrapper` 的 legacy backward 是 `0.530 ms`；stage timing 中 `dh_recurrence_bwd` 是 `0.420 ms`，约占 full backward 的 79%。这个数字不是发布 benchmark，只作为第一轮定位瓶颈的工程记录。
+
+### 1.1 Correctness closure
+
+优化过程中发现，历史 Gated DeltaNet backward 虽然计算了 `dAw/dAu`，wrapper
+却没有继续反传 chunk-local inverse，也没有加入 future carry 对 `dw` 的修正。
+小输入和 `atol=rtol=5e-2` 的 smoke gate 可以通过，但 accuracy diagnostic 显示
+`dk/dg/dbeta` 的 L2 relative error 分别约为 `4.21%/3.89%/2.48%`。
+
+当前实现补齐了：
+
+```text
+dw_corr = -(du_corr @ S_start^T) * exp(g_i + g_last)
+dL      = -A^T @ dA @ A^T
+dL -> dk_A, dbeta_A, dg_A
+```
+
+在 `B=1,H=2,S=128,DK=DV=128,chunk=64,fp16,seed=42` 上，相对 fp32
+differentiable reference 的结果为：
+
+| gradient | max abs | L2 relative | cosine |
+| --- | ---: | ---: | ---: |
+| `dq` | `2.253e-4` | `0.376%` | `0.999993` |
+| `dk` | `2.829e-4` | `0.376%` | `0.999993` |
+| `dv` | `2.173e-4` | `0.337%` | `0.999995` |
+| `dg` | `1.679e-4` | `0.887%` | `0.999961` |
+| `dbeta` | `2.990e-4` | `0.321%` | `0.999995` |
+
+完整梯度链下的 H200 backward-only timing：
+
+| sequence | TileOps complete bwd | FLA 0.5.1 bwd | TileOps speedup |
+| ---: | ---: | ---: | ---: |
+| 4K | `0.580968 ms` | `0.830285 ms` | `1.43x` |
+| 8K | `1.078452 ms` | `1.100744 ms` | `1.02x` |
+| 16K | `2.048846 ms` | `2.137829 ms` | `1.04x` |
+
+合同为 `B=1,H=16,DK=DV=128,chunk=64,fp16,BHSD`，
+`warmup=5,repeat=20,trials=3`。旧的 `0.620904/1.148775/2.112842 ms`
+来自 incomplete-gradient historical path，只用于说明优化前的实现状态，不再作为
+最终 correctness/performance claim。
 
 ## 2. 和 Prefill 对齐的核心结构
 

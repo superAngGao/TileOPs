@@ -6,6 +6,8 @@ to BHSD before calling the legacy kernel. That measures wrapper/layout overhead;
 it is not a BTHD-native optimized path.
 """
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import argparse
@@ -23,24 +25,25 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from benchmarks.benchmark_base import bench_kernel
-from tileops.kernels.gated_deltanet.compute_w_u_bwd import compute_w_u_bwd_tl
+from tileops.kernels.gated_deltanet.compute_w_u_bwd import compute_w_u_bwd_full_tl
 from tileops.kernels.gated_deltanet.fused_prepare_compute_w_u import (
     fused_prepare_compute_w_u_tl,
 )
 from tileops.kernels.gated_deltanet.gated_deltanet_bwd import (
     GatedDeltaNetBwdKernel,
     _bwd_parallel_tl,
+    _compute_dw_correction_tl,
     _dh_carry_after_scan_tl,
     _dh_correction_from_carry_tl,
     _dh_recurrence_bwd_tl,
     _dh_segment_boundary_scan_tl,
     _dh_segment_local_carry_tl,
     _dh_segment_summary_tl,
+    _merge_bwd_outputs_tl,
     _reduce_dh_recurrence_partials_tl,
 )
 from tileops.kernels.gated_deltanet.gated_deltanet_fwd import _chunk_local_cumsum
 from tileops.ops import GatedDeltaNetFwdOp
-
 
 _DTYPES = {
     "fp16": torch.float16,
@@ -156,9 +159,7 @@ def _time_layout_convert(cfg: BenchConfig, inputs: tuple[torch.Tensor, ...]) -> 
 def _bench_full_bwd(cfg: BenchConfig, inputs_bhsd: tuple[torch.Tensor, ...]) -> float:
     q, k, v, g, beta, do = inputs_bhsd
     dtype = _DTYPES[cfg.dtype]
-    fwd = GatedDeltaNetFwdOp(
-        cfg.batch, cfg.heads, cfg.seq_len, cfg.dim_k, cfg.dim_v, cfg.chunk_size, dtype
-    )
+    fwd = GatedDeltaNetFwdOp(chunk_size=cfg.chunk_size)
     _o, S, _Aw, _Au = fwd.forward(q, k, v, g, beta)
     op = GatedDeltaNetBwdKernel(
         cfg.batch,
@@ -193,7 +194,7 @@ def _bench_stage_breakdown(cfg: BenchConfig, inputs_bhsd: tuple[torch.Tensor, ..
         "bfloat16" if _DTYPES[cfg.dtype] == torch.bfloat16 else "float32"
     )
 
-    fwd = GatedDeltaNetFwdOp(B, H, S, DK, DV, BC, _DTYPES[cfg.dtype])
+    fwd = GatedDeltaNetFwdOp(chunk_size=BC)
     _o, S_buf, _Aw_ref, _Au_ref = fwd.forward(q, k, v, g, beta)
     g_cum = _chunk_local_cumsum(g.float(), BC).to(g.dtype)
 
@@ -206,9 +207,15 @@ def _bench_stage_breakdown(cfg: BenchConfig, inputs_bhsd: tuple[torch.Tensor, ..
     reduce_dh_partials_fn = _reduce_dh_recurrence_partials_tl(
         B, H, S, BC, DK, DV, dtype_str, block_v=cfg.recurrence_block_v
     )(cfg.recurrence_threads)
-    wu_bwd_fn = compute_w_u_bwd_tl(B, H, S, BC, DK, DV, dtype_str)(
+    merge_bwd_outputs_fn = _merge_bwd_outputs_tl(
+        B, H, S, BC, DK, dtype_str,
+    )(cfg.threads)
+    wu_bwd_fn = compute_w_u_bwd_full_tl(B, H, S, BC, DK, DV, dtype_str)(
         cfg.num_stages, cfg.threads
     )
+    dw_correction_fn = _compute_dw_correction_tl(
+        B, H, S, BC, DK, DV, dtype_str,
+    )(cfg.threads)
 
     Aw, Au, w, u = fused_fn(k, v, g_cum, beta)
     dq, dk_partial, dg_partial, dw, du_partial, v_new, dh_local = bwd_parallel_fn(
@@ -266,9 +273,11 @@ def _bench_stage_breakdown(cfg: BenchConfig, inputs_bhsd: tuple[torch.Tensor, ..
             segment_carry_after,
             dh_carry_after,
         )
-    _dk_corr, _dg_corr = reduce_dh_partials_fn(dk_corr_partial, dg_corr_partial)
-    du = du_partial + du_corr
-
+    dk_corr, dg_corr = reduce_dh_partials_fn(dk_corr_partial, dg_corr_partial)
+    dw_corr = dw_correction_fn(du_corr, S_buf, g_cum)
+    dk_prepare, _dv, _dbeta, dg_prepare = wu_bwd_fn(
+        dw, dw_corr, du_partial, du_corr, Aw, k, v, g_cum, beta,
+    )
     result = {
         "fused_prepare_compute_w_u_ms": bench_kernel(
             fused_fn, (k, v, g_cum, beta), cfg.warmup, cfg.repeat, cfg.trials
@@ -283,8 +292,26 @@ def _bench_stage_breakdown(cfg: BenchConfig, inputs_bhsd: tuple[torch.Tensor, ..
             cfg.repeat,
             cfg.trials,
         ),
-        "compute_w_u_bwd_ms": bench_kernel(
-            wu_bwd_fn, (dw, du, Aw, Au, k, v, beta), cfg.warmup, cfg.repeat, cfg.trials
+        "compute_dw_correction_ms": bench_kernel(
+            dw_correction_fn,
+            (du_corr, S_buf, g_cum),
+            cfg.warmup,
+            cfg.repeat,
+            cfg.trials,
+        ),
+        "compute_w_u_bwd_full_ms": bench_kernel(
+            wu_bwd_fn,
+            (dw, dw_corr, du_partial, du_corr, Aw, k, v, g_cum, beta),
+            cfg.warmup,
+            cfg.repeat,
+            cfg.trials,
+        ),
+        "merge_bwd_outputs_ms": bench_kernel(
+            merge_bwd_outputs_fn,
+            (dk_partial, dk_corr, dk_prepare, dg_partial, dg_corr, dg_prepare),
+            cfg.warmup,
+            cfg.repeat,
+            cfg.trials,
         ),
     }
     if cfg.recurrence_split_carry == 0:
