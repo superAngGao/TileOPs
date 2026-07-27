@@ -1025,6 +1025,7 @@ def _gated_deltanet_bwd_wrapped_kernel(
 
     fused_fn = fused_prepare_compute_w_u_tl(
         batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
+        write_duplicate_A=False,
     )(num_stages, threads)
     bwd_parallel_fn = _bwd_parallel_tl(
         batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
@@ -1043,7 +1044,7 @@ def _gated_deltanet_bwd_wrapped_kernel(
         batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
     )(threads)
 
-    Aw, Au, w, u = fused_fn(k, v, g_cum, beta)
+    Aw, _Au, w, u = fused_fn(k, v, g_cum, beta)
     dq, dk_partial, dg_partial, dw, du_partial, v_new, dh_local = \
         bwd_parallel_fn(do, q, k, g_cum, w, u, S)
     if recurrence_split_carry == 0:

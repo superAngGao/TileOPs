@@ -30,8 +30,13 @@ def fused_prepare_compute_w_u_tl(
     dim_k: int,
     dim_v: int,
     dtype: str = "float32",
+    write_duplicate_A: bool = True,
 ):
-    """Fused TileLang kernel: (k, v, g, beta) -> (Aw, Au, w, u) per chunk."""
+    """Fused TileLang kernel: (k, v, g, beta) -> (Aw, Au, w, u) per chunk.
+
+    Backward recompute can skip the duplicate ``Au`` store because ``Aw`` and
+    ``Au`` contain the same matrix and only one copy is consumed.
+    """
     accum_dtype = "float32"
     block_C = chunk_size
     num_rounds = int(math.ceil(math.log2(chunk_size))) if chunk_size > 1 else 0
@@ -106,7 +111,12 @@ def fused_prepare_compute_w_u_tl(
                 # S_shared = A_g^{-1}; write to both Aw and Au (same matrix)
                 T.copy(S_shared, temp_frag)
                 T.copy(temp_frag, Aw[bid, hid, by * block_C : (by + 1) * block_C, :], disable_tma=True)
-                T.copy(temp_frag, Au[bid, hid, by * block_C : (by + 1) * block_C, :], disable_tma=True)
+                if write_duplicate_A:
+                    T.copy(
+                        temp_frag,
+                        Au[bid, hid, by * block_C : (by + 1) * block_C, :],
+                        disable_tma=True,
+                    )
 
                 # k_beta = k * beta, v_beta = v * beta
                 for i_s, i_k in T.Parallel(block_C, dim_k):
