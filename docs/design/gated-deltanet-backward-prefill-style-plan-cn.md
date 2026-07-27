@@ -53,13 +53,15 @@ differentiable reference 的结果为：
 
 | sequence | TileOps complete bwd | FLA 0.5.1 bwd | TileOps speedup |
 | ---: | ---: | ---: | ---: |
-| 4K | `0.555714 ms` | `0.830285 ms` | `1.49x` |
-| 8K | `1.027129 ms` | `1.100744 ms` | `1.07x` |
-| 16K | `1.952438 ms` | `2.137829 ms` | `1.09x` |
+| 4K | `0.554564 ms` | `0.830285 ms` | `1.50x` |
+| 8K | `1.022625 ms` | `1.100744 ms` | `1.08x` |
+| 16K | `1.940487 ms` | `2.137829 ms` | `1.10x` |
 
-`bwd_parallel` 单独启用 TileLang fast-math 后，16K stage latency 从约
-`0.742 ms` 降到 `0.670 ms`。完整五梯度诊断与关闭 fast-math 时逐项一致，
-因此该选择保留在当前实现中，而不是用放宽正确性门限换取速度。
+`bwd_parallel`、完整 prepare backward 和 carry correction 分别启用
+TileLang fast-math。主要收益来自 `bwd_parallel`，其 16K stage latency 从约
+`0.742 ms` 降到 `0.670 ms`；另两个阶段合计再节省约 `0.009 ms`。完整五梯度
+诊断与关闭 fast-math 时逐项一致，因此这些选择保留在当前实现中，而不是用
+放宽正确性门限换取速度。
 
 合同为 `B=1,H=16,DK=DV=128,chunk=64,fp16,BHSD`，
 `warmup=5,repeat=20,trials=3`。旧的 `0.620904/1.148775/2.112842 ms`
