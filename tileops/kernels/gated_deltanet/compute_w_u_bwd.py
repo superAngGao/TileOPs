@@ -171,7 +171,7 @@ def compute_w_u_bwd_full_tl(
     @tilelang.jit(
         out_idx=[-4, -3, -2, -1],
         pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
         compile_flags=["-O3", "-DENABLE_BF16"],
     )

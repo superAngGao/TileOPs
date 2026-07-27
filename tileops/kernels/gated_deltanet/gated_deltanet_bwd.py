@@ -651,7 +651,7 @@ def _dh_correction_from_carry_tl(
     @tilelang.jit(
         out_idx=[-3, -2, -1],
         pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
         compile_flags=["-O3", "-DENABLE_BF16"],
     )
