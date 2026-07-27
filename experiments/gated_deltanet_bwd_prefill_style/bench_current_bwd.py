@@ -199,7 +199,15 @@ def _bench_stage_breakdown(cfg: BenchConfig, inputs_bhsd: tuple[torch.Tensor, ..
     g_cum = _chunk_local_cumsum(g.float(), BC).to(g.dtype)
 
     fused_fn = fused_prepare_compute_w_u_tl(
-        B, H, S, BC, DK, DV, dtype_str, write_duplicate_A=False,
+        B,
+        H,
+        S,
+        BC,
+        DK,
+        DV,
+        dtype_str,
+        write_duplicate_A=False,
+        fast_math=True,
     )(cfg.num_stages, cfg.threads)
     bwd_parallel_fn = _bwd_parallel_tl(B, H, S, BC, DK, DV, dtype_str)(
         cfg.parallel_threads
