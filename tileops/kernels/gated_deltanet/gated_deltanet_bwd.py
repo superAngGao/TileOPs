@@ -5,8 +5,8 @@ Backward (split for SM utilisation):
   1. fused_prepare_compute_w_u: recompute w, u from forward
   2. bwd_parallel:    per-chunk gradients (grid: num_chunks x B x H)
   3. dh_recurrence_bwd: sequential dh propagation + corrections (grid: B x H)
-  4. compute_w_u_bwd: dw, du -> dk_wu, dv, dbeta
-  5. merge: dk = dk_parallel + dk_correction + dk_wu
+  4. complete prepare backward: dw, du, A -> dk_prepare, dv, dbeta, dg_prepare
+  5. merge: combine dk paths and apply the chunk-local reverse cumsum to dg
 """
 import functools
 from typing import Optional, Tuple
@@ -440,6 +440,123 @@ def _reduce_dh_recurrence_partials_tl(
                     dg[bid, hid, cid * block_C + n] = T.cast(acc, dtype)
 
         return reduce_dh_recurrence_partials
+
+    return _func
+
+
+@functools.lru_cache(maxsize=32)
+def _merge_bwd_outputs_tl(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dtype: str = "float32",
+):
+    """Merge dk contributions and convert chunk-local dg_cum to dg."""
+    block_C = chunk_size
+
+    @tilelang.jit(
+        out_idx=[-2, -1],
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
+        },
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _func(threads=128):
+        @T.prim_func
+        def merge_bwd_outputs(
+            dk_partial: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            dk_corr: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            dk_prepare: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            dg_partial: T.Tensor([batch, head, seq_len], dtype),
+            dg_corr: T.Tensor([batch, head, seq_len], dtype),
+            dg_prepare: T.Tensor([batch, head, seq_len], dtype),
+            dk: T.Tensor([batch, head, seq_len, dim_k], dtype),
+            dg: T.Tensor([batch, head, seq_len], dtype),
+        ):
+            with T.Kernel(batch, head, seq_len // block_C, threads=threads) as (bid, hid, cid):
+                offset = cid * block_C
+                for n, kk in T.Parallel(block_C, dim_k):
+                    dk[bid, hid, offset + n, kk] = (
+                        dk_partial[bid, hid, offset + n, kk]
+                        + dk_corr[bid, hid, offset + n, kk]
+                        + dk_prepare[bid, hid, offset + n, kk]
+                    )
+
+                for n in T.Parallel(block_C):
+                    acc = T.alloc_var(T.float32, init=0.0)
+                    for j in T.Serial(block_C):
+                        if j >= n:
+                            acc += T.cast(
+                                dg_partial[bid, hid, offset + j]
+                                + dg_corr[bid, hid, offset + j]
+                                + dg_prepare[bid, hid, offset + j],
+                                "float32",
+                            )
+                    dg[bid, hid, offset + n] = T.cast(acc, dtype)
+
+        return merge_bwd_outputs
+
+    return _func
+
+
+@functools.lru_cache(maxsize=32)
+def _compute_dw_correction_tl(
+    batch: int,
+    head: int,
+    seq_len: int,
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str = "float32",
+):
+    """Backpropagate future-state du into w for each independent chunk."""
+    accum_dtype = "float32"
+    block_C = chunk_size
+    num_chunks = seq_len // block_C
+
+    @tilelang.jit(
+        out_idx=[-1],
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
+        },
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _func(threads=128):
+        @T.prim_func
+        def compute_dw_correction(
+            du_corr: T.Tensor([batch, head, seq_len, dim_v], dtype),
+            S: T.Tensor([batch, head, num_chunks + 1, dim_k, dim_v], dtype),
+            g: T.Tensor([batch, head, seq_len], dtype),
+            dw_corr: T.Tensor([batch, head, seq_len, dim_k], dtype),
+        ):
+            with T.Kernel(batch, head, num_chunks, threads=threads) as (bid, hid, cid):
+                offset = cid * block_C
+                du_s = T.alloc_shared([block_C, dim_v], dtype)
+                state_s = T.alloc_shared([dim_k, dim_v], dtype)
+                g_s = T.alloc_shared([block_C], dtype)
+                dw_frag = T.alloc_fragment([block_C, dim_k], accum_dtype)
+                T.copy(
+                    du_corr[bid, hid, offset : offset + block_C, :],
+                    du_s,
+                    disable_tma=True,
+                )
+                T.copy(S[bid, hid, cid, :, :], state_s, disable_tma=True)
+                T.copy(
+                    g[bid, hid, offset : offset + block_C],
+                    g_s,
+                    disable_tma=True,
+                )
+                T.clear(dw_frag)
+                T.gemm(du_s, state_s, dw_frag, transpose_B=True)
+                for i, j in T.Parallel(block_C, dim_k):
+                    dw_corr[bid, hid, offset + i, j] = (
+                        -dw_frag[i, j]
+                        * T.exp2((g_s[i] + g_s[block_C - 1]) * _LOG2E)
+                    )
+
+        return compute_dw_correction
 
     return _func
 
@@ -900,7 +1017,7 @@ def _gated_deltanet_bwd_wrapped_kernel(
     v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
     S: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    from .compute_w_u_bwd import compute_w_u_bwd_tl
+    from .compute_w_u_bwd import compute_w_u_bwd_full_tl
     from .fused_prepare_compute_w_u import fused_prepare_compute_w_u_tl
     from .gated_deltanet_fwd import _chunk_local_cumsum
 
@@ -916,9 +1033,15 @@ def _gated_deltanet_bwd_wrapped_kernel(
         batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
         block_v=recurrence_block_v,
     )(recurrence_threads)
-    wu_bwd_fn = compute_w_u_bwd_tl(
+    merge_bwd_outputs_fn = _merge_bwd_outputs_tl(
+        batch, head, seq_len, chunk_size, dim_k, dtype,
+    )(threads)
+    wu_bwd_fn = compute_w_u_bwd_full_tl(
         batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
     )(num_stages, threads)
+    dw_correction_fn = _compute_dw_correction_tl(
+        batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
+    )(threads)
 
     Aw, Au, w, u = fused_fn(k, v, g_cum, beta)
     dq, dk_partial, dg_partial, dw, du_partial, v_new, dh_local = \
@@ -970,15 +1093,14 @@ def _gated_deltanet_bwd_wrapped_kernel(
             dh_correction_from_carry_fn(g_cum, k, v_new, S, dh_carry_after)
     dk_corr, dg_corr = reduce_dh_partials_fn(dk_corr_partial, dg_corr_partial)
 
-    du = du_partial + du_corr
-    _dAw, _dAu, dk_wu, dv, dbeta = wu_bwd_fn(dw, du, Aw, Au, k, v, beta)
+    dw_corr = dw_correction_fn(du_corr, S, g_cum)
+    dk_prepare, dv, dbeta, dg_prepare = wu_bwd_fn(
+        dw, dw_corr, du_partial, du_corr, Aw, k, v, g_cum, beta,
+    )
 
-    dk = dk_partial + dk_corr + dk_wu
-    dg_cum = dg_partial + dg_corr
-
-    B, H, SL = g.shape
-    dg = dg_cum.float().reshape(B, H, SL // chunk_size, chunk_size)
-    dg = dg.flip(-1).cumsum(-1).flip(-1).reshape(B, H, SL).to(g.dtype)
+    dk, dg = merge_bwd_outputs_fn(
+        dk_partial, dk_corr, dk_prepare, dg_partial, dg_corr, dg_prepare,
+    )
     return dq, dk, dv, dg, dbeta
 
 
@@ -1010,8 +1132,8 @@ class GatedDeltaNetBwdKernel(Kernel):
       1. fused_prepare_compute_w_u: recompute w, u
       2. bwd_parallel: per-chunk gradients (grid: num_chunks x B x H)
       3. dh_recurrence_bwd: sequential dh propagation + corrections (grid: B x H)
-      4. compute_w_u_bwd: dw, du -> dk_wu, dv, dbeta
-      5. merge: dk = dk_partial + dk_correction + dk_wu, etc.
+      4. complete prepare backward: dw, du, A -> dk_prepare, dv, dbeta, dg_prepare
+      5. merge: combine dk paths and apply the chunk-local reverse cumsum to dg
     """
 
     supported_archs: list[int] = [80, 89, 90]

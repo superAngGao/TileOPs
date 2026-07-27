@@ -125,6 +125,16 @@ def test_gated_deltanet_bwd(
             op_out, ref_out.to(dtype), **tols,
             msg=lambda m, n=name: f"{n}: {m}",
         )
+        if dtype == torch.float16 and dim_k == 128 and dim_v == 128:
+            diff_norm = torch.linalg.vector_norm(
+                op_out.float() - ref_out.float()
+            )
+            ref_norm = torch.linalg.vector_norm(ref_out.float()).clamp_min(1e-12)
+            relative_l2 = float((diff_norm / ref_norm).item())
+            assert relative_l2 < 1.5e-2, (
+                f"{name}: relative L2 error {relative_l2:.6f} exceeds 0.015; "
+                "this usually indicates a missing prepare-A gradient path"
+            )
 
 
 @pytest.mark.smoke
