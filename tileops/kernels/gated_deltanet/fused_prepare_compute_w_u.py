@@ -31,6 +31,7 @@ def fused_prepare_compute_w_u_tl(
     dim_v: int,
     dtype: str = "float32",
     write_duplicate_A: bool = True,
+    fast_math: bool = False,
 ):
     """Fused TileLang kernel: (k, v, g, beta) -> (Aw, Au, w, u) per chunk.
 
@@ -44,7 +45,7 @@ def fused_prepare_compute_w_u_tl(
     @tilelang.jit(
         out_idx=[-4, -3, -2, -1],
         pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: fast_math,
         },
         compile_flags=["-O3", "-DENABLE_BF16"],
     )

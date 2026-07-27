@@ -1026,6 +1026,7 @@ def _gated_deltanet_bwd_wrapped_kernel(
     fused_fn = fused_prepare_compute_w_u_tl(
         batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
         write_duplicate_A=False,
+        fast_math=True,
     )(num_stages, threads)
     bwd_parallel_fn = _bwd_parallel_tl(
         batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
