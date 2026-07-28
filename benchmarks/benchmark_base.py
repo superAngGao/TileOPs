@@ -113,9 +113,8 @@ def _sum_kernel_time_us(kineto_results):
     is ~16x slower (~130ms of Python parsing/tree-building) for large traces.
 
     Returns:
-        ``(total_us, n_regions)``: summed kernel time in microseconds and the
-        number of annotation windows. The caller checks ``n_regions ==
-        n_repeat`` to confirm the scope projected on every iteration.
+        ``(total_us, n_regions, n_kernels)``: summed kernel time in microseconds,
+        number of annotation windows, and sampled business CUDA kernel count.
     """
     import bisect
 
@@ -128,19 +127,23 @@ def _sum_kernel_time_us(kineto_results):
             if evt.name() == _KERNEL_REGION:
                 windows.append((evt.start_ns(), evt.end_ns()))
             continue
+        name = evt.name()
+        if "vectorized_elementwise" in name and "FillFunctor" in name:
+            continue
         kernels.append((evt.start_ns(), evt.duration_ns()))
 
     windows.sort()
     starts = [w[0] for w in windows]
     ends = [w[1] for w in windows]
     total_us = 0.0
+    n_kernels = 0
     for start_ns, dur_ns in kernels:
-        # Count only kernels that fall inside a timed-call window; everything
-        # outside (notably the L2-flush fill) is excluded.
+        # Count only business kernels that fall inside a timed-call window.
         idx = bisect.bisect_right(starts, start_ns) - 1
         if idx >= 0 and start_ns < ends[idx]:
             total_us += dur_ns / 1000.0
-    return total_us, len(windows)
+            n_kernels += 1
+    return total_us, len(windows), n_kernels
 
 
 # L2 cache flush buffer (sized to actual L2, allocated lazily)
@@ -264,48 +267,56 @@ def bench_kernel(
         _run(i)
     torch.cuda.synchronize()
 
-    # One plain profiler context per trial; torch.profiler.schedule is avoided
-    # because queued launches leak across its warmup/active boundary.
-    # Kineto's window projection may include a flush merely enqueued before
-    # the window, so the flush is drained (sync) before the timed call and
-    # the call is drained before the next flush; the syncs add host-side
-    # latency only.
+    # One projected GPU timing window per trial. Open the annotation before the
+    # CPU issues the measured repeats, then launch all repeats inside that
+    # window. L2 flush kernels also fall inside the window and are filtered by
+    # name when summing CUDA activity time.
     trial_means: list[float] = []
     try:
         with _native_output_suppressor():
             for _ in range(n_trials):
-                with torch.profiler.profile(
+                profiler = torch.profiler.profile(
                     # CPU activity is required for Kineto to project the
                     # annotation window; it never adds device time.
                     activities=[
                         torch.profiler.ProfilerActivity.CPU,
                         torch.profiler.ProfilerActivity.CUDA,
                     ],
-                ) as profiler:
-                    for i in range(n_repeat):
+                )
+                profiler.prepare_trace()
+                started = False
+                try:
+                    for i in range(n_warmup):
                         cache.zero_()
                         torch.cuda.synchronize()
-                        with torch.profiler.record_function(_KERNEL_REGION):
-                            _run(i)
+                        _run(i)
                         torch.cuda.synchronize()
-                total_us, n_regions = _sum_kernel_time_us(profiler.profiler.kineto_results)
+                    profiler.start_trace()
+                    started = True
+                    with torch.profiler.record_function(_KERNEL_REGION):
+                        for i in range(n_repeat):
+                            cache.zero_()
+                            torch.cuda.synchronize()
+                            _run(i)
+                            torch.cuda.synchronize()
+                finally:
+                    if started:
+                        profiler.stop_trace()
+                total_us, n_regions, n_kernels = _sum_kernel_time_us(
+                    profiler.profiler.kineto_results
+                )
                 # Untrustworthy trace → CUDA-events fallback; genuine CUDA
                 # errors and OOM propagate.
-                if n_regions != n_repeat:
-                    # Count actual CUDA kernels for diagnostics
-                    n_cuda_kernels = sum(
-                        1 for evt in profiler.profiler.kineto_results.events()
-                        if evt.device_type() == DeviceType.CUDA and not evt.is_user_annotation()
-                    )
+                if n_regions != 1 or n_kernels == 0:
                     _logger.debug(
-                        "CUPTI projection mismatch: %d annotation windows vs %d repeats "
-                        "(%d CUDA kernels captured). This may indicate torch.profiler "
+                        "CUPTI projection mismatch: %d trial window(s), %d business "
+                        "CUDA kernels captured for %d repeats. This may indicate torch.profiler "
                         "instability in the current environment. Falling back to CUDA events.",
-                        n_regions, n_repeat, n_cuda_kernels,
+                        n_regions, n_kernels, n_repeat,
                     )
                     raise _CuptiProjectionError(
-                        f"{n_regions}/{n_repeat} annotation windows projected, "
-                        f"{n_cuda_kernels} CUDA kernels captured"
+                        f"{n_regions}/1 trial annotation windows projected, "
+                        f"{n_kernels} business CUDA kernels captured"
                     )
                 trial_means.append((total_us / n_repeat) * 1e-3)
         _bench_meta.timing = "cupti"
