@@ -373,3 +373,33 @@ Accepted. The intended QK/PV overlap survives lowering and improves every
 representative shape. The remaining local-memory traffic shows that fragment
 state still escapes across the helper boundary; reducing that spill/lifetime
 cost is now more promising than adding another pipeline stage.
+
+## Round 011: Pass Softmax Row Fragments Directly Across the Helper Boundary
+
+**Hypothesis**
+
+The generated CUDA represents each consumer's `ss` and `ls` row state as two
+thread-local floats. Passing those fragments directly to the CUTE rescale and
+output-store helpers should remove four 64-element shared arrays and their
+fragment-to-shared copies.
+
+**Action**
+
+- removed the two `ss_shared` and two `ls_shared` arrays;
+- passed `ss.data` and `ls.data` to the C++ helpers;
+- selected the two local row values from the CUTE row coordinate.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- the first formal S3584 benchmark compile remained CPU-bound for more than
+  11 minutes and did not produce a runnable kernel;
+- the benchmark was terminated, so no latency result is reported.
+
+**Decision**
+
+Rejected. Correct arithmetic is insufficient when a representation change
+causes pathological compile time. Passing TileLang fragment storage through
+this helper boundary expands the lowering/compiler problem substantially.
+The `ss` rescale path and the final `ls` output path will be tested separately
+before considering any combined change.
