@@ -955,3 +955,36 @@ enough to invalidate the long persistent loop, even though the short shape is
 numerically correct. A follow-up may use a narrower inline conversion that
 does not materialize `Array` temporaries. The accepted implementation remains
 Round 022.
+
+## Round 029: Inline FP8x4 Merge Conversion
+
+**Hypothesis**
+
+Inlining the exact four-scalar PTX conversion used by CUTLASS, without any
+`Array` or fragment object, should preserve the outer register lifetime while
+allowing the second FP8x2 conversion to merge into the same 32-bit P operand.
+
+**Action**
+
+- loaded the same four mapped QK-accumulator values as Round 022;
+- emitted two `cvt.rn.satfinite.e4m3x2.f32` instructions and one `mov.b32`
+  inside the existing pack helper;
+- preserved every outer helper call, WGMMA issue, wait, barrier, and loop
+  statement;
+- ran the dequantized-reference smoke before the S3584 gate.
+
+**Gate result**
+
+- S896 dequantized-reference smoke: `1 passed`;
+- the S3584 kernel again remained resident at full GPU utilization without
+  producing output and was stopped after more than two minutes;
+- the source was restored exactly to Round 022.
+
+**Decision**
+
+Rejected. Removing C++ container temporaries does not resolve the long-loop
+liveness failure. The current asynchronous mainloop is sensitive to the
+lowering of the P operand construction itself. The 6.42 M-instruction
+opportunity remains valid, but exploiting it requires first establishing a
+scoreboard/barrier protocol that is robust to compiler scheduling changes.
+The accepted implementation remains Round 022.
