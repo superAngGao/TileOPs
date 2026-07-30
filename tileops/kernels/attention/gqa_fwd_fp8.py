@@ -47,8 +47,6 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
     accum_dtype = "float"
     fp8_dtype = "float8_e4m3fn"
     scale = make_log2e_scale(dim)
-    scale_block = 128
-    scale_blocks = (seq_len + scale_block - 1) // scale_block
 
     @tilelang.jit(
         out_idx=[6, 7],
@@ -68,8 +66,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
     def func():
         q_shape = (batch, seq_len, heads, dim)
         kv_shape = (batch, seq_len, heads_kv, dim)
-        q_scale_shape = (batch, heads, scale_blocks)
-        kv_scale_shape = (batch, heads_kv, scale_blocks)
+        descale_shape = (batch, heads_kv)
         online_softmax_1 = make_online_softmax_with_score_scale(scale, accum_dtype, half_m, 224)
         online_softmax_2 = make_online_softmax_with_score_scale(scale, accum_dtype, half_m, 224)
         pv_accumulate_helper = "tl::fp8_pv_ptx_unit_accumulate_fa3_raw_64x128x224"
@@ -82,9 +79,9 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
             q: T.Tensor(q_shape, fp8_dtype),
             k: T.Tensor(kv_shape, fp8_dtype),
             v: T.Tensor(kv_shape, fp8_dtype),
-            q_scale: T.Tensor(q_scale_shape, accum_dtype),
-            k_scale: T.Tensor(kv_scale_shape, accum_dtype),
-            v_scale: T.Tensor(kv_scale_shape, accum_dtype),
+            q_descale: T.Tensor(descale_shape, accum_dtype),
+            k_descale: T.Tensor(descale_shape, accum_dtype),
+            v_descale: T.Tensor(descale_shape, accum_dtype),
             output: T.Tensor(q_shape, out_dtype),
             lse: T.Tensor([batch, heads, seq_len], accum_dtype),
         ) -> None:
@@ -383,7 +380,6 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         tile_h = tile_hkv * groups + tile_g
                         head_kv = tile_hkv
                         row_base = tile_m * block_m
-                        q_scale_idx = row_base // scale_block
                         loop_range = T.ceildiv(seq_len, 224)
                         T.tma_copy(
                             q[tile_b, row_base : row_base + half_m, tile_h, :],
@@ -396,7 +392,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         T.call_extern("handle", "tl::fp8_zero_raw_acc_64", acc_o_1.data)
                         T.clear(ls_1)
                         T.fill(sm_1, -T.infinity(accum_dtype))
-                        for n_idx in T.Pipelined(loop_range, num_stages=0):
+                        for _n_idx in T.Pipelined(loop_range, num_stages=0):
                             T.barrier_wait(k_full, gi_kc1 % 2)
                             if gi_kc1 % 2 == 0:
                                 T.wgmma_gemm(
@@ -426,8 +422,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 ss_1,
                                 ssum_1,
                                 ls_1,
-                                q_scale[tile_b, tile_h, q_scale_idx]
-                                * k_scale[tile_b, head_kv, n_idx],
+                                q_descale[tile_b, head_kv]
+                                * k_descale[tile_b, head_kv],
                             )
                             T.copy(ss_1, ss_shared_1)
                             T.barrier_wait(v_full, gi_vc1 % 2)
@@ -439,7 +435,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     v_tc_smem_0.access_ptr("r"),
                                     4,
                                     ss_shared_1.access_ptr("r"),
-                                    v_scale[tile_b, head_kv, n_idx],
+                                    v_descale[tile_b, head_kv],
                                     acc_o_1.data,
                                 )
                             else:
@@ -450,7 +446,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     v_tc_smem_1.access_ptr("r"),
                                     4,
                                     ss_shared_1.access_ptr("r"),
-                                    v_scale[tile_b, head_kv, n_idx],
+                                    v_descale[tile_b, head_kv],
                                     acc_o_1.data,
                                 )
                             if gi_vc1 % 2 == 0:
@@ -492,7 +488,6 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         tile_h = tile_hkv * groups + tile_g
                         head_kv = tile_hkv
                         row_base = tile_m * block_m
-                        q_scale_idx = row_base // scale_block
                         loop_range = T.ceildiv(seq_len, 224)
                         T.tma_copy(
                             q[tile_b, row_base + half_m : row_base + block_m, tile_h, :],
@@ -505,7 +500,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         T.call_extern("handle", "tl::fp8_zero_raw_acc_64", acc_o_2.data)
                         T.clear(ls_2)
                         T.fill(sm_2, -T.infinity(accum_dtype))
-                        for n_idx in T.Pipelined(loop_range, num_stages=0):
+                        for _n_idx in T.Pipelined(loop_range, num_stages=0):
                             T.barrier_wait(k_full, gi_kc2 % 2)
                             if gi_kc2 % 2 == 0:
                                 T.wgmma_gemm(
@@ -535,8 +530,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 ss_2,
                                 ssum_2,
                                 ls_2,
-                                q_scale[tile_b, tile_h, q_scale_idx]
-                                * k_scale[tile_b, head_kv, n_idx],
+                                q_descale[tile_b, head_kv]
+                                * k_descale[tile_b, head_kv],
                             )
                             T.copy(ss_2, ss_shared_2)
                             T.barrier_wait(v_full, gi_vc2 % 2)
@@ -548,7 +543,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     v_tc_smem_0.access_ptr("r"),
                                     4,
                                     ss_shared_2.access_ptr("r"),
-                                    v_scale[tile_b, head_kv, n_idx],
+                                    v_descale[tile_b, head_kv],
                                     acc_o_2.data,
                                 )
                             else:
@@ -559,7 +554,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     v_tc_smem_1.access_ptr("r"),
                                     4,
                                     ss_shared_2.access_ptr("r"),
-                                    v_scale[tile_b, head_kv, n_idx],
+                                    v_descale[tile_b, head_kv],
                                     acc_o_2.data,
                                 )
                             if gi_vc2 % 2 == 0:
@@ -607,12 +602,12 @@ def _gqa_fwd_fp8_bn224_tma_v_wrapped_kernel(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return _gqa_fwd_fp8_bn224_tma_v_kernel(batch, heads, heads_kv, seq_len, dim, out_dtype)()(
-        q, k, v, q_scale, k_scale, v_scale
+        q, k, v, q_descale, k_descale, v_descale
     )
 
 
@@ -632,72 +627,8 @@ def _(
     return (fake_o, fake_lse)
 
 
-def _expand_fa3_gqa_descales(
-    q_descale: torch.Tensor,
-    k_descale: torch.Tensor,
-    v_descale: torch.Tensor,
-    batch: int,
-    heads: int,
-    heads_kv: int,
-    seq_len: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Accept FA3-interface [batch, heads_kv] descales.
-
-    The TileLang kernels below still index scale metadata as
-    q: [batch, heads, scale_blocks] and k/v: [batch, heads_kv, scale_blocks].
-    The public FA3 FP8 GQA binding exposes q/k/v descales as [batch, heads_kv],
-    with q grouped by KV head.  This wrapper broadcasts that 2D contract to the
-    internal per-block layout; direct kernel users may still pass the internal
-    3D layout explicitly.
-    """
-    scale_blocks = (seq_len + 127) // 128
-    group_size = heads // heads_kv
-
-    def _record_stream(x: torch.Tensor) -> torch.Tensor:
-        if x.is_cuda:
-            x.record_stream(torch.cuda.current_stream(x.device))
-        return x
-
-    def _as_float_contiguous(x: torch.Tensor) -> torch.Tensor:
-        return x if x.dtype == torch.float32 and x.is_contiguous() else x.float().contiguous()
-
-    def _expand_q(x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 3:
-            if tuple(x.shape) != (batch, heads, scale_blocks):
-                raise ValueError(
-                    f"q_descale/q_scale with 3 dimensions must have internal shape ({batch}, {heads}, {scale_blocks}), got {tuple(x.shape)}."
-                )
-            return _record_stream(_as_float_contiguous(x))
-        if x.ndim != 2 or tuple(x.shape) != (batch, heads_kv):
-            raise ValueError(
-                f"q_descale must have FA3 shape ({batch}, {heads_kv}) or internal shape ({batch}, {heads}, {scale_blocks}), got {tuple(x.shape)}."
-            )
-        x = _as_float_contiguous(x).repeat_interleave(group_size, dim=1)
-        return _record_stream(x[:, :, None].expand(batch, heads, scale_blocks).contiguous())
-
-    def _expand_kv(name: str, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 3:
-            if tuple(x.shape) != (batch, heads_kv, scale_blocks):
-                raise ValueError(
-                    f"{name} with 3 dimensions must have internal shape ({batch}, {heads_kv}, {scale_blocks}), got {tuple(x.shape)}."
-                )
-            return _record_stream(_as_float_contiguous(x))
-        if x.ndim != 2 or tuple(x.shape) != (batch, heads_kv):
-            raise ValueError(
-                f"{name} must have FA3 shape ({batch}, {heads_kv}) or internal shape ({batch}, {heads_kv}, {scale_blocks}), got {tuple(x.shape)}."
-            )
-        x = _as_float_contiguous(x)
-        return _record_stream(x[:, :, None].expand(batch, heads_kv, scale_blocks).contiguous())
-
-    return (
-        _expand_q(q_descale),
-        _expand_kv("k_descale", k_descale),
-        _expand_kv("v_descale", v_descale),
-    )
-
-
 class GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel(Kernel):
-    """BN224 WS FP8 GQA kernel with FA3-compatible 2D descales and TMA-V layout."""
+    """BN224 WS FP8 GQA kernel with direct FA3-compatible descales."""
 
     supported_archs: list[int] = [90]
 
@@ -754,9 +685,6 @@ class GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel(Kernel):
             raise ValueError(
                 "GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel expects q/k/v to be torch.float8_e4m3fn."
             )
-        q_scale, k_scale, v_scale = _expand_fa3_gqa_descales(
-            q_descale, k_descale, v_descale, self.batch, self.heads, self.heads_kv, self.seq_len
-        )
         return _gqa_fwd_fp8_bn224_tma_v_wrapped_kernel(
             self.batch,
             self.heads,
@@ -767,7 +695,7 @@ class GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel(Kernel):
             q,
             k,
             v,
-            q_scale,
-            k_scale,
-            v_scale,
+            q_descale,
+            k_descale,
+            v_descale,
         )

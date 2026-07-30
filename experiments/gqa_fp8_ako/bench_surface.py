@@ -17,10 +17,6 @@ from benchmarks.ops.attention.bench_gqa_fp8 import (
     _make_inputs,
     _manifest_cases,
 )
-from tileops.kernels.attention.gqa_fwd_fp8 import (
-    GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel,
-    _expand_fa3_gqa_descales,
-)
 from tileops.ops import GroupedQueryAttentionPrefillFwdOp
 
 
@@ -71,34 +67,8 @@ def main() -> None:
             backend="fp8",
             validate_uniform_cu_seqlens=case.validate_uniform_cu_seqlens,
         )
-        kernel = GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel(
-            case.batch,
-            case.heads,
-            case.heads_kv,
-            case.seq_len,
-            case.dim,
-            case.out_dtype,
-        )
-        q_scale, k_scale, v_scale = _expand_fa3_gqa_descales(
-            q_descale,
-            k_descale,
-            v_descale,
-            case.batch,
-            case.heads,
-            case.heads_kv,
-            case.seq_len,
-        )
-
         implementations = [
             ("tileops_canonical_2d_descale", op, inputs),
-            (
-                "tileops_kernel_3d_scale",
-                kernel,
-                (q.reshape(case.batch, case.seq_len, case.heads, case.dim),
-                 k.reshape(case.batch, case.seq_len, case.heads_kv, case.dim),
-                 v.reshape(case.batch, case.seq_len, case.heads_kv, case.dim),
-                 q_scale, k_scale, v_scale),
-            ),
         ]
         fa3_fn = _fa3_gqa_fp8_fwd(case)
         if fa3_fn is not None:
