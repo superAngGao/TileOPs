@@ -788,3 +788,31 @@ without carrying `gi_kp` across persistent tasks.
 Rejected. The small timing movement is not supported by the lowering evidence:
 deriving the phase from `n_idx` causes more local reloads under the constrained
 producer register budget. The accepted implementation remains Round 022.
+
+## Round 024: Launch K Before Completing V Transpose
+
+**Hypothesis**
+
+FA3 launches the next K TMA before transposing the previously loaded V tile.
+Moving the independent K launch between the TileOps V TMA launch and V
+wait/transpose could hide K latency behind the producer-side transpose.
+
+**Action**
+
+- launched V TMA as before;
+- acquired and launched the current K TMA before waiting for V completion;
+- completed the V transpose and published `v_full` afterward;
+- left all consumer code unchanged.
+
+**Gate result**
+
+- dequantized-reference smoke: `1 passed`;
+- S3584 H64/Hkv8 FP16 regressed from Round 022 `0.666609 ms` to
+  `0.800958 ms`; FA3 measured `0.530934 ms`.
+
+**Decision**
+
+Rejected. The producer blocks on `k_empty` while a completed V tile is waiting
+to be transposed, delaying the PV consumer. FA3's ordering depends on a fuller
+pipeline-state protocol and cannot be copied as a local statement reorder.
+The accepted implementation remains Round 022.
