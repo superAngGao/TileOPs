@@ -1190,3 +1190,31 @@ Rejected at the short-shape gate. The dynamic register partition is itself
 performance-sensitive; reallocating eight registers from each consumer does
 not provide a useful producer-spill trade. The accepted implementation remains
 Round 022.
+
+## Round 038: Fully Unroll the K/V Tile Loops
+
+**Hypothesis**
+
+Because `seq_len` is a compile-time specialization and the K/V loop length is
+known, explicitly unrolling the producer and both consumer loops may eliminate
+the loop-index dependency and expose constant barrier phases to the compiler.
+
+**Action**
+
+- replaced the three `T.Pipelined(loop_range, num_stages=0)` loops with
+  `T.unroll(loop_range)`;
+- retained the accepted counters, barriers, WGMMA order, and register budget;
+- compiled S896 from an isolated empty Round 038 cache.
+
+**Gate result**
+
+- compilation and launch took substantially longer than the accepted source;
+- the S896 kernel remained resident at full GPU utilization for more than
+  three minutes without returning;
+- the named container was stopped and no longer-shape run was attempted.
+
+**Decision**
+
+Rejected on the liveness and compilation-cost gates. Explicit unrolling does
+not preserve the persistent barrier/scoreboard contract even at the four-tile
+S896 shape. The accepted implementation remains Round 022.
