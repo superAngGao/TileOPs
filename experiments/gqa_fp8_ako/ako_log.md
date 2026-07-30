@@ -555,3 +555,60 @@ S3584 NCU remained effectively identical to Round 010:
 Rejected as source-only churn. The compiler already reuses the row lifetime:
 the generated resource use, local-memory traffic, and runtime are unchanged.
 The existing shared softmax utility remains the smaller public API.
+
+## Round 017: Independent P Fragment for True Softmax/PV Overlap
+
+**Hypothesis**
+
+Round 010 reuses the QK accumulator as the FP8 P operand. It therefore issues
+`PV(n-1)` before `QK(n)` and waits for PV before softmax. Keeping a separate
+28-register FP8 P fragment should enable the FA3 ordering:
+`QK(n) -> PV(n-1) -> wait<1> -> softmax(n) -> wait<0>`.
+
+**Action**
+
+- added an explicitly annotated per-consumer FP8 P fragment;
+- split score-to-P packing from the RS-WGMMA issue helper;
+- handled the first QK tile and final PV tile separately;
+- reordered the steady state so PV remains outstanding during the next
+  softmax.
+
+**Gate result**
+
+- S896 H32/Hkv8 completed at `0.040299 ms` versus FA3 `0.028971 ms`;
+- this was `5.8%` slower than the Round 010 short-shape row;
+- S3584 did not terminate after entering the generated kernel;
+- a `V2P_NUM_SMS=1792` probe assigning one work item per persistent CTA also
+  failed to terminate, ruling out cross-work-item phase reuse as the sole
+  cause;
+- the small official correctness shape likewise failed the liveness gate.
+
+**Decision**
+
+Rejected. The independent P representation exposes the desired algorithmic
+schedule, but the current TileLang fragment-to-extern-to-async-RS-WGMMA
+boundary does not maintain a valid long-loop scoreboard contract.
+
+## Round 018: Explicit P-Fragment WGMMA Fences
+
+**Hypothesis**
+
+The compiler may not know that the raw FP8 P fragment remains an asynchronous
+RS-WGMMA operand until `wait_group<0>`. Explicit operand fences after packing
+and after the wait may make the fragment's read/overwrite lifetime visible.
+
+**Action**
+
+Added `T.warpgroup_fence_operand(..., num_regs=28)` around both consumers'
+pack/overwrite boundaries without changing the Round 017 schedule.
+
+**Gate result**
+
+The S3584 probe again entered the generated kernel and did not terminate.
+
+**Decision**
+
+Rejected. Source-level operand fences are insufficient for this cross-helper
+fragment lifetime. The true-overlap direction remains structurally relevant,
+but its P packing and RS-WGMMA issue must share a compiler-visible boundary or
+move into one typed helper.
