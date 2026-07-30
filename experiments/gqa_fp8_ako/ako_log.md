@@ -1627,3 +1627,31 @@ visibility protocol with fewer stores than generic `T.copy`.
 Rejected. Unique-owner stores preserve liveness, but a full 128-thread barrier
 is more synchronization than this warp-local row mapping requires and causes
 a 3.1% regression versus Round 042.
+
+## Round 051: Narrow Row-Scale Publication to Warp Scope
+
+**Hypothesis**
+
+Each scale owner and every consumer of that row belong to the same warp.
+Replacing the 128-thread barrier with `__syncwarp()` should preserve shared
+visibility without serializing all four warps.
+
+**Action**
+
+- retained the unique-owner shared stores from Round 050;
+- replaced the 128-thread named barrier with a warp sync;
+- retained the accepted shared-memory accumulator-rescale helper.
+
+**Gate result**
+
+- S1792 FP16 completed under the formal repeated timing contract;
+- TileOps measured `0.110940 ms`;
+- FA3 measured `0.088073 ms`;
+- Round 042 measured `0.108229 ms`.
+
+**Decision**
+
+Rejected. Warp-local publication is stable but still 2.5% slower than the
+generic TileLang fragment-to-shared copy. The accepted `T.copy` already lowers
+this replicated row layout more efficiently than the hand-specialized
+publisher.
