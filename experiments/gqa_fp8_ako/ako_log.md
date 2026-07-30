@@ -1161,3 +1161,32 @@ without the scheduler regression.
 Rejected. Dynamic register redistribution does not recover the scheduling
 loss caused by the derived-phase dependency. The accepted implementation
 remains Round 022.
+
+## Round 037: Rebalance Registers With Explicit Phase Counters
+
+**Hypothesis**
+
+The accepted Round 022 producer counters may spill only because its producer
+warpgroup is capped at 24 registers. Raising the producer cap to 32 while
+lowering both consumer requests from 240 to 232 tests that possibility without
+changing any phase or barrier dependency.
+
+**Action**
+
+- retained the exact accepted Round 022 producer, consumer, and barrier logic;
+- changed only producer `dec_max_nreg(24) -> dec_max_nreg(32)`;
+- changed both consumers `inc_max_nreg(240) -> inc_max_nreg(232)`;
+- compiled from an isolated empty Round 037 cache.
+
+**Gate result**
+
+- targeted S896 FP16 correctness: `1 passed`;
+- S896 FP16 latency: `0.037434 ms`, roughly 9% slower than the fresh accepted
+  baseline.
+
+**Decision**
+
+Rejected at the short-shape gate. The dynamic register partition is itself
+performance-sensitive; reallocating eight registers from each consumer does
+not provide a useful producer-spill trade. The accepted implementation remains
+Round 022.
