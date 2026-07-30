@@ -1061,3 +1061,35 @@ barrier phase sequence.
 Rejected. The compiler preserved the same local-memory lifetime despite the
 source-level counter fold, while the longer dependence through one counter
 regressed the mainloop. The source was restored exactly to Round 022.
+
+## Round 034: Fold Producer K/V Phase Counters
+
+**Hypothesis**
+
+Fresh source correlation maps the two dominant local stores to producer
+updates of `gi_vp` and `gi_kp`, not to the consumer counters tested in Round
+033. Within one work item, K production is one tile ahead of V production, and
+the counters become equal again after the V tail. Encoding that relation in
+one counter may remove the actual producer spill.
+
+**Action**
+
+- removed `gi_vp`;
+- derived the previous V buffer, raw-V barrier phase, and V-empty phase from
+  `gi_kp - 1`;
+- retained the existing K load order, V transpose, and all barrier objects;
+- compiled and tested from a new isolated Round 034 cache.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- the formal S896 benchmark failed the liveness gate: the kernel remained
+  resident at 100% GPU utilization for more than two minutes;
+- the named container was stopped before any longer-shape or profiler run.
+
+**Decision**
+
+Rejected. The within-work-item arithmetic relation is not sufficient to
+reconstruct the producer's persistent barrier phase across grouped scheduler
+work. Independent K and V producer counters are part of the live scheduler
+contract. The source was restored exactly to Round 022.
