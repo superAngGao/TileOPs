@@ -639,3 +639,37 @@ The S896 probe entered the generated kernel but did not terminate.
 Rejected. Even without schedule reordering, separating P packing from the
 asynchronous RS-WGMMA issue breaks the current compiler/scoreboard contract.
 P packing, register lifetime, and PV issue must remain in one typed boundary.
+
+## Round 020: Typed Pack-QK-PV Helper
+
+**Hypothesis**
+
+Keeping the previous-tile P packing, current-tile QK issue, and previous-tile
+PV issue inside one C++ helper should preserve the register-source lifetime
+that Rounds 017-019 lost while exposing the FA3 ordering:
+`pack P(n-1) -> QK(n) -> PV(n-1) -> wait<1> -> softmax(n) -> wait<0>`.
+
+**Action**
+
+- added a typed helper that packs the previous score accumulator into 28 local
+  FP8 words, issues and commits current QK, then issues and commits previous PV;
+- split the first QK and final PV out of the steady-state loop;
+- kept barriers, online softmax, accumulator rescaling, and the final epilogue
+  in TileLang.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- S896 H32/Hkv8 FP16: `0.039301 ms` versus Round 010 `0.038082 ms`,
+  a `3.2%` regression; FA3 measured `0.028709 ms`;
+- S3584 entered the generated kernel and remained at 100% GPU utilization
+  without terminating; the named container was stopped after the liveness
+  gate failed;
+- no S7168 timing or profiler run was attempted after the long-loop failure.
+
+**Decision**
+
+Rejected. A single typed boundary is sufficient for the short loop and
+preserves numerical correctness, but it does not establish a valid long-loop
+scoreboard protocol. It also adds a material short-shape regression. The
+accepted implementation remains Round 010.
