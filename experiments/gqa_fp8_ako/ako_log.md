@@ -816,3 +816,32 @@ Rejected. The producer blocks on `k_empty` while a completed V tile is waiting
 to be transposed, delaying the PV consumer. FA3's ordering depends on a fuller
 pipeline-state protocol and cannot be copied as a local statement reorder.
 The accepted implementation remains Round 022.
+
+## Round 025: Consumer Warpgroup Scheduler Token
+
+**Hypothesis**
+
+FA3 alternates its two consumer warpgroups through named scheduler barriers.
+Giving each TileOps consumer a token before QK issue and passing it immediately
+after issue could reduce Tensor Core issue-queue contention while preserving
+the existing `PV(n-1) + QK(n)` overlap.
+
+**Action**
+
+- seeded a 256-thread named barrier for the first consumer warpgroup;
+- alternated barrier IDs between the two consumers before each QK issue;
+- passed the token to the peer warpgroup immediately after QK issue;
+- kept softmax, PV issue, and producer pipelines unchanged.
+
+**Gate result**
+
+- dequantized-reference smoke: `1 passed`;
+- S3584 H64/Hkv8 FP16 regressed from Round 022 `0.666609 ms` to
+  `0.683065 ms`; FA3 measured `0.529283 ms`.
+
+**Decision**
+
+Rejected. FA3's scheduler token is coupled to a step that issues QK and PV
+together. On the Round 022 schedule, adding the token only introduces another
+wait and does not improve Tensor Core utilization. The accepted implementation
+remains Round 022.
