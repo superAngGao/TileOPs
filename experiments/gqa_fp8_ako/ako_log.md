@@ -1093,3 +1093,71 @@ Rejected. The within-work-item arithmetic relation is not sufficient to
 reconstruct the producer's persistent barrier phase across grouped scheduler
 work. Independent K and V producer counters are part of the live scheduler
 contract. The source was restored exactly to Round 022.
+
+## Round 035: Derive All K/V Phases From the Tile Index
+
+**Hypothesis**
+
+The kernel contract requires `seq_len` to be divisible by both 224 and 128, so
+the producer loop length is always a multiple of four. All K/V double-buffer
+phases therefore return to their initial value at each persistent work-item
+boundary and can be derived from `n_idx` without persistent scalar counters.
+
+**Action**
+
+- removed the six producer and consumer K/V phase counters;
+- derived K/V buffer selection, full-barrier phase, and empty-barrier phase
+  from `n_idx` and the final `loop_range - 1` tile;
+- retained the two independent Q consumer counters;
+- compiled and tested from an isolated empty Round 035 cache.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- S896 FP16: `0.034963 ms`;
+- paired GPU0 S3584 FP16: `0.682377 ms` versus the fresh Round 022 baseline
+  of `0.664097 ms`, a 2.75% regression;
+- S3584 local loads/stores fell from `458,752 / 237,072` to
+  `336,896 / 121,856`;
+- dynamic instructions fell from `202.45 M` to `200.35 M`;
+- despite the lower spill traffic, eligible warps per scheduler fell from
+  `0.59` to `0.55`, while no-eligible cycles rose from `58.69%` to `60.84%`.
+
+**Decision**
+
+Rejected. The phase counters were a real source of local-memory traffic, but
+binding every barrier decision to the pipelined loop index lengthened the
+producer control dependence and reduced scheduler eligibility. Lower
+instruction and spill counts did not translate into lower latency.
+
+## Round 036: Rebalance Dynamic Registers Around the Derived Phase
+
+**Hypothesis**
+
+Round 035 may spill the producer loop index because the producer warpgroup is
+capped at 24 registers. Giving the producer eight more dynamic registers,
+while reducing each consumer request by eight, may retain the spill reduction
+without the scheduler regression.
+
+**Action**
+
+- first tested `dec_max_nreg(16)`, which the assembler rejected because
+  `setmaxnreg.dec` accepts values in `[24, 256]`;
+- corrected the direction to producer `dec_max_nreg(32)` and consumer
+  `inc_max_nreg(232)`;
+- retained the Round 035 phase derivation unchanged;
+- compiled from a new isolated empty Round 036 cache.
+
+**Gate result**
+
+- targeted S896 FP16 correctness: `1 passed`;
+- S896 FP16 latency: `0.036158 ms`, slower than both Round 035
+  (`0.034963 ms`) and the accepted Round 022 range;
+- the short-shape performance gate rejected the candidate before a formal
+  long-shape/profile sweep.
+
+**Decision**
+
+Rejected. Dynamic register redistribution does not recover the scheduling
+loss caused by the derived-phase dependency. The accepted implementation
+remains Round 022.
