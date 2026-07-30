@@ -612,3 +612,30 @@ Rejected. Source-level operand fences are insufficient for this cross-helper
 fragment lifetime. The true-overlap direction remains structurally relevant,
 but its P packing and RS-WGMMA issue must share a compiler-visible boundary or
 move into one typed helper.
+
+## Round 019: Shared-Memory P Mailbox
+
+**Hypothesis**
+
+A per-consumer `[28 registers, 128 lanes]` shared mailbox can keep P out of a
+cross-helper TileLang fragment. Packing writes coalesced lane-major words and
+the PV helper immediately reloads them into its own local P registers.
+
+**Action**
+
+- allocated two 14 KiB P mailboxes, keeping total shared memory below the H200
+  one-CTA-per-SM limit;
+- split the existing fused score-pack/PV helper into a shared pack and a
+  mailbox-load/PV issue;
+- retained the proven Round 010 schedule to isolate representation cost and
+  liveness before attempting true overlap.
+
+**Gate result**
+
+The S896 probe entered the generated kernel but did not terminate.
+
+**Decision**
+
+Rejected. Even without schedule reordering, separating P packing from the
+asynchronous RS-WGMMA issue breaks the current compiler/scoreboard contract.
+P packing, register lifetime, and PV issue must remain in one typed boundary.
