@@ -718,3 +718,44 @@ shared-memory conflict or performance gap. Separate V buffers consume another
 56 KiB of shared memory without improving the mainloop. The accepted
 implementation remains Round 010, and subsequent work should target the
 LDSM/STSM/PV access pattern or consumer schedule rather than buffer aliasing.
+
+## Round 022: Vectorized CUTE Output Copy
+
+**Hypothesis**
+
+Source-correlated NCU counters refined the Round 021 diagnosis: 2.753 M of the
+shared-memory excessive wavefronts came from 128 scalar `LDS.U16` instructions
+in the output epilogue, not from the V transpose. Replacing the hand-written
+scalar shared loads with a 128-bit CUTE tiled copy should remove that conflict
+without changing the accepted QK/PV schedule.
+
+**Action**
+
+- kept the existing STSM register-to-shared output conversion;
+- replaced eight scalar shared loads per output vector with
+  `AutoVectorizingCopyWithAssumedAlignment<128>`;
+- used the same 128-thread, 64x128 output tile and swizzled shared layout;
+- preserved the Round 010 mainloop, barriers, online softmax, and descale ABI.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- S896 H32/Hkv8 FP16: `0.034846 ms` versus Round 010 `0.038082 ms`,
+  an `8.5%` improvement; FA3 measured `0.028663 ms`;
+- S1792 H32/Hkv8 FP16: `0.108867 ms`; FA3 measured `0.086161 ms`;
+- S3584 H64/Hkv8 FP16: `0.666609 ms` versus Round 010 `0.703467 ms`,
+  a `5.2%` improvement; FA3 measured `0.530303 ms`;
+- S7168 H64/Hkv8 FP16: `2.550040 ms` versus Round 010 `2.656325 ms`,
+  a `4.0%` improvement; FA3 measured `2.043426 ms`;
+- focused S3584 NCU duration fell from `705.44 us` to `662.85 us`;
+- shared-memory bank conflicts fell from `3.140 M` to `0.344 M`;
+- dynamic instructions fell from `208.29 M` to `202.42 M`;
+- tensor-pipe active rose from `37.15%` to `39.60%`.
+
+**Decision**
+
+Accepted as the new baseline. The change removes a measured epilogue
+bottleneck with a standard CUTE vector-copy primitive and improves every
+measured FP16 shape. The remaining gap to FA3 is approximately 22-26%, so the
+next search should return to mainloop issue efficiency, local-memory traffic,
+and producer/consumer overlap.

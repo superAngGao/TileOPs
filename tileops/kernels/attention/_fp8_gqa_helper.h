@@ -599,25 +599,23 @@ __device__ __forceinline__ void fp8_fa3_o_smem_store_global_cute_64x128(
     OutT* o_smem, OutT* output, int output_row_stride) {
   using namespace cute;
   using StoreConfig = FP8Fa3OutputStore64x128<OutT>;
+  using GmemLayoutAtom = Layout<Shape<_16, _8>, Stride<_8, _1>>;
+  using GmemTiledCopyO = decltype(make_tiled_copy(
+      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, OutT>{},
+      GmemLayoutAtom{}, Layout<Shape<_1, _8>>{}));
 
   int const tid = static_cast<int>(threadIdx.x) & 127;
-  int const row_lane = tid >> 3;
-  int const col_lane = tid & 7;
-  typename StoreConfig::SmemLayoutO smem_layout;
-
-#pragma unroll
-  for (int row = row_lane; row < 64; row += 16) {
-#pragma unroll
-    for (int col_block = 0; col_block < 128; col_block += 64) {
-      int const col = col_block + col_lane * 8;
-      uint4 vec;
-      OutT* vec_out = reinterpret_cast<OutT*>(&vec);
-#pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        vec_out[i] = o_smem[int(smem_layout(make_coord(row, col + i)))];
-      }
-      *reinterpret_cast<uint4*>(output + row * output_row_stride + col) = vec;
-    }
-  }
+  Tensor sO = make_tensor(
+      make_smem_ptr(o_smem), typename StoreConfig::SmemLayoutO{});
+  Tensor gO = make_tensor(
+      make_gmem_ptr(output),
+      make_layout(Shape<_64, _128>{}, make_stride(output_row_stride, _1{})));
+  GmemTiledCopyO gmem_tiled_copy_O;
+  auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tid);
+  Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
+  Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+  Tensor tOrO = make_fragment_like(tOsO);
+  cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+  cute::copy(gmem_tiled_copy_O, tOrO, tOgO);
 }
 }  // namespace tl
