@@ -486,3 +486,30 @@ three-warpgroup persistent scheduling and barrier-phase protocol, not an
 independent locality parameter. Future scheduler changes must derive and test
 the producer/consumer tile sequence together rather than sweep this value in
 isolation.
+
+## Round 015: Skip First-Tile Output Rescale
+
+**Hypothesis**
+
+The output accumulator is explicitly zeroed before the first PV. FA3 handles
+the first tile separately, so the first shared `ss` copy and multiplication of
+the zero accumulator appear arithmetically redundant.
+
+**Action**
+
+Guarded each consumer's `ss` staging and accumulator-rescale helper with
+`n_idx > 0`; all steady-state iterations and barriers were unchanged.
+
+**Gate result**
+
+- lowering completed;
+- the official-runner correctness process entered the generated kernel but did
+  not terminate;
+- GPU4 remained at 100% utilization until the named test container was stopped.
+
+**Decision**
+
+Rejected as a liveness failure. In the current lowering, the rescale helper is
+also an accumulator-lifetime/compiler anchor. Its first-iteration presence
+cannot be removed as if it were only scalar arithmetic. A future first-tile
+specialization would need an explicit WGMMA operand/fence contract.
