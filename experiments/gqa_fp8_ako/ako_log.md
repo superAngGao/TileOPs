@@ -403,3 +403,30 @@ causes pathological compile time. Passing TileLang fragment storage through
 this helper boundary expands the lowering/compiler problem substantially.
 The `ss` rescale path and the final `ls` output path will be tested separately
 before considering any combined change.
+
+## Round 012: Pass Only the Online-Softmax Rescale Fragment Directly
+
+**Hypothesis**
+
+The pathological compile time in Round 011 may have come from combining local
+`ss` and `ls` pointers with the final CUTE output-store template. Keeping the
+final `ls` path unchanged while passing only the two-float `ss` fragment should
+isolate that interaction.
+
+**Action**
+
+- retained the original shared-memory `ls` path;
+- removed only the two `ss_shared` arrays and copies;
+- passed each consumer's `ss` fragment to the accumulator-rescale helper.
+
+**Gate result**
+
+- formatting and lint gates passed;
+- the formal S3584 benchmark remained CPU-bound in compilation and did not
+  produce a runnable kernel within a four-minute hard limit.
+
+**Decision**
+
+Rejected. The compile-time failure follows the local `ss` fragment across the
+extern/helper boundary. Shared staging remains the practical compiler contract
+for this row state in the current TileLang/CUTE integration.
