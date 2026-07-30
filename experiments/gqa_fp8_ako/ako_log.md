@@ -845,3 +845,42 @@ Rejected. FA3's scheduler token is coupled to a step that issues QK and PV
 together. On the Round 022 schedule, adding the token only introduces another
 wait and does not improve Tensor Core utilization. The accepted implementation
 remains Round 022.
+
+## Round 026: TileLang-Owned Register-P and RS-WGMMA
+
+**Hypothesis**
+
+If TileLang owns the FP8 register-A fragment, RS-WGMMA issue, waits, output
+accumulator layout, and epilogue, the compiler may preserve the P operand
+lifetime that failed across the fragment/extern boundary in Rounds 017-020.
+Only the QK-accumulator-to-P layout conversion would remain a typed helper.
+
+**Action**
+
+- allocated explicit `[64, 224]` FP8 P fragments for both consumer warpgroups;
+- derived and annotated the register-A fragment layout inferred by TileLang;
+- replaced the fused raw-PTX PV helper with `T.wgmma_gemm`;
+- moved output rescaling, normalization, and shared/global copies to TileLang;
+- kept producer TMA, V transpose, barriers, QK issue, and persistent scheduling
+  unchanged.
+
+**Gate result**
+
+- an unannotated probe failed layout inference because the standard TileLang
+  RS-WGMMA output layout differs from the accepted raw-PTX accumulator ABI;
+- after moving the complete output path to the inferred layout, direct
+  `T.copy` from the QK accumulator to P exposed the expected QK/PV fragment
+  layout conflict;
+- a narrow typed conversion helper resolved both compile-time layout
+  conflicts, and the candidate entered the S896 kernel;
+- the S896 dequantized-reference smoke then failed the liveness gate: the
+  kernel stayed resident without producing output and the named container was
+  stopped.
+
+**Decision**
+
+Rejected. TileLang can infer and lower the FP8 RS-WGMMA path, but the current
+register-P conversion plus asynchronous persistent-loop protocol still does
+not establish a valid runtime scoreboard contract. The experiment confirms
+that the remaining issue is not merely the raw PV issue helper. The accepted
+implementation remains Round 022.
