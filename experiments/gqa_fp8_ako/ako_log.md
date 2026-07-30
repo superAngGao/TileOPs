@@ -98,3 +98,103 @@ without changing the mainloop.
 
 Accepted. This closes the wrapper allocation gap and makes the public ABI the
 native kernel ABI. The long-sequence structural wall is unchanged.
+
+## Round 003: Lowering And NCU Audit
+
+**Hypothesis**
+
+The remaining long-sequence gap is caused by exposed dependency latency in the
+consumer mainloop, not DRAM bandwidth. Generated code may also reveal local
+work that can be removed before changing the pipeline structure.
+
+**Action**
+
+- profiled one warmed S3584 H64/Hkv8 FP16 call with NCU `--set full`;
+- isolated the generated TileLang cache for source inspection;
+- inspected registers, shared memory, occupancy, scheduler eligibility,
+  scoreboard stalls, local-memory instructions, and static Hopper SASS.
+
+**Result**
+
+- duration: `802.272 us`;
+- compute / memory throughput: `38.06% / 48.77%`;
+- tensor-pipe active: `32.75%`;
+- registers: `168` per thread;
+- dynamic shared memory: `197.63 KiB`;
+- achieved occupancy: `18.70%`, one CTA per SM;
+- no eligible warp: `60.46%`;
+- dominant PC samples: long scoreboard `14,495`, wait `13,882`, short
+  scoreboard `9,148`, barrier `8,831`;
+- DRAM throughput was only `1.87%`.
+
+The generated CUDA also performs two complete `acc_o_layout_seed` conversions
+and shared-memory writes. The custom output helper reads `acc_o` directly and
+does not consume either seed buffer, so these writes are a concrete removable
+candidate rather than a speculative pipeline rewrite.
+
+**Decision**
+
+The profile confirms the serial dependency wall. First remove the dead
+layout-seed work and re-run all gates; then probe whether typed QK/PV overlap is
+expressible without fragment conversion or spill growth.
+
+## Round 004: Remove Layout Seeds Without A Replacement Contract
+
+**Hypothesis**
+
+Because the custom output helper does not read `acc_o_layout_seed_1/2`, deleting
+the buffers and their copies should remove dead runtime work.
+
+**Action**
+
+Removed both shared buffers and both `T.copy(acc_o, acc_o_layout_seed)` calls
+without adding an explicit fragment layout.
+
+**Gate result**
+
+Rejected at lowering:
+
+```text
+InternalError: In PrimFunc main variables (acc_o_1, acc_o_2) are used,
+but are not passed in as API arguments
+```
+
+The copies were not semantically required by the output calculation, but they
+were the only TileLang-visible consumers anchoring the raw accumulator
+fragments and their layouts. A no-contract deletion is therefore invalid.
+
+## Round 005: Explicit TileLang PV Accumulator Layout
+
+**Hypothesis**
+
+An explicit `tilelang.layout.Fragment` matching the FA3-style 64x128 PV
+accumulator mapping can preserve the compiler contract without materializing
+the dummy seed copies.
+
+**Action**
+
+- defined the 64x128 PV accumulator thread/register mapping as a TileLang
+  fragment;
+- annotated both consumer warpgroup accumulators with that layout;
+- removed the two 16 KiB seed buffers and generated FP32-to-output conversion
+  loops.
+
+**Gate result**
+
+- ruff: pass;
+- official-runner correctness: `8 passed`;
+- generated CUDA seed/local-cast markers: `0`;
+- dynamic shared memory: about `197.6 KiB -> 161.0 KiB`;
+- no CUDA-events fallback accepted.
+
+| Shape | Round 002 | Round 005 | Change | FA3 | Round 005 / FA3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S896 H32/Hkv8 FP16 | 0.042019 ms | 0.041315 ms | -1.7% | 0.028664 ms | 1.441x |
+| S3584 H64/Hkv8 FP16 | 0.803116 ms | 0.802621 ms | -0.1% | 0.534570 ms | 1.501x |
+| S7168 H64/Hkv8 FP16 | 3.034873 ms | 3.040450 ms | +0.2% | 2.038617 ms | 1.491x |
+
+**Decision**
+
+Accepted. The long-sequence change is within measurement noise, while the
+implementation replaces hidden runtime work with an explicit TileLang layout
+contract and improves the short-sequence row.

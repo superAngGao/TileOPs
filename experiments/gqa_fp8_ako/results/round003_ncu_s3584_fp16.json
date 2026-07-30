@@ -1,0 +1,45 @@
+{
+  "round": 3,
+  "case": "llama-3.1-70b-prefill-fp8tc-bn224-s3584-float16",
+  "gpu": "NVIDIA H200",
+  "sm_clock_ghz": 1.48,
+  "duration_us": 802.272,
+  "compute_throughput_percent": 38.06,
+  "memory_throughput_percent": 48.77,
+  "tensor_pipe_active_percent": 32.753723,
+  "registers_per_thread": 168,
+  "dynamic_shared_memory_kib": 197.63,
+  "theoretical_occupancy_percent": 18.75,
+  "achieved_occupancy_percent": 18.70,
+  "eligible_warps_per_scheduler": 0.547129,
+  "no_eligible_percent": 60.46,
+  "local_load_instructions": 229376,
+  "local_store_instructions": 121856,
+  "shared_load_bank_conflicts": 3161826,
+  "shared_store_bank_conflicts": 188258,
+  "pc_sampling": {
+    "samples": 73845,
+    "long_scoreboard": 14495,
+    "wait": 13882,
+    "short_scoreboard": 9148,
+    "barrier": 8831,
+    "mio_throttle": 6166,
+    "not_selected": 3772,
+    "warpgroup_arrive": 203
+  },
+  "sass_static": {
+    "qgmma_64x128x32": 28,
+    "qgmma_64x32x32": 112,
+    "warpgroup_arrive": 12,
+    "warpgroup_depbar": 6,
+    "usetmaxreg_alloc": 2,
+    "local_load_sites": 2,
+    "local_store_sites": 2
+  },
+  "generated_kernel_hash": "f29d31216ae255a1e58d75c021d7ea230858c665e77dfe86c2a22ec80e591156",
+  "notes": [
+    "NCU --set full replays one warmed TileOps main_kernel inside the NVTX range.",
+    "The kernel is latency/scoreboard limited rather than DRAM-bandwidth limited.",
+    "Generated CUDA materializes two unused acc_o_layout_seed shared-memory writes totaling 32 KiB per CTA allocation."
+  ]
+}

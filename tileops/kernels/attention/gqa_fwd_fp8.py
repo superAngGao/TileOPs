@@ -23,6 +23,20 @@ _ANCHOR_HELPER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "_
 _FP8_GQA_HELPER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "_fp8_gqa_helper.h"))
 
 
+def _make_fa3_pv_acc_fragment(dim: int, thread_offset: int) -> tilelang.layout.Fragment:
+    col_phase = dim // 8
+
+    def forward_fn(i, j):
+        rv = j // 4
+        thread = thread_offset + (i // 16) * 32 + (i % 8) * 4 + (j % 4)
+        index = (rv % col_phase) * 4 + ((i % 16) // 8) * 2 + rv // col_phase
+        return thread, index
+
+    if dim != 128:
+        raise ValueError("FA3 PV accumulator fragment annotation requires dim == 128.")
+    return tilelang.layout.Fragment([64, dim], forward_fn=forward_fn)
+
+
 @functools.lru_cache(maxsize=32)
 def _gqa_fwd_fp8_bn224_tma_v_kernel(
     batch: int, heads: int, heads_kv: int, seq_len: int, dim: int, out_dtype: str
@@ -100,8 +114,6 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                 ss_shared_2 = T.alloc_shared([half_m], accum_dtype)
                 ls_shared_1 = T.alloc_shared([half_m], accum_dtype)
                 ls_shared_2 = T.alloc_shared([half_m], accum_dtype)
-                acc_o_layout_seed_1 = T.alloc_shared([half_m, dim], out_dtype)
-                acc_o_layout_seed_2 = T.alloc_shared([half_m, dim], out_dtype)
                 acc_s_1 = T.alloc_fragment([half_m, 224], accum_dtype)
                 acc_o_1 = T.alloc_fragment([half_m, dim], accum_dtype)
                 sm_1 = T.alloc_fragment([half_m], accum_dtype)
@@ -128,6 +140,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                     {
                         q_shared_1: tilelang.layout.make_swizzled_layout(q_shared_1),
                         q_shared_2: tilelang.layout.make_swizzled_layout(q_shared_2),
+                        acc_o_1: _make_fa3_pv_acc_fragment(dim, 128),
+                        acc_o_2: _make_fa3_pv_acc_fragment(dim, 256),
                     }
                 )
                 T.sync_threads()
@@ -456,7 +470,6 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                             gi_vc1 = gi_vc1 + 1
                             gi_kc1 = gi_kc1 + 1
                         T.copy(ls_1, ls_shared_1)
-                        T.copy(acc_o_1, acc_o_layout_seed_1)
                         T.call_extern(
                             "handle",
                             "tl::fp8_fa3_raw_acc_store_smem_cute_64x128",
@@ -564,7 +577,6 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                             gi_vc2 = gi_vc2 + 1
                             gi_kc2 = gi_kc2 + 1
                         T.copy(ls_2, ls_shared_2)
-                        T.copy(acc_o_2, acc_o_layout_seed_2)
                         T.call_extern(
                             "handle",
                             "tl::fp8_fa3_raw_acc_store_smem_cute_64x128",
