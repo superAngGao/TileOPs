@@ -1532,3 +1532,39 @@ preserves the performance gain, but applying it unconditionally breaks the H64
 persistent workload. The synchronization requirement is therefore tied to the
 compiled dispatch shape rather than being a universal replacement for the
 shared-memory path.
+
+## Round 048: Compile-Time H32/H64 Synchronization Split
+
+**Hypothesis**
+
+Round 046 completed on H64 without an explicit convergence point, while Round
+047 completed on H32 with one. Selecting the sync behavior at specialization
+time may match the different persistent head-group workloads.
+
+**Action**
+
+- retained direct row-fragment scale broadcasting;
+- emitted the 128-thread consumer sync only for `heads == 32`;
+- required every manifest shape to complete before accepting formal timing;
+- used a per-process 180-second timeout for the formal surface.
+
+**Gate result**
+
+- quick completion probes passed:
+  - S896 FP16: `0.033354 ms`;
+  - S1792 FP16: `0.101739 ms`;
+  - S3584 FP16: `0.632158 ms`;
+  - S7168 FP16: `2.434213 ms`;
+- official-runner correctness suite: `8 passed`;
+- formal S896 FP16/BF16 measured `0.033302 / 0.033285 ms`;
+- formal S1792 FP16 timed out after 180 seconds under
+  `warmup=5, repeat=20, trials=3`.
+
+**Decision**
+
+Rejected. Compile-time shape selection made short completion probes pass, but
+the H32 path remained nondeterministically unsafe under the formal repeated
+launch contract. The direct register broadcast lacks a synchronization or
+visibility property provided by the accepted shared-scale path; timing-based
+or shape-based barriers are not a valid substitute. The accepted
+implementation remains Round 042.
