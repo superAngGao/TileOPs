@@ -513,3 +513,45 @@ Rejected as a liveness failure. In the current lowering, the rescale helper is
 also an accumulator-lifetime/compiler anchor. Its first-iteration presence
 cannot be removed as if it were only scalar arithmetic. A future first-tile
 specialization would need an explicit WGMMA operand/fence contract.
+
+## Round 016: Reuse Previous-Max Row Storage for the Current Sum
+
+**Hypothesis**
+
+After the online-softmax rescale factor is computed, the previous-max row
+fragment is dead for the current tile. Reusing it as the reduction-sum
+destination should shorten live row state while keeping all softmax operations
+in TileLang.
+
+**Action**
+
+- added an experimental scaled online-softmax macro that reuses the
+  previous-max fragment;
+- removed the separate `ssum` fragment and layout annotation from both
+  consumers;
+- kept QK, PV, barriers, and arithmetic order unchanged.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- no timing fallback accepted;
+
+| Shape | Round 010 | Round 016 | Change | FA3 | Round 016 / FA3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S896 H32/Hkv8 FP16 | 0.038082 ms | 0.038125 ms | +0.1% | 0.028690 ms | 1.329x |
+| S3584 H64/Hkv8 FP16 | 0.703467 ms | 0.703243 ms | -0.0% | 0.534624 ms | 1.315x |
+| S7168 H64/Hkv8 FP16 | 2.656325 ms | 2.654613 ms | -0.1% | 2.039317 ms | 1.302x |
+
+S3584 NCU remained effectively identical to Round 010:
+
+- duration: `701.056 us`;
+- registers: `168` per thread;
+- dynamic shared memory: `164.864 KiB`;
+- local loads/stores: `458752 / 237072`;
+- tensor-pipe active: `37.19%`.
+
+**Decision**
+
+Rejected as source-only churn. The compiler already reuses the row lifetime:
+the generated resource use, local-memory traffic, and runtime are unchanged.
+The existing shared softmax utility remains the smaller public API.

@@ -1,0 +1,19 @@
+{
+  "round": 16,
+  "case": "llama-3.1-70b-prefill-fp8tc-bn224-s3584-float16",
+  "implementation": "tileops_reuse_previous_max_row",
+  "duration_us": 701.056,
+  "tensor_pipe_active_percent": 37.190697,
+  "registers_per_thread": 168,
+  "dynamic_shared_memory_kib": 164.864,
+  "eligible_warps_per_scheduler": 0.577907,
+  "local_load_instructions": 458752,
+  "local_store_instructions": 237072,
+  "pc_sampling": {
+    "long_scoreboard": 12523,
+    "wait": 13120,
+    "barrier": 6744,
+    "mio_throttle": 5617,
+    "no_instruction": 1548
+  }
+}
