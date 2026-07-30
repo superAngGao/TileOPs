@@ -884,3 +884,74 @@ register-P conversion plus asynchronous persistent-loop protocol still does
 not establish a valid runtime scoreboard contract. The experiment confirms
 that the remaining issue is not merely the raw PV issue helper. The accepted
 implementation remains Round 022.
+
+## Round 027: Source-Correlated Mainloop Profile
+
+**Hypothesis**
+
+The remaining 22-26% gap should be localized before another structural edit.
+A same-shape source profile can distinguish producer latency, consumer
+arithmetic, and scheduler overhead without inferring from aggregate duration.
+
+**Action**
+
+- collected Nsight Compute 2025.2.1 reports for Round 022 and FA3 at
+  `B=1, S=3584, H=64, Hkv=8, D=128`, FP16 output;
+- used the same `132 x 384` launch geometry and 1500 MHz H200 clock;
+- compared dynamic instruction classes, scheduler state, source-correlated
+  stalls, and the selected FA3 kernel template;
+- mapped the largest TileOps barrier wait back to the generated producer
+  control flow.
+
+**Gate result**
+
+- TileOps measured `659.040 us`; FA3 measured `533.664 us`;
+- TileOps executed `202.45 M` instructions versus FA3 `183.21 M`;
+- tensor-pipe active was `40.06%` versus `49.10%`;
+- the largest TileOps stall, 5,766 long-scoreboard samples, is the producer
+  waiting on `k_empty` after publishing V, not a consumer waiting for V;
+- TileOps executes about `6.34 M` more `PRMT` instructions while both kernels
+  execute the same number of FP8 conversion instructions;
+- the 28 FP8x2-to-FP8x4 pack permutations per PV step account for about
+  `6.42 M` dynamic instructions across the two consumers.
+
+**Decision**
+
+Diagnostic round. A deeper V producer pipeline is not the immediate answer:
+the producer already catches the consumer and blocks on K-buffer reuse.
+Target the redundant register-A pack permutation while preserving the accepted
+raw-WGMMA layout and scoreboard protocol. The accepted implementation remains
+Round 022.
+
+## Round 028: CUTLASS FP8x4 Register-A Conversion
+
+**Hypothesis**
+
+Using CUTLASS's four-element FP32-to-E4M3 converter should lower the second
+FP8x2 conversion with merge semantics and remove the 28 explicit P-register
+pack permutations without changing the accumulator index map.
+
+**Action**
+
+- replaced two FP8x2 intrinsics plus shift/or packing with
+  `NumericArrayConverter<float_e4m3_t, float, 4>`;
+- preserved the accepted QK accumulator layout, source-index map, raw PV
+  WGMMA helper, barriers, and persistent schedule;
+- tested the dequantized-reference smoke before the S3584 performance gate.
+
+**Gate result**
+
+- S896 dequantized-reference smoke: `1 passed`;
+- the S3584 kernel failed the liveness gate: it remained resident at full GPU
+  utilization for more than three minutes without producing output;
+- the named container was stopped and the source was restored exactly to
+  Round 022.
+
+**Decision**
+
+Rejected. As in the earlier typed-fragment probes, introducing a C++ array
+conversion boundary changes register allocation or asynchronous lowering
+enough to invalidate the long persistent loop, even though the short shape is
+numerically correct. A follow-up may use a narrower inline conversion that
+does not materialize `Array` temporaries. The accepted implementation remains
+Round 022.
