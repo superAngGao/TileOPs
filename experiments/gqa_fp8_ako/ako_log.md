@@ -1028,3 +1028,36 @@ performance and fresh-cache liveness evidence. Round 029 is rejected on
 fresh-cache lowering and performance evidence, without relying on its earlier
 shared-cache long-shape observation. Full details are recorded in
 `results/round032/round032_cache_audit.md`.
+
+## Round 033: Fold Consumer K/V Phase Counters
+
+**Hypothesis**
+
+Each consumer maintains separate persistent K and V barrier counters even
+though they identify the same tile at PV issue time. Folding them into one
+counter may remove one high-frequency local spill without changing the
+barrier phase sequence.
+
+**Action**
+
+- removed `gi_vc1` and `gi_vc2`;
+- used the current K phase for the current V tile and the opposite phase when
+  releasing the previous V tile;
+- delayed the single counter increment until after PV issue;
+- compiled every candidate shape from the isolated Round 033 cache.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- S896 FP16: `0.034728 ms`, effectively unchanged from Round 022;
+- paired GPU0 S3584 FP16: `0.682017 ms` versus a freshly compiled Round 022
+  baseline of `0.664097 ms`, a 2.7% regression;
+- local loads/stores remained exactly `458,752 / 237,072`;
+- dynamic instructions fell slightly to `201.03 M`, but the intended spill
+  removal did not occur.
+
+**Decision**
+
+Rejected. The compiler preserved the same local-memory lifetime despite the
+source-level counter fold, while the longer dependence through one counter
+regressed the mainloop. The source was restored exactly to Round 022.
