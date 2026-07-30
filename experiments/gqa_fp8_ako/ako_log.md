@@ -1218,3 +1218,99 @@ the loop-index dependency and expose constant barrier phases to the compiler.
 Rejected on the liveness and compilation-cost gates. Explicit unrolling does
 not preserve the persistent barrier/scoreboard contract even at the four-tile
 S896 shape. The accepted implementation remains Round 022.
+
+## Round 039: Same-GPU FA3 Gap and Counter-Store Diagnosis
+
+**Hypothesis**
+
+A same-GPU, same-image paired benchmark and profile can separate the remaining
+FA3 gap into WGMMA utilization, scheduling, instruction, and spill components
+before another structural edit.
+
+**Action**
+
+- moved the paired baseline to idle GPU1 after GPU0 was claimed by nightly CI;
+- compiled Round 022 from an isolated empty cache in the official development
+  runner;
+- benchmarked TileOps and FA3 in the same process at S896 and S3584;
+- collected full NCU reports for both S3584 kernels.
+
+**Gate result**
+
+| Metric | Round 022 | FA3 |
+| --- | ---: | ---: |
+| S896 FP16 | `0.034653 ms` | `0.028912 ms` |
+| S3584 FP16 | `0.665510 ms` | `0.538036 ms` |
+| NCU duration | `665.344 us` | `537.888 us` |
+| dynamic instructions | `202.43 M` | `183.21 M` |
+| local loads | `458,752` | `456,898` |
+| local stores | `237,072` | `121,178` |
+| tensor active | `39.67%` | `49.32%` |
+| eligible warps / scheduler | `0.598` | `0.648` |
+| registers / thread | `168` | `168` |
+
+**Decision**
+
+Diagnostic round. Register count and local loads are already comparable.
+TileOps has about `116 K` excess local stores, lower scheduler eligibility,
+and lower Tensor Core occupancy. The excess stores match the producer phase
+counter stores removed by Round 035, so the next probe should preserve the
+explicit barrier contract while changing the storage of those uniform states.
+
+## Round 040: Warp-Shared Producer Phase Counters
+
+**Hypothesis**
+
+The producer K/V phases are warp-uniform. Storing one shared counter per
+producer warp instead of one spilled scalar per thread may remove the excess
+local stores while retaining the accepted explicit phase control flow.
+
+**Action**
+
+- replaced `gi_kp` and `gi_vp` with two four-element shared arrays;
+- indexed each array by producer warp;
+- retained all original phase expressions, barriers, and update points;
+- compiled and profiled from an isolated empty Round 040 cache.
+
+**Gate result**
+
+- targeted S896 FP16 correctness: `1 passed`;
+- S896 FP16: `0.034862 ms`;
+- S3584 FP16: `0.677190 ms` versus paired Round 022 `0.665510 ms`;
+- local loads/stores fell to `14,560 / 7,696`;
+- dynamic instructions rose to `204.16 M`;
+- eligible warps per scheduler fell to `0.587`.
+
+**Decision**
+
+Rejected. Shared storage removes almost all local spill traffic, proving the
+counter diagnosis, but repeated shared loads in branch expressions cost more
+than the removed local traffic.
+
+## Round 041: Hoist Shared Phases Into Short-Lived Scalars
+
+**Hypothesis**
+
+Loading each warp-shared phase once per tile into a short-lived scalar and
+writing it back once should preserve Round 040's spill reduction while
+removing repeated shared-memory expressions.
+
+**Action**
+
+- hoisted V and K phases into per-iteration `T.alloc_var` scalars;
+- hoisted the V-tail phase once outside the main loop;
+- retained the Round 040 shared arrays and original barrier logic.
+
+**Gate result**
+
+- targeted S896 FP16 correctness: `1 passed`;
+- S896 FP16: `0.034946 ms`;
+- S3584 FP16: `0.672305 ms`, better than Round 040 but still about 1.0% slower
+  than paired Round 022.
+
+**Decision**
+
+Rejected. The repeated-load cost was real, but a shared counter update per
+tile remains slower than the accepted spilled-register control path. The
+next probe will exploit the stronger four-tile phase-reset invariant rather
+than preserving full counters.
