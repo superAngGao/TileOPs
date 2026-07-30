@@ -673,3 +673,48 @@ Rejected. A single typed boundary is sufficient for the short loop and
 preserves numerical correctness, but it does not establish a valid long-loop
 scoreboard protocol. It also adds a material short-shape regression. The
 accepted implementation remains Round 010.
+
+## Round 021: Split V-Transpose Source and Destination
+
+**Hypothesis**
+
+Round 010 transposes V in place and synchronizes all 128 producer threads
+before and after every LDSM/STSM micro-step. Allocating distinct source and
+Tensor-Core-layout destination buffers should remove those internal barriers,
+reduce shared-memory conflicts, and move the producer closer to FA3.
+
+**Action**
+
+- collected a focused same-contract NCU comparison before changing source;
+- allocated two additional `[128, 224]` FP8 shared buffers for transposed V;
+- changed the transpose helper to read and write distinct buffers without
+  per-step barriers;
+- preserved TileLang TMA, mbarriers, persistent scheduling, QK/PV order,
+  softmax, and epilogue.
+
+The focused baseline comparison confirmed a large execution-level gap:
+
+| Metric | Round 010 | FA3 |
+| --- | ---: | ---: |
+| Duration | 705.44 us | 530.50 us |
+| Tensor-pipe active | 37.15% | 49.30% |
+| Dynamic instructions | 208.29 M | 183.20 M |
+| Shared bank conflicts | 3.140 M | 0.716 M |
+| Local loads / stores | 458752 / 237072 | 444416 / 109104 |
+
+**Gate result**
+
+- official-runner dequantized-reference smoke: `1 passed`;
+- S896 H32/Hkv8 FP16: `0.038327 ms`, a `0.6%` regression from Round 010;
+- S3584 H64/Hkv8 FP16: `0.706746 ms`, a `0.5%` regression from Round 010;
+- focused candidate NCU duration: `704.54 us`;
+- candidate shared bank conflicts increased to `3.287 M`; tensor-pipe active
+  and local traffic were unchanged.
+
+**Decision**
+
+Rejected. The in-place synchronization was not the source of the remaining
+shared-memory conflict or performance gap. Separate V buffers consume another
+56 KiB of shared memory without improving the mainloop. The accepted
+implementation remains Round 010, and subsequent work should target the
+LDSM/STSM/PV access pattern or consumer schedule rather than buffer aliasing.
