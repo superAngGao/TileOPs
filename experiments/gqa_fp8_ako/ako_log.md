@@ -1568,3 +1568,34 @@ launch contract. The direct register broadcast lacks a synchronization or
 visibility property provided by the accepted shared-scale path; timing-based
 or shape-based barriers are not a valid substitute. The accepted
 implementation remains Round 042.
+
+## Round 049: Express Output Rescale With a TileLang Primitive
+
+**Hypothesis**
+
+Because TileLang knows both fragment layouts, the shared `make_rescale` macro
+may lower `acc_o[i, j] *= scores_scale[i]` with the required data exchange and
+remove the custom helper plus shared scale arrays.
+
+**Action**
+
+- instantiated `make_rescale(64, 128)` for each consumer warpgroup;
+- removed both shared scale arrays and fragment-to-shared copies;
+- replaced the C++ rescale calls with the TileLang rescale macro;
+- compiled from isolated empty caches.
+
+**Gate result**
+
+- targeted dequantized-reference correctness: `1 passed`;
+- S896 FP16: `0.033514 ms`, versus Round 042 `0.034937 ms`;
+- FA3 in the same process: `0.029035 ms`;
+- S1792 FP16 timed out after 180 seconds under
+  `warmup=5, repeat=20, trials=3`.
+
+**Decision**
+
+Rejected. The TileLang expression is numerically correct and lowers to a fast
+single-shape kernel, but removing the shared-scale exchange still violates the
+repeated-launch liveness contract. This confirms that the accepted shared
+path is a data-publication protocol, not merely an avoidable storage round
+trip.
