@@ -107,7 +107,9 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
         descale_shape = (batch, heads_kv)
         online_softmax_1 = make_online_softmax_with_score_scale(scale, accum_dtype, half_m, 224)
         online_softmax_2 = make_online_softmax_with_score_scale(scale, accum_dtype, half_m, 224)
-        pv_accumulate_helper = "tl::fp8_pv_ptx_unit_accumulate_fa3_raw_64x128x224"
+        pv_begin_accumulate_helper = (
+            "tl::fp8_pv_ptx_unit_begin_accumulate_fa3_raw_64x128x224"
+        )
         v_inplace_transform_helper = (
             "tl::fp8_transpose_v_128x224_fa3_src_ldsm_stsm_barrier_each_iter"
         )
@@ -476,29 +478,31 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 * k_descale[tile_b, head_kv],
                             )
                             T.copy(ss_1, ss_shared_1)
+                            T.call_extern(
+                                "handle",
+                                "tl::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
+                                acc_o_1.data,
+                                ss_shared_1.access_ptr("r"),
+                            )
                             T.barrier_wait(v_full, gi_vc1 % 2)
                             if gi_vc1 % 2 == 0:
                                 T.call_extern(
                                     "handle",
-                                    pv_accumulate_helper,
+                                    pv_begin_accumulate_helper,
                                     acc_s_1.data,
                                     v_tc_smem_0.access_ptr("r"),
-                                    4,
-                                    ss_shared_1.access_ptr("r"),
-                                    v_descale[tile_b, head_kv],
                                     acc_o_1.data,
                                 )
                             else:
                                 T.call_extern(
                                     "handle",
-                                    pv_accumulate_helper,
+                                    pv_begin_accumulate_helper,
                                     acc_s_1.data,
                                     v_tc_smem_1.access_ptr("r"),
-                                    4,
-                                    ss_shared_1.access_ptr("r"),
-                                    v_descale[tile_b, head_kv],
                                     acc_o_1.data,
                                 )
+                            T.wait_wgmma(0)
+                            T.warpgroup_fence_operand(acc_o_1, num_regs=64)
                             if gi_vc1 % 2 == 0:
                                 T.barrier_arrive(v_empty_0)
                             else:
@@ -508,10 +512,11 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         T.copy(ls_1, ls_shared_1)
                         T.call_extern(
                             "handle",
-                            "tl::fp8_fa3_raw_acc_store_smem_cute_64x128",
+                            "tl::fp8_fa3_raw_acc_finalize_store_smem_cute_64x128",
                             acc_o_1.data,
                             ls_shared_1.access_ptr("r"),
                             4,
+                            v_descale[tile_b, head_kv],
                             o_shared_1.access_ptr("w"),
                         )
                         T.fence_proxy_async()
@@ -581,29 +586,31 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 * k_descale[tile_b, head_kv],
                             )
                             T.copy(ss_2, ss_shared_2)
+                            T.call_extern(
+                                "handle",
+                                "tl::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
+                                acc_o_2.data,
+                                ss_shared_2.access_ptr("r"),
+                            )
                             T.barrier_wait(v_full, gi_vc2 % 2)
                             if gi_vc2 % 2 == 0:
                                 T.call_extern(
                                     "handle",
-                                    pv_accumulate_helper,
+                                    pv_begin_accumulate_helper,
                                     acc_s_2.data,
                                     v_tc_smem_0.access_ptr("r"),
-                                    4,
-                                    ss_shared_2.access_ptr("r"),
-                                    v_descale[tile_b, head_kv],
                                     acc_o_2.data,
                                 )
                             else:
                                 T.call_extern(
                                     "handle",
-                                    pv_accumulate_helper,
+                                    pv_begin_accumulate_helper,
                                     acc_s_2.data,
                                     v_tc_smem_1.access_ptr("r"),
-                                    4,
-                                    ss_shared_2.access_ptr("r"),
-                                    v_descale[tile_b, head_kv],
                                     acc_o_2.data,
                                 )
+                            T.wait_wgmma(0)
+                            T.warpgroup_fence_operand(acc_o_2, num_regs=64)
                             if gi_vc2 % 2 == 0:
                                 T.barrier_arrive(v_empty_0)
                             else:
@@ -613,10 +620,11 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         T.copy(ls_2, ls_shared_2)
                         T.call_extern(
                             "handle",
-                            "tl::fp8_fa3_raw_acc_store_smem_cute_64x128",
+                            "tl::fp8_fa3_raw_acc_finalize_store_smem_cute_64x128",
                             acc_o_2.data,
                             ls_shared_2.access_ptr("r"),
                             4,
+                            v_descale[tile_b, head_kv],
                             o_shared_2.access_ptr("w"),
                         )
                         T.fence_proxy_async()

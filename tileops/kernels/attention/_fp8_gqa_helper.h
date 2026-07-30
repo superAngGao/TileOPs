@@ -358,6 +358,124 @@ __device__ __forceinline__ void fp8_pv_ptx_unit_accumulate_fa3_raw_64x128x224(
   }
 }
 template <typename FP8T>
+__device__ __forceinline__ void fp8_pv_ptx_unit_begin_accumulate_fa3_raw_64x128x224(
+    float* acc_s, FP8T* v_tc_smem, float* acc_o) {
+  using namespace cute;
+  using Element = cutlass::float_e4m3_t;
+  using ElementAccum = float;
+  using TileShapePV = Shape<_64, _128, Int<224>>;
+  using AtomLayout = Layout<Shape<_1, _1, _1>>;
+  using MmaPV = decltype(GMMA::rs_op_selector<Element, Element, ElementAccum,
+                                              TileShapePV, GMMA::Major::K,
+                                              GMMA::Major::K>());
+  using TiledMmaPV = decltype(make_tiled_mma(MmaPV{}, AtomLayout{}));
+  using VConfig = fp8_gqa_detail::VTranspose128x224<FP8T>;
+
+  int const tid = static_cast<int>(threadIdx.x) & 127;
+  uint32_t p_regs[28];
+  TiledMmaPV tiled_mma_pv;
+  auto thr_mma = tiled_mma_pv.get_slice(tid);
+  Tensor sV = make_tensor(make_smem_ptr(v_tc_smem), typename VConfig::SmemLayoutVtMma{});
+  Tensor tOrV = thr_mma.partition_fragment_B(sV)(_, _, _, _0{});
+
+  fp8_acc_to_fa3_p_regs_64x224_no_cute(acc_s, p_regs);
+
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+  for (int ki = 0; ki < 7; ++ki) {
+    cute::GmmaDescriptor desc_b = tOrV(_, _, ki)(0);
+    wgmma_rs<DataType::kFloat8_e4m3, DataType::kFloat8_e4m3, DataType::kFloat32,
+             64, 128, 32, false, false>(
+        p_regs + ki * 4,
+        uint64_t(desc_b),
+        reinterpret_cast<uint32_t*>(acc_o),
+        true);
+  }
+  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+__device__ __forceinline__ void fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128(
+    float* acc_o, float* ss) {
+  using namespace cute;
+  using Element = cutlass::float_e4m3_t;
+  using ElementAccum = float;
+  using TileShapePV = Shape<_64, _128, _128>;
+  using AtomLayout = Layout<Shape<_1, _1, _1>>;
+  using MmaPV = decltype(GMMA::rs_op_selector<Element, Element, ElementAccum,
+                                              TileShapePV, GMMA::Major::K,
+                                              GMMA::Major::K>());
+  using TiledMmaPV = decltype(make_tiled_mma(MmaPV{}, AtomLayout{}));
+
+  int const tid = static_cast<int>(threadIdx.x) & 127;
+  TiledMmaPV tiled_mma_pv;
+  auto thr_mma = tiled_mma_pv.get_slice(tid);
+  Tensor tOrO_template = partition_fragment_C(tiled_mma_pv, Shape<_64, _128>{});
+  Tensor tAccO = make_tensor(acc_o, tOrO_template.layout());
+  Tensor cO = make_identity_tensor(Shape<_64, _128>{});
+  Tensor tOcO = thr_mma.partition_C(cO);
+  Tensor frag = group_modes<1, 3>(tAccO);
+  Tensor frag_coord = group_modes<1, 3>(tOcO);
+
+#pragma unroll
+  for (int mi = 0; mi < size<1>(frag); ++mi) {
+#pragma unroll
+  for (int x0 = 0; x0 < size<0, 0>(frag); ++x0) {
+#pragma unroll
+  for (int j = 0; j < size<0, 1>(frag); ++j) {
+#pragma unroll
+  for (int x2 = 0; x2 < size<0, 2>(frag); ++x2) {
+    bool const swapped =
+        (x0 == 1 && ((x2 & 1) == 0)) || (x0 == 0 && ((x2 & 1) == 1));
+    if (!swapped) {
+      auto coord = frag_coord(make_coord(x0, j, x2), mi);
+      int const row = int(get<0>(coord));
+      frag(make_coord(x0, j, x2), mi) *= ss[row];
+    }
+  }
+  }
+  }
+  }
+
+#pragma unroll
+  for (int mi = 0; mi < size<1>(frag); ++mi) {
+#pragma unroll
+  for (int j = 0; j < size<0, 1>(frag); ++j) {
+#pragma unroll
+  for (int i = 0; i < size<0, 2>(frag) / 2; ++i) {
+    auto coord_a = frag_coord(make_coord(_1{}, j, 2 * i), mi);
+    auto coord_b = frag_coord(make_coord(_0{}, j, 2 * i + 1), mi);
+    int const row_a = int(get<0>(coord_a));
+    int const row_b = int(get<0>(coord_b));
+    frag(make_coord(_1{}, j, 2 * i), mi) *= ss[row_b];
+    frag(make_coord(_0{}, j, 2 * i + 1), mi) *= ss[row_a];
+  }
+  }
+  }
+}
+__device__ __forceinline__ void fp8_fa3_raw_acc_permute_to_canonical_64x128(
+    float* acc_o) {
+  using namespace cute;
+  using Element = cutlass::float_e4m3_t;
+  using ElementAccum = float;
+  using TileShapePV = Shape<_64, _128, _128>;
+  using AtomLayout = Layout<Shape<_1, _1, _1>>;
+  using MmaPV = decltype(GMMA::rs_op_selector<Element, Element, ElementAccum,
+                                              TileShapePV, GMMA::Major::K,
+                                              GMMA::Major::K>());
+  using TiledMmaPV = decltype(make_tiled_mma(MmaPV{}, AtomLayout{}));
+
+  TiledMmaPV tiled_mma_pv;
+  Tensor tOrO_template = partition_fragment_C(tiled_mma_pv, Shape<_64, _128>{});
+  Tensor tAccO = make_tensor(acc_o, tOrO_template.layout());
+  fp8_gqa_detail::permute_output_fp8(tAccO);
+}
+__device__ __forceinline__ void fp8_fa3_raw_acc_scale_64x128(
+    float* acc_o, float scale) {
+#pragma unroll
+  for (int i = 0; i < 64; ++i) {
+    acc_o[i] *= scale;
+  }
+}
+template <typename FP8T>
 __device__ __forceinline__ void fp8_qk_cute_grouped_fa3_raw_64x224x128(
     FP8T* q_tc_smem, FP8T* k_tc_smem, float* acc_s) {
   using namespace cute;
@@ -468,6 +586,13 @@ __device__ __forceinline__ void fp8_fa3_raw_acc_store_smem_cute_64x128(
   Tensor taccOrO = smem_thr_copy_O.retile_S(tOut);
   Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
   cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+}
+template <typename OutT>
+__device__ __forceinline__ void fp8_fa3_raw_acc_finalize_store_smem_cute_64x128(
+    float* acc_o, float* ls, int flags, float scale, OutT* o_smem) {
+  fp8_fa3_raw_acc_permute_to_canonical_64x128(acc_o);
+  fp8_fa3_raw_acc_scale_64x128(acc_o, scale);
+  fp8_fa3_raw_acc_store_smem_cute_64x128(acc_o, ls, flags, o_smem);
 }
 template <typename OutT>
 __device__ __forceinline__ void fp8_fa3_o_smem_store_global_cute_64x128(

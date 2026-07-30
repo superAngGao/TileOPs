@@ -289,3 +289,39 @@ retained the Round 005 explicit PV accumulator layout.
 Accepted. This is the first structural mainloop improvement in the clean AKO
 ladder. The remaining gap tracks exposed softmax/PV dependency more than QK
 instruction shape.
+
+## Round 009: Direct PV Accumulation With Deferred V Descale
+
+**Hypothesis**
+
+The per-KV-head V descale is constant across all N tiles. Keeping the output
+accumulator in raw PV-WGMMA units, applying online-softmax row rescaling before
+each PV issue, and applying V descale once in the epilogue should be equivalent
+to materializing a second delta accumulator on every tile.
+
+**Action**
+
+- split the synchronous PV helper into an asynchronous direct-accumulate issue;
+- replaced the 64-float per-thread delta accumulator and scalar merge loop with
+  an explicit raw-layout row-rescale helper;
+- deferred the constant V descale to the final output conversion;
+- retained the serial QK -> softmax -> PV wait order for this round.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- no timing fallback accepted;
+- stable GPU4 results:
+
+| Shape | Round 008 | Round 009 | Change | FA3 | Round 009 / FA3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S896 H32/Hkv8 FP16 | 0.038858 ms | 0.039155 ms | +0.8% | 0.028694 ms | 1.365x |
+| S3584 H64/Hkv8 FP16 | 0.733979 ms | 0.722727 ms | -1.5% | 0.528954 ms | 1.366x |
+| S7168 H64/Hkv8 FP16 | 2.757815 ms | 2.719297 ms | -1.4% | 2.036495 ms | 1.335x |
+
+**Decision**
+
+Accepted. The short-row regression is negligible, the long rows improve, and
+the direct accumulator representation removes the extra delta lifetime needed
+by the old synchronous helper. Round 010 may now move the PV wait across the
+next QK issue without changing the arithmetic representation again.
