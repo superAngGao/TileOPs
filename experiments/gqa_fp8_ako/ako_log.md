@@ -3,8 +3,8 @@
 ## Status
 
 - Maximum rounds: 300
-- Selected production candidate: Round 022 vectorized output epilogue
-- Best validated candidate: Round 022 vectorized output epilogue
+- Selected production candidate: Round 042 compressed producer phase state
+- Best validated candidate: Round 042 compressed producer phase state
 - Current structural question: whether the latest TileLang/lowering stack can
   preserve FA3-style grouped QK/PV overlap without fragment-layout conversion,
   register spilling, or conservative scoreboard serialization.
@@ -1314,3 +1314,60 @@ Rejected. The repeated-load cost was real, but a shared counter update per
 tile remains slower than the accepted spilled-register control path. The
 next probe will exploit the stronger four-tile phase-reset invariant rather
 than preserving full counters.
+
+## Round 042: Compress Producer State to One Warm-Up Bit
+
+**Hypothesis**
+
+The public kernel contract requires `seq_len` to be divisible by both 224 and
+128, so `loop_range = seq_len / 224` is a multiple of four. Both K and V
+double-buffer phases therefore reset at every persistent work-item boundary.
+The only cross-work-item producer state is whether the first two V buffers
+have ever been populated.
+
+**Action**
+
+- removed the persistent per-thread K and V phase counters;
+- derived K/V buffer and barrier phases from `n_idx`;
+- retained one shared warm-up bit per producer warp so only the first work
+  item skips the initial V-empty waits;
+- preserved the accepted QK/PV issue order, consumer counters, register
+  partition, output epilogue, and public ABI;
+- compiled every candidate shape from an isolated empty Round 042 cache.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- S3584 local stores fell from `237,072` to `129,024`, close to FA3's
+  `121,178`;
+- S3584 eligible warps per scheduler improved from `0.598` to `0.603`;
+- S3584 tensor-pipe active improved from `39.67%` to `40.33%`;
+- paired GPU1 FP16 comparison against a fresh Round 022 worktree:
+
+| Shape | Round 022 | Round 042 | Change |
+| --- | ---: | ---: | ---: |
+| S896 | `0.034653 ms` | `0.034937 ms` | `+0.82%` |
+| S1792 | `0.109168 ms` | `0.108229 ms` | `-0.86%` |
+| S3584 | `0.665510 ms` | `0.653060 ms` | `-1.87%` |
+| S7168 | `2.557244 ms` | `2.495464 ms` | `-2.42%` |
+
+The isolated candidate/FA3 surface was:
+
+| Shape | Round 042 | FA3 | Round 042 / FA3 |
+| --- | ---: | ---: | ---: |
+| S896 FP16 | `0.034937 ms` | `0.028867 ms` | `1.210x` |
+| S896 BF16 | `0.035024 ms` | `0.028874 ms` | `1.213x` |
+| S1792 FP16 | `0.108229 ms` | `0.087929 ms` | `1.231x` |
+| S1792 BF16 | `0.108107 ms` | `0.088072 ms` | `1.228x` |
+| S3584 FP16 | `0.653060 ms` | `0.538542 ms` | `1.213x` |
+| S3584 BF16 | `0.654170 ms` | `0.537248 ms` | `1.218x` |
+| S7168 FP16 | `2.495464 ms` | `2.046073 ms` | `1.220x` |
+| S7168 BF16 | `2.498358 ms` | `2.049279 ms` | `1.219x` |
+
+**Decision**
+
+Accepted as the new baseline. The sub-1% S896 regression is within the
+predeclared negligible-regression budget, while every longer shape improves
+and the mechanism removes the measured excess producer stores. The remaining
+roughly 21-23% gap to FA3 still requires better consumer issue overlap rather
+than more phase-counter tuning.

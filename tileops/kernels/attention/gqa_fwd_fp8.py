@@ -140,6 +140,9 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                 ss_shared_2 = T.alloc_shared([half_m], accum_dtype)
                 ls_shared_1 = T.alloc_shared([half_m], accum_dtype)
                 ls_shared_2 = T.alloc_shared([half_m], accum_dtype)
+                # Valid sequence lengths make loop_range a multiple of four, so
+                # K/V phases reset per work item; only the initial V warm-up persists.
+                producer_warm_shared = T.alloc_shared([4], "int32")
                 acc_s_1 = T.alloc_fragment([half_m, 224], accum_dtype)
                 acc_o_1 = T.alloc_fragment([half_m, dim], accum_dtype)
                 sm_1 = T.alloc_fragment([half_m], accum_dtype)
@@ -184,9 +187,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         acc_o_2: _make_fa3_pv_acc_fragment(dim, 256),
                     }
                 )
+                T.clear(producer_warm_shared)
                 T.sync_threads()
-                gi_kp = T.alloc_var("int32", init=0)
-                gi_vp = T.alloc_var("int32", init=0)
                 gi_kc1 = T.alloc_var("int32", init=0)
                 gi_vc1 = T.alloc_var("int32", init=0)
                 gi_kc2 = T.alloc_var("int32", init=0)
@@ -204,14 +206,21 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                     ):
                         head_kv = tile_hkv
                         loop_range = T.ceildiv(seq_len, 224)
+                        producer_warm = T.alloc_var(
+                            "int32", init=producer_warm_shared[tx // 32]
+                        )
                         for n_idx in T.Pipelined(loop_range, num_stages=0):
                             if n_idx > 0:
-                                if gi_vp >= 2:
-                                    if gi_vp % 2 == 0:
-                                        T.barrier_wait(v_empty_0, (gi_vp // 2 - 1) % 2)
+                                if producer_warm != 0 or n_idx >= 3:
+                                    if (n_idx - 1) % 2 == 0:
+                                        T.barrier_wait(
+                                            v_empty_0, ((n_idx - 1) // 2 - 1) % 2
+                                        )
                                     else:
-                                        T.barrier_wait(v_empty_1, (gi_vp // 2 - 1) % 2)
-                                if gi_vp % 2 == 0:
+                                        T.barrier_wait(
+                                            v_empty_1, ((n_idx - 1) // 2 - 1) % 2
+                                        )
+                                if (n_idx - 1) % 2 == 0:
                                     if tx == 0:
                                         T.mbarrier_expect_tx(v_raw_full, dim * 224)
                                         v_desc = T.create_tma_descriptor(
@@ -251,7 +260,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                             tile_b,
                                         )
                                     T.barrier_arrive(v_raw_full)
-                                    T.barrier_wait(v_raw_full, gi_vp % 2)
+                                    T.barrier_wait(v_raw_full, (n_idx - 1) % 2)
                                     T.call_extern(
                                         "handle",
                                         v_inplace_transform_helper,
@@ -298,7 +307,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                             tile_b,
                                         )
                                     T.barrier_arrive(v_raw_full)
-                                    T.barrier_wait(v_raw_full, gi_vp % 2)
+                                    T.barrier_wait(v_raw_full, (n_idx - 1) % 2)
                                     T.call_extern(
                                         "handle",
                                         v_inplace_transform_helper,
@@ -306,9 +315,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                         v_vt_smem_1.access_ptr("rw"),
                                     )
                                 T.barrier_arrive(v_full)
-                                gi_vp = gi_vp + 1
-                            T.barrier_wait(k_empty, (gi_kp + 1) % 2)
-                            if gi_kp % 2 == 0:
+                            T.barrier_wait(k_empty, (n_idx + 1) % 2)
+                            if n_idx % 2 == 0:
                                 T.tma_copy(
                                     k[tile_b, n_idx * 224 : (n_idx + 1) * 224, head_kv, :],
                                     k_smem_0,
@@ -321,13 +329,16 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     barrier=k_full,
                                 )
                             T.barrier_arrive(k_full)
-                            gi_kp = gi_kp + 1
-                        if gi_vp >= 2:
-                            if gi_vp % 2 == 0:
-                                T.barrier_wait(v_empty_0, (gi_vp // 2 - 1) % 2)
+                        if producer_warm != 0 or loop_range - 1 >= 2:
+                            if (loop_range - 1) % 2 == 0:
+                                T.barrier_wait(
+                                    v_empty_0, ((loop_range - 1) // 2 - 1) % 2
+                                )
                             else:
-                                T.barrier_wait(v_empty_1, (gi_vp // 2 - 1) % 2)
-                        if gi_vp % 2 == 0:
+                                T.barrier_wait(
+                                    v_empty_1, ((loop_range - 1) // 2 - 1) % 2
+                                )
+                        if (loop_range - 1) % 2 == 0:
                             if tx == 0:
                                 T.mbarrier_expect_tx(v_raw_full, dim * 224)
                                 v_desc_tail = T.create_tma_descriptor(
@@ -367,7 +378,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     tile_b,
                                 )
                             T.barrier_arrive(v_raw_full)
-                            T.barrier_wait(v_raw_full, gi_vp % 2)
+                            T.barrier_wait(v_raw_full, (loop_range - 1) % 2)
                             T.call_extern(
                                 "handle",
                                 v_inplace_transform_helper,
@@ -414,7 +425,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     tile_b,
                                 )
                             T.barrier_arrive(v_raw_full)
-                            T.barrier_wait(v_raw_full, gi_vp % 2)
+                            T.barrier_wait(v_raw_full, (loop_range - 1) % 2)
                             T.call_extern(
                                 "handle",
                                 v_inplace_transform_helper,
@@ -422,7 +433,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 v_vt_smem_1.access_ptr("rw"),
                             )
                         T.barrier_arrive(v_full)
-                        gi_vp = gi_vp + 1
+                        producer_warm_shared[tx // 32] = 1
                 elif tx < 256:
                     T.inc_max_nreg(240)
                     for tile_b, tile_hkv, tile_m, tile_g in T.Persistent(
