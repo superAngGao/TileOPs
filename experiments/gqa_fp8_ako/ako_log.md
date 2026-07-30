@@ -458,3 +458,31 @@ compile time. The current compiler-friendly boundary is therefore explicit
 shared staging for `ss` and `ls`. Subsequent rounds will change scheduling or
 softmax organization rather than remove these copies through raw fragment
 pointers.
+
+## Round 014: Persistent Scheduler Group Size 4
+
+**Hypothesis**
+
+Reducing the persistent scheduler's grouping from eight tiles to four may trade
+some GQA-group locality for better tail-wave balance without changing the
+kernel arithmetic.
+
+**Action**
+
+Changed the producer and both consumer `T.Persistent` loops from
+`group_size=8` to `group_size=4`.
+
+**Gate result**
+
+- lowering completed and produced a cached executable;
+- the first S3584 warmup did not terminate;
+- GPU4 remained at 100% utilization until the experiment container was
+  explicitly stopped.
+
+**Decision**
+
+Rejected as a liveness failure. In this kernel, `group_size` is part of the
+three-warpgroup persistent scheduling and barrier-phase protocol, not an
+independent locality parameter. Future scheduler changes must derive and test
+the producer/consumer tile sequence together rather than sweep this value in
+isolation.
