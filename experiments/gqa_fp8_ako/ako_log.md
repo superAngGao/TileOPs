@@ -759,3 +759,32 @@ bottleneck with a standard CUTE vector-copy primitive and improves every
 measured FP16 shape. The remaining gap to FA3 is approximately 22-26%, so the
 next search should return to mainloop issue efficiency, local-memory traffic,
 and producer/consumer overlap.
+
+## Round 023: Derive K-Producer Phase From Tile Index
+
+**Hypothesis**
+
+The 24-register producer warpgroup appeared to spill its persistent K phase
+counter. Because the kernel contract makes the number of 224-wide K tiles a
+multiple of four, the K buffer and barrier phase can be derived from `n_idx`
+without carrying `gi_kp` across persistent tasks.
+
+**Action**
+
+- removed the producer `gi_kp` scalar;
+- selected the K buffer and empty-barrier phase from `n_idx`;
+- left V production and both consumer warpgroup schedules unchanged.
+
+**Gate result**
+
+- dequantized-reference smoke: `1 passed`;
+- S3584 H64/Hkv8 FP16: `0.661659 ms` versus Round 022 `0.666609 ms`,
+  a `0.7%` improvement; FA3 measured `0.530045 ms`;
+- focused NCU local loads increased from `458752` to `573440`;
+- local stores remained `237072`, and dynamic instructions increased slightly.
+
+**Decision**
+
+Rejected. The small timing movement is not supported by the lowering evidence:
+deriving the phase from `n_idx` causes more local reloads under the constrained
+producer register budget. The accepted implementation remains Round 022.
