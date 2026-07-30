@@ -1457,3 +1457,46 @@ recover the independent-P baseline.
 Rejected at the short-shape gate. Outstanding-PV softmax overlap is not the
 sole source of the regression; the cross-iteration P pipeline itself lowers
 poorly in this form. The accepted implementation remains Round 042.
+
+## Round 046: Rescale the Output Accumulator From the Row Fragment
+
+**Hypothesis**
+
+The softmax row scale already exists as a two-element register fragment per
+thread. Broadcasting those values with warp shuffles should remove the
+register-to-shared-to-register round trip before PV without changing the
+accepted Round 042 schedule.
+
+**Action**
+
+- removed the two 64-element shared scale arrays;
+- removed the two local-to-shared scale copies;
+- added a fragment-layout-aware helper that broadcasts each row scale from
+  the owning lane and applies it directly to the output accumulator;
+- retained Round 042's producer state, WGMMA issue order, barriers, and output
+  epilogue;
+- compiled the candidate from isolated empty caches.
+
+**Gate result**
+
+- official-runner correctness suite: `8 passed`;
+- S896 FP16: `0.033526 ms` versus Round 042 `0.034937 ms`;
+- S896 BF16: `0.033582 ms` versus Round 042 `0.035024 ms`;
+- S3584 FP16: `0.635262 ms` versus Round 042 `0.653060 ms`;
+- S3584 NCU dynamic instructions fell from `202.454 M` to `199.764 M`;
+- S3584 tensor-pipe active rose from `40.33%` to `41.34%`;
+- S1792 FP16 did not complete while holding GPU utilization at 100% for more
+  than three minutes;
+- the S1792 failure reproduced from a second independent empty TileLang cache.
+
+The two archived Round 046 JSONL files are a partial short-shape diagnostic,
+not a completed benchmark surface.
+
+**Decision**
+
+Rejected. The direct row-fragment rescale is a real performance improvement
+on the shapes that complete, but it violates the required S1792/H32 liveness
+contract. The accepted implementation remains Round 042. This round also
+exposed a gate gap: the general correctness suite does not instantiate the
+exact S1792/H32 manifest shape, so subsequent candidates must run a
+manifest-shape completion probe before the formal timing surface.
