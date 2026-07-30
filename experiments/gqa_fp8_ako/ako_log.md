@@ -1500,3 +1500,35 @@ contract. The accepted implementation remains Round 042. This round also
 exposed a gate gap: the general correctness suite does not instantiate the
 exact S1792/H32 manifest shape, so subsequent candidates must run a
 manifest-shape completion probe before the formal timing surface.
+
+## Round 047: Restore a Warpgroup Convergence Point
+
+**Hypothesis**
+
+The removed fragment-to-shared copy may have supplied a warpgroup convergence
+point in addition to moving data. A 128-thread named-barrier sync after online
+softmax should preserve direct row-fragment broadcasting while restoring that
+execution contract.
+
+**Action**
+
+- retained Round 046's direct register-fragment row-scale helper;
+- added a separate 128-thread named-barrier sync for each consumer warpgroup
+  immediately after online softmax;
+- compiled the candidate from an isolated empty cache.
+
+**Gate result**
+
+- S896 FP16 completed at `0.033354 ms`;
+- S1792 FP16 completed at `0.101739 ms`, versus Round 042 `0.108229 ms`;
+- FA3 measured `0.028893 ms` and `0.088064 ms` in the same processes;
+- S3584 FP16 did not complete while holding GPU utilization at 100% for more
+  than three minutes.
+
+**Decision**
+
+Rejected. Restoring a convergence point fixes the H32 liveness failure and
+preserves the performance gain, but applying it unconditionally breaks the H64
+persistent workload. The synchronization requirement is therefore tied to the
+compiled dispatch shape rather than being a universal replacement for the
+shared-memory path.
