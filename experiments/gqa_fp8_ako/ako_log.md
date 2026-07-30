@@ -430,3 +430,31 @@ isolate that interaction.
 Rejected. The compile-time failure follows the local `ss` fragment across the
 extern/helper boundary. Shared staging remains the practical compiler contract
 for this row state in the current TileLang/CUTE integration.
+
+## Round 013: Pass Only the Final Normalization Fragment Directly
+
+**Hypothesis**
+
+The final output-store helper is called once per consumer CTA rather than once
+per K/V tile. Passing only `ls` directly may remove its shared round trip
+without triggering the repeated online-rescale compile behavior from Round 012.
+
+**Action**
+
+- retained the original shared-memory `ss` path;
+- removed only the two `ls_shared` arrays and copies;
+- passed each consumer's `ls` fragment to the final CUTE output-store helper.
+
+**Gate result**
+
+- formatting and lint gates passed;
+- the formal S3584 benchmark remained CPU-bound in compilation and did not
+  produce a runnable kernel within a four-minute hard limit.
+
+**Decision**
+
+Rejected. Both row-state fragment handoffs independently trigger pathological
+compile time. The current compiler-friendly boundary is therefore explicit
+shared staging for `ss` and `ls`. Subsequent rounds will change scheduling or
+softmax organization rather than remove these copies through raw fragment
+pointers.
