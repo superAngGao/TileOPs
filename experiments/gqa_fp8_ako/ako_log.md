@@ -1371,3 +1371,89 @@ predeclared negligible-regression budget, while every longer shape improves
 and the mechanism removes the measured excess producer stores. The remaining
 roughly 21-23% gap to FA3 still requires better consumer issue overlap rather
 than more phase-counter tuning.
+
+## Round 043: Materialize an Independent Register P Fragment
+
+**Hypothesis**
+
+The earlier independent-P probes predated the isolated-cache protocol. Keeping
+the accepted schedule while materializing 28 FP8 P registers per consumer can
+revalidate the representation and liveness boundary before reordering WGMMA.
+
+**Action**
+
+- split score-to-P packing from the RS-WGMMA issue helper;
+- allocated 28 per-thread `uint32` P registers for each consumer;
+- added a typed helper that issues PV directly from those registers;
+- retained the exact Round 042 QK/softmax/PV ordering and barriers.
+
+**Gate result**
+
+- targeted S896 FP16 correctness: `1 passed`;
+- S896 FP16: `0.035043 ms` versus Round 042 `0.034937 ms`;
+- S3584 FP16: `0.656588 ms` versus Round 042 `0.653060 ms`;
+- unlike the old pre-audit probes, S3584 completed without a liveness failure.
+
+**Decision**
+
+Representation gate passed, performance candidate rejected. An independent P
+fragment is viable in the current compiler/runtime, with about 0.3-0.5%
+overhead before any overlap benefit.
+
+## Round 044: True Softmax/PV Overlap With Independent P
+
+**Hypothesis**
+
+With a stable independent P fragment, the FA3-style steady state should expose
+PV latency behind the next softmax:
+`QK(n) -> rescale O -> PV(n-1) -> wait<1> -> softmax(n) -> wait<0> -> pack P(n)`.
+
+**Action**
+
+- handled the first P and final PV separately;
+- issued current QK before previous PV;
+- waited for QK with one WGMMA group left outstanding;
+- ran current softmax while previous PV remained outstanding;
+- waited for PV before overwriting P and releasing V.
+
+**Gate result**
+
+- targeted S896 FP16 correctness: `1 passed`;
+- S896 FP16: `0.040782 ms`;
+- S3584 FP16: `0.838896 ms`;
+- S3584 dynamic instructions and local traffic remained near Round 042;
+- eligible warps per scheduler collapsed from `0.603` to `0.450`;
+- tensor-pipe active fell from `40.33%` to `32.36%`.
+
+**Decision**
+
+Rejected. Generated commit/wait ordering matched the source, but the
+cross-iteration P dependency and outstanding RS-WGMMA interaction created a
+much longer scoreboard stall. This source-level ordering does not reproduce
+FA3's compiler-visible fragment/pipeline contract.
+
+## Round 045: Complete QK/PV Before Softmax
+
+**Hypothesis**
+
+If Round 044's regression is specifically caused by running TileLang softmax
+while RS-WGMMA is outstanding, waiting for both QK and PV before softmax should
+recover the independent-P baseline.
+
+**Action**
+
+- retained QK-then-PV issue order and the cross-iteration P fragment;
+- changed the steady-state wait to `wait_wgmma<0>`;
+- released K/V before running softmax;
+- removed the second post-softmax WGMMA wait.
+
+**Gate result**
+
+- targeted S896 FP16 correctness: `1 passed`;
+- S896 FP16: `0.041489 ms`, slower than Round 044.
+
+**Decision**
+
+Rejected at the short-shape gate. Outstanding-PV softmax overlap is not the
+sole source of the regression; the cross-iteration P pipeline itself lowers
+poorly in this form. The accepted implementation remains Round 042.
