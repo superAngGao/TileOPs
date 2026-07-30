@@ -37,6 +37,29 @@ def _make_fa3_pv_acc_fragment(dim: int, thread_offset: int) -> tilelang.layout.F
     return tilelang.layout.Fragment([64, dim], forward_fn=forward_fn)
 
 
+def _make_fa3_qk_acc_fragment(block_n: int, thread_offset: int) -> tilelang.layout.Fragment:
+    col_phase = block_n // 8
+
+    def forward_fn(i, j):
+        rv = j // 4
+        thread = thread_offset + (i // 16) * 32 + (i % 8) * 4 + (j % 4)
+        index = (rv % col_phase) * 4 + ((i % 16) // 8) * 2 + rv // col_phase
+        return thread, index
+
+    if block_n != 224:
+        raise ValueError("FA3 QK accumulator fragment annotation requires block_n == 224.")
+    return tilelang.layout.Fragment([64, block_n], forward_fn=forward_fn)
+
+
+def _make_fa3_qk_row_fragment(thread_offset: int) -> tilelang.layout.Fragment:
+    def forward_fn(i, rep):
+        thread = thread_offset + (i // 16) * 32 + (i % 8) * 4 + rep
+        index = (i % 16) // 8
+        return thread, index
+
+    return tilelang.layout.Fragment([64], forward_fn=forward_fn, replicate=4)
+
+
 @functools.lru_cache(maxsize=32)
 def _gqa_fwd_fp8_bn224_tma_v_kernel(
     batch: int, heads: int, heads_kv: int, seq_len: int, dim: int, out_dtype: str
@@ -71,6 +94,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
         compile_flags=[
             "-O3",
             "-DENABLE_BF16",
+            "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
             "-include",
             _ANCHOR_HELPER_PATH,
             "-include",
@@ -140,6 +164,20 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                     {
                         q_shared_1: tilelang.layout.make_swizzled_layout(q_shared_1),
                         q_shared_2: tilelang.layout.make_swizzled_layout(q_shared_2),
+                        k_smem_0: tilelang.layout.make_swizzled_layout(k_smem_0),
+                        k_smem_1: tilelang.layout.make_swizzled_layout(k_smem_1),
+                        acc_s_1: _make_fa3_qk_acc_fragment(224, 128),
+                        acc_s_2: _make_fa3_qk_acc_fragment(224, 256),
+                        sm_1: _make_fa3_qk_row_fragment(128),
+                        smp_1: _make_fa3_qk_row_fragment(128),
+                        ss_1: _make_fa3_qk_row_fragment(128),
+                        ssum_1: _make_fa3_qk_row_fragment(128),
+                        ls_1: _make_fa3_qk_row_fragment(128),
+                        sm_2: _make_fa3_qk_row_fragment(256),
+                        smp_2: _make_fa3_qk_row_fragment(256),
+                        ss_2: _make_fa3_qk_row_fragment(256),
+                        ssum_2: _make_fa3_qk_row_fragment(256),
+                        ls_2: _make_fa3_qk_row_fragment(256),
                         acc_o_1: _make_fa3_pv_acc_fragment(dim, 128),
                         acc_o_2: _make_fa3_pv_acc_fragment(dim, 256),
                     }
@@ -409,22 +447,20 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         for _n_idx in T.Pipelined(loop_range, num_stages=0):
                             T.barrier_wait(k_full, gi_kc1 % 2)
                             if gi_kc1 % 2 == 0:
-                                T.wgmma_gemm(
-                                    q_shared_1,
-                                    k_smem_0,
-                                    acc_s_1,
-                                    transpose_B=True,
-                                    policy=T.GemmWarpPolicy.FullRow,
-                                    clear_accum=True,
+                                T.call_extern(
+                                    "handle",
+                                    "tl::fp8_qk_cute_grouped_fa3_raw_64x224x128",
+                                    q_shared_1.access_ptr("r"),
+                                    k_smem_0.access_ptr("r"),
+                                    acc_s_1.data,
                                 )
                             else:
-                                T.wgmma_gemm(
-                                    q_shared_1,
-                                    k_smem_1,
-                                    acc_s_1,
-                                    transpose_B=True,
-                                    policy=T.GemmWarpPolicy.FullRow,
-                                    clear_accum=True,
+                                T.call_extern(
+                                    "handle",
+                                    "tl::fp8_qk_cute_grouped_fa3_raw_64x224x128",
+                                    q_shared_1.access_ptr("r"),
+                                    k_smem_1.access_ptr("r"),
+                                    acc_s_1.data,
                                 )
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(acc_s_1, num_regs=112)
@@ -516,22 +552,20 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         for _n_idx in T.Pipelined(loop_range, num_stages=0):
                             T.barrier_wait(k_full, gi_kc2 % 2)
                             if gi_kc2 % 2 == 0:
-                                T.wgmma_gemm(
-                                    q_shared_2,
-                                    k_smem_0,
-                                    acc_s_2,
-                                    transpose_B=True,
-                                    policy=T.GemmWarpPolicy.FullRow,
-                                    clear_accum=True,
+                                T.call_extern(
+                                    "handle",
+                                    "tl::fp8_qk_cute_grouped_fa3_raw_64x224x128",
+                                    q_shared_2.access_ptr("r"),
+                                    k_smem_0.access_ptr("r"),
+                                    acc_s_2.data,
                                 )
                             else:
-                                T.wgmma_gemm(
-                                    q_shared_2,
-                                    k_smem_1,
-                                    acc_s_2,
-                                    transpose_B=True,
-                                    policy=T.GemmWarpPolicy.FullRow,
-                                    clear_accum=True,
+                                T.call_extern(
+                                    "handle",
+                                    "tl::fp8_qk_cute_grouped_fa3_raw_64x224x128",
+                                    q_shared_2.access_ptr("r"),
+                                    k_smem_1.access_ptr("r"),
+                                    acc_s_2.data,
                                 )
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(acc_s_2, num_regs=112)

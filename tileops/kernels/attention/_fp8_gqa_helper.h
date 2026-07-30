@@ -357,6 +357,47 @@ __device__ __forceinline__ void fp8_pv_ptx_unit_accumulate_fa3_raw_64x128x224(
   }
   }
 }
+template <typename FP8T>
+__device__ __forceinline__ void fp8_qk_cute_grouped_fa3_raw_64x224x128(
+    FP8T* q_tc_smem, FP8T* k_tc_smem, float* acc_s) {
+  using namespace cute;
+  using Element = cutlass::float_e4m3_t;
+  using ElementAccum = float;
+  using TileShapeQK = Shape<_64, Int<224>, _128>;
+  using AtomLayout = Layout<Shape<_1, _1, _1>>;
+  using MmaQK = decltype(GMMA::ss_op_selector<Element, Element, ElementAccum, TileShapeQK>());
+  using TiledMmaQK = decltype(make_tiled_mma(MmaQK{}, AtomLayout{}));
+  using SmemLayoutAtomQ =
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               GMMA::Major::K, Element, _64, _128>());
+  using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, Shape<_64, _128>{}));
+  using SmemLayoutAtomK =
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               GMMA::Major::K, Element, Int<224>, _128>());
+  using SmemLayoutK = decltype(tile_to_shape(
+      SmemLayoutAtomK{}, Shape<Int<224>, _128, _1>{}));
+
+  TiledMmaQK tiled_mma_qk;
+  auto thr_mma = tiled_mma_qk.get_slice(static_cast<int>(threadIdx.x) & 127);
+  Tensor sQ = make_tensor(make_smem_ptr(q_tc_smem), SmemLayoutQ{});
+  Tensor sK = make_tensor(make_smem_ptr(k_tc_smem), SmemLayoutK{});
+  Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
+  Tensor tSrK = thr_mma.partition_fragment_B(sK)(_, _, _, _0{});
+  Tensor tSrS_template = partition_fragment_C(tiled_mma_qk, Shape<_64, Int<224>>{});
+  Tensor tSrS = make_tensor(acc_s, tSrS_template.layout());
+
+  warpgroup_fence_operand(tSrS);
+  warpgroup_arrive();
+  tiled_mma_qk.accumulate_ = GMMA::ScaleOut::Zero;
+
+#pragma unroll
+  for (int ki = 0; ki < size<2>(tSrQ); ++ki) {
+    cute::gemm(tiled_mma_qk, tSrQ(_, _, ki), tSrK(_, _, ki), tSrS);
+    tiled_mma_qk.accumulate_ = GMMA::ScaleOut::One;
+  }
+
+  warpgroup_commit_batch();
+}
 __device__ __forceinline__ void fp8_zero_raw_acc_64(float* acc) {
 #pragma unroll
   for (int i = 0; i < 64; ++i) {

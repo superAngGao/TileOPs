@@ -1,0 +1,31 @@
+{
+  "round": 6,
+  "case": "llama-3.1-70b-prefill-fp8tc-bn224-s3584-float16",
+  "implementation": "fa3",
+  "duration_us": 530.46,
+  "compute_throughput_percent": 50.15,
+  "memory_throughput_percent": 44.40,
+  "tensor_pipe_active_percent": 49.214172,
+  "registers_per_thread": 168,
+  "dynamic_shared_memory_kib": 191.49,
+  "achieved_occupancy_percent": 18.72,
+  "eligible_warps_per_scheduler": 0.65,
+  "no_eligible_percent": 54.27,
+  "local_load_instructions": 456869,
+  "local_store_instructions": 121181,
+  "pc_sampling": {
+    "samples": 48950,
+    "long_scoreboard": 6299,
+    "wait": 11404,
+    "short_scoreboard": 4552,
+    "barrier": 6837,
+    "mio_throttle": 3084,
+    "warpgroup_arrive": 382
+  },
+  "sass_static": {
+    "qgmma_64x224x32": 8,
+    "qgmma_64x128x32": 14,
+    "warpgroup_arrive": 4,
+    "warpgroup_depbar": 4
+  }
+}

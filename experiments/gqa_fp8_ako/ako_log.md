@@ -198,3 +198,94 @@ the dummy seed copies.
 Accepted. The long-sequence change is within measurement noise, while the
 implementation replaces hidden runtime work with an explicit TileLang layout
 contract and improves the short-sequence row.
+
+## Round 006: Same-Contract FA3 NCU Reference
+
+**Hypothesis**
+
+A same-input NCU profile can identify which execution property, rather than
+which source-level feature, separates FA3 from the selected TileOps path.
+
+**Action**
+
+Profiled one warmed FA3 S3584 H64/Hkv8 FP16 call with the same GPU, input
+generator, NVTX boundary, and NCU `--set full` collection.
+
+**Result**
+
+| Metric | TileOps Round 003 | FA3 |
+| --- | ---: | ---: |
+| NCU duration | 802.27 us | 530.46 us |
+| Tensor-pipe active | 32.75% | 49.21% |
+| Compute throughput | 38.06% | 50.15% |
+| Eligible warps / scheduler | 0.55 | 0.65 |
+| Registers / thread | 168 | 168 |
+| Dynamic shared memory | 197.63 KiB | 191.49 KiB |
+
+The static SASS shapes expose the strongest difference: FA3 issues wide
+`QGMMA.64x224x32` QK operations, whereas the selected TileOps path emits QK as
+many `QGMMA.64x32x32` instructions.
+
+**Decision**
+
+Use wide-QK lowering as the next isolated structural target. Register count
+alone is not the explanation because both kernels use 168 registers per
+thread.
+
+## Round 007: Wide QK With An Incomplete Layout Contract
+
+**Hypothesis**
+
+Replacing TileLang's seven n32 QK issues with one CUTE-selected m64n224 group
+should preserve the existing TileLang-visible softmax path.
+
+**Action**
+
+- added a typed CUTE wide-QK helper;
+- annotated Q/K shared memory and the QK accumulator;
+- left the softmax row fragments on inferred layouts.
+
+**Gate result**
+
+Rejected by correctness: the kernel compiled, but output contained non-finite
+values. Generated CUDA showed that `ss` and `ls` materialization had been
+eliminated, leaving the PV and epilogue helpers to read uninitialized shared
+state.
+
+**Decision**
+
+The wide instruction itself was not disproven. The candidate lacked the
+softmax row-fragment portion of the compiler contract.
+
+## Round 008: Wide QK With Complete Row Layouts
+
+**Hypothesis**
+
+Explicit replicated row layouts for `sm`, `smp`, `ss`, `ssum`, and `ls` should
+preserve the TileLang softmax dataflow around the wide QK accumulator.
+
+**Action**
+
+Added a four-way replicated row fragment for both consumer warpgroups and
+retained the Round 005 explicit PV accumulator layout.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- static SASS QK: `112 x m64n32 -> 16 x m64n224`;
+- registers: unchanged at `168` per thread;
+- NCU tensor-pipe active: `32.75% -> 35.96%`;
+- NCU duration: `802.27 us -> 729.95 us`;
+- no CUDA-events fallback accepted.
+
+| Shape | Round 005 | Round 008 | Change | FA3 | Round 008 / FA3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S896 H32/Hkv8 FP16 | 0.041315 ms | 0.038858 ms | -5.9% | 0.028688 ms | 1.354x |
+| S3584 H64/Hkv8 FP16 | 0.802621 ms | 0.733979 ms | -8.6% | 0.529436 ms | 1.386x |
+| S7168 H64/Hkv8 FP16 | 3.040450 ms | 2.757815 ms | -9.3% | 2.039602 ms | 1.352x |
+
+**Decision**
+
+Accepted. This is the first structural mainloop improvement in the clean AKO
+ladder. The remaining gap tracks exposed softmax/PV dependency more than QK
+instruction shape.
