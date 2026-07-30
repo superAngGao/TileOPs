@@ -446,7 +446,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         T.call_extern("handle", "tl::fp8_zero_raw_acc_64", acc_o_1.data)
                         T.clear(ls_1)
                         T.fill(sm_1, -T.infinity(accum_dtype))
-                        for _n_idx in T.Pipelined(loop_range, num_stages=0):
+                        for n_idx in T.Pipelined(loop_range, num_stages=0):
                             T.barrier_wait(k_full, gi_kc1 % 2)
                             if gi_kc1 % 2 == 0:
                                 T.call_extern(
@@ -464,9 +464,18 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     k_smem_1.access_ptr("r"),
                                     acc_s_1.data,
                                 )
+                            if n_idx > 0:
+                                T.wait_wgmma(1)
+                                T.warpgroup_fence_operand(acc_o_1, num_regs=64)
+                                if gi_vc1 % 2 == 0:
+                                    T.barrier_arrive(v_empty_0)
+                                else:
+                                    T.barrier_arrive(v_empty_1)
+                                gi_vc1 = gi_vc1 + 1
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(acc_s_1, num_regs=112)
                             T.barrier_arrive(k_empty)
+                            gi_kc1 = gi_kc1 + 1
                             online_softmax_1(
                                 acc_s_1,
                                 sm_1,
@@ -501,14 +510,13 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     v_tc_smem_1.access_ptr("r"),
                                     acc_o_1.data,
                                 )
-                            T.wait_wgmma(0)
-                            T.warpgroup_fence_operand(acc_o_1, num_regs=64)
-                            if gi_vc1 % 2 == 0:
-                                T.barrier_arrive(v_empty_0)
-                            else:
-                                T.barrier_arrive(v_empty_1)
-                            gi_vc1 = gi_vc1 + 1
-                            gi_kc1 = gi_kc1 + 1
+                        T.wait_wgmma(0)
+                        T.warpgroup_fence_operand(acc_o_1, num_regs=64)
+                        if gi_vc1 % 2 == 0:
+                            T.barrier_arrive(v_empty_0)
+                        else:
+                            T.barrier_arrive(v_empty_1)
+                        gi_vc1 = gi_vc1 + 1
                         T.copy(ls_1, ls_shared_1)
                         T.call_extern(
                             "handle",
@@ -554,7 +562,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         T.call_extern("handle", "tl::fp8_zero_raw_acc_64", acc_o_2.data)
                         T.clear(ls_2)
                         T.fill(sm_2, -T.infinity(accum_dtype))
-                        for _n_idx in T.Pipelined(loop_range, num_stages=0):
+                        for n_idx in T.Pipelined(loop_range, num_stages=0):
                             T.barrier_wait(k_full, gi_kc2 % 2)
                             if gi_kc2 % 2 == 0:
                                 T.call_extern(
@@ -572,9 +580,18 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     k_smem_1.access_ptr("r"),
                                     acc_s_2.data,
                                 )
+                            if n_idx > 0:
+                                T.wait_wgmma(1)
+                                T.warpgroup_fence_operand(acc_o_2, num_regs=64)
+                                if gi_vc2 % 2 == 0:
+                                    T.barrier_arrive(v_empty_0)
+                                else:
+                                    T.barrier_arrive(v_empty_1)
+                                gi_vc2 = gi_vc2 + 1
                             T.wait_wgmma(0)
                             T.warpgroup_fence_operand(acc_s_2, num_regs=112)
                             T.barrier_arrive(k_empty)
+                            gi_kc2 = gi_kc2 + 1
                             online_softmax_2(
                                 acc_s_2,
                                 sm_2,
@@ -609,14 +626,13 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                     v_tc_smem_1.access_ptr("r"),
                                     acc_o_2.data,
                                 )
-                            T.wait_wgmma(0)
-                            T.warpgroup_fence_operand(acc_o_2, num_regs=64)
-                            if gi_vc2 % 2 == 0:
-                                T.barrier_arrive(v_empty_0)
-                            else:
-                                T.barrier_arrive(v_empty_1)
-                            gi_vc2 = gi_vc2 + 1
-                            gi_kc2 = gi_kc2 + 1
+                        T.wait_wgmma(0)
+                        T.warpgroup_fence_operand(acc_o_2, num_regs=64)
+                        if gi_vc2 % 2 == 0:
+                            T.barrier_arrive(v_empty_0)
+                        else:
+                            T.barrier_arrive(v_empty_1)
+                        gi_vc2 = gi_vc2 + 1
                         T.copy(ls_2, ls_shared_2)
                         T.call_extern(
                             "handle",

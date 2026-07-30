@@ -325,3 +325,51 @@ Accepted. The short-row regression is negligible, the long rows improve, and
 the direct accumulator representation removes the extra delta lifetime needed
 by the old synchronous helper. Round 010 may now move the PV wait across the
 next QK issue without changing the arithmetic representation again.
+
+## Round 010: QK(n) / PV(n-1) WGMMA Overlap
+
+**Hypothesis**
+
+After Round 009, the previous PV writes only `acc_o` while the next QK writes
+only `acc_s`. Issuing both groups before `wait_group<1>` should overlap Tensor
+Core work without changing softmax order or adding another accumulator.
+
+**Action**
+
+- issued `QK(n)` while `PV(n-1)` remained outstanding;
+- used `wait_group<1>` to retire the previous PV before reading/rescaling
+  `acc_o`;
+- used `wait_group<0>` before consuming the current QK scores;
+- delayed each V-buffer release by one loop iteration while preserving the
+  existing double-buffer phases.
+
+**Gate result**
+
+- official-runner correctness: `8 passed`;
+- no timing fallback accepted;
+
+| Shape | Round 009 | Round 010 | Change | FA3 | Round 010 / FA3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S896 H32/Hkv8 FP16 | 0.039155 ms | 0.038082 ms | -2.7% | 0.028710 ms | 1.326x |
+| S3584 H64/Hkv8 FP16 | 0.722727 ms | 0.703467 ms | -2.7% | 0.536064 ms | 1.312x |
+| S7168 H64/Hkv8 FP16 | 2.719297 ms | 2.656325 ms | -2.3% | 2.040118 ms | 1.302x |
+
+S3584 NCU:
+
+| Metric | Round 008 | Round 010 |
+| --- | ---: | ---: |
+| Duration | 729.95 us | 701.82 us |
+| Tensor-pipe active | 35.96% | 37.28% |
+| Eligible warps / scheduler | 0.56 | 0.58 |
+| Registers / thread | 168 | 168 |
+| Static `WARPGROUP.ARRIVE` | 12 | 8 |
+| Static `WARPGROUP.DEPBAR` | 6 | 6 |
+| Local load instructions | 229376 | 458752 |
+| Local store instructions | 121856 | 237072 |
+
+**Decision**
+
+Accepted. The intended QK/PV overlap survives lowering and improves every
+representative shape. The remaining local-memory traffic shows that fragment
+state still escapes across the helper boundary; reducing that spill/lifetime
+cost is now more promising than adding another pipeline stage.
