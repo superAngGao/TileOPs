@@ -3,11 +3,13 @@
 ## Status
 
 - Maximum rounds: 300
-- Selected production candidate: current main baseline
-- Best validated candidate: current main baseline
+- Selected production candidate: Round 022 vectorized output epilogue
+- Best validated candidate: Round 022 vectorized output epilogue
 - Current structural question: whether the latest TileLang/lowering stack can
   preserve FA3-style grouped QK/PV overlap without fragment-layout conversion,
   register spilling, or conservative scoreboard serialization.
+- Compiler-artifact rule: every candidate is compiled with a unique empty
+  TileLang cache. Shared-cache results are not accepted for helper-only edits.
 
 ## Round 000: Contract Freeze
 
@@ -942,8 +944,10 @@ pack permutations without changing the accumulator index map.
 **Gate result**
 
 - S896 dequantized-reference smoke: `1 passed`;
-- the S3584 kernel failed the liveness gate: it remained resident at full GPU
-  utilization for more than three minutes without producing output;
+- a fresh-cache S896 profile measured `36.51 us` versus `34.11 us` for the
+  fresh Round 022 baseline, with identical `PRMT` and `F2FP` counts;
+- a fresh-cache S3584 run failed the liveness gate: it remained resident at
+  full GPU utilization for more than three minutes without producing output;
 - the named container was stopped and the source was restored exactly to
   Round 022.
 
@@ -976,15 +980,51 @@ allowing the second FP8x2 conversion to merge into the same 32-bit P operand.
 **Gate result**
 
 - S896 dequantized-reference smoke: `1 passed`;
-- the S3584 kernel again remained resident at full GPU utilization without
-  producing output and was stopped after more than two minutes;
+- a fresh-cache S896 profile measured `36.74 us` versus `34.11 us` for the
+  fresh Round 022 baseline;
+- the fresh artifact retained the same `412,160` PRMT and `458,752` F2FP
+  instructions as Round 022, so the intended merge lowering did not occur;
+- the earlier shared-cache S3584 liveness observation is excluded from the
+  decision because the compiler artifact was not trustworthy;
 - the source was restored exactly to Round 022.
 
 **Decision**
 
-Rejected. Removing C++ container temporaries does not resolve the long-loop
-liveness failure. The current asynchronous mainloop is sensitive to the
-lowering of the P operand construction itself. The 6.42 M-instruction
-opportunity remains valid, but exploiting it requires first establishing a
-scoreboard/barrier protocol that is robust to compiler scheduling changes.
-The accepted implementation remains Round 022.
+Rejected. The inline rewrite did not reproduce FA3's merged conversion
+lowering and regressed the fresh-cache S896 kernel by 7.7%. The accepted
+implementation remains Round 022.
+
+## Round 032: Compiler Cache-Key Audit
+
+**Hypothesis**
+
+Helper-only edits may not participate in the generated-kernel cache key. A
+fresh compiler-artifact comparison is required before interpreting the
+Round 028/029 profiles.
+
+**Action**
+
+- created a unique empty `/ci-cache/tilelang` mount for each candidate;
+- rebuilt and profiled Round 022, Round 028, and Round 029 at S896;
+- reran the Round 028 S3584 liveness gate with a fresh cache;
+- compared duration, executed instructions, scheduler state, PRMT, and F2FP.
+
+**Gate result**
+
+| Candidate | Duration | Instructions | No eligible | PRMT | F2FP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Round 022 | 34.11 us | 7,068,440 | 64.71% | 412,160 | 458,752 |
+| Round 028 | 36.51 us | 7,064,890 | 66.58% | 412,160 | 458,752 |
+| Round 029 | 36.74 us | 7,079,181 | 66.60% | 412,160 | 458,752 |
+
+The old shared-cache profile measured 38.30 us and 469,504 PRMT instructions;
+it was not the fresh Round 022 artifact.
+
+**Decision**
+
+Protocol correction accepted. Unique empty TileLang caches are mandatory for
+all subsequent candidate compiles. Round 028 remains rejected on both
+performance and fresh-cache liveness evidence. Round 029 is rejected on
+fresh-cache lowering and performance evidence, without relying on its earlier
+shared-cache long-shape observation. Full details are recorded in
+`results/round032/round032_cache_audit.md`.
