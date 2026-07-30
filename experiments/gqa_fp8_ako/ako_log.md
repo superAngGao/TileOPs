@@ -1599,3 +1599,31 @@ single-shape kernel, but removing the shared-scale exchange still violates the
 repeated-launch liveness contract. This confirms that the accepted shared
 path is a data-publication protocol, not merely an avoidable storage round
 trip.
+
+## Round 050: Publish Only Unique Row-Scale Owners
+
+**Hypothesis**
+
+The replicated row fragment maps each scale to four lanes. Publishing only
+the eight owner lanes per warp, two rows per owner, should preserve the shared
+visibility protocol with fewer stores than generic `T.copy`.
+
+**Action**
+
+- added a layout-specific row-fragment publisher;
+- emitted 64 unique shared stores per consumer warpgroup;
+- synchronized the 128-thread consumer warpgroup after publication;
+- retained the accepted shared-memory rescale helper.
+
+**Gate result**
+
+- S1792 FP16 completed under the formal repeated timing contract;
+- TileOps measured `0.111565 ms`;
+- FA3 measured `0.087977 ms`;
+- Round 042 measured `0.108229 ms`.
+
+**Decision**
+
+Rejected. Unique-owner stores preserve liveness, but a full 128-thread barrier
+is more synchronization than this warp-local row mapping requires and causes
+a 3.1% regression versus Round 042.
