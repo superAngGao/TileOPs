@@ -1918,3 +1918,39 @@ costs more than the store overlap recovers. The regression grows with the
 longer H64 workload. Round 042 remains the accepted implementation; a useful
 epilogue improvement must avoid both manual global-store pressure and a second
 full output stage per consumer.
+
+## Round 060: Single-Buffer Delayed TMA Output Store
+
+**Hypothesis**
+
+An output stage is not overwritten until the next persistent work item's
+epilogue. A single asynchronous TMA stage can therefore overlap its store with
+the next work item's full QK, softmax, and PV mainloop, then wait immediately
+before the shared buffer is reused. This keeps Round 042's shared-memory
+footprint and removes Round 059's second output stage.
+
+**Action**
+
+- retained one 64x128 output stage per consumer warpgroup;
+- issued output through TileLang `T.tma_copy`;
+- delayed `T.tma_store_wait(0)` until the next epilogue, followed by a
+  warpgroup barrier before the shared stage is overwritten;
+- drained the final store after the persistent loop;
+- preserved the accepted mainloop, accumulator-to-shared helper, producer
+  protocol, public ABI, and correctness contract.
+
+**Gate result**
+
+- targeted dequantized-reference correctness: `1 passed`;
+- S896 FP16: `0.034808 ms`, versus Round 042 `0.034937 ms` (`-0.37%`);
+- S1792 FP16: `0.109858 ms`, versus Round 042 `0.108229 ms` (`+1.51%`);
+- S3584 FP16: `0.668100 ms`, versus Round 042 `0.653060 ms` (`+2.30%`);
+- FA3 measured `0.028990 / 0.087277 / 0.534909 ms`, respectively.
+
+**Decision**
+
+Rejected. Removing the second output stage recovers the short-shape cost but
+does not recover the medium and long shapes. TMA launch/descriptor work and
+the shared-stage reuse synchronization remain more expensive than the overlap
+they expose. Rounds 058-060 close this local TMA-epilogue family in its current
+form; Round 042 remains the accepted implementation.
