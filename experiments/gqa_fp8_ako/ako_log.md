@@ -1655,3 +1655,39 @@ Rejected. Warp-local publication is stable but still 2.5% slower than the
 generic TileLang fragment-to-shared copy. The accepted `T.copy` already lowers
 this replicated row layout more efficiently than the hand-specialized
 publisher.
+
+## Round 052: Reinterpret QK Accumulators as PV A Registers
+
+**Hypothesis**
+
+The accepted P conversion explicitly permutes each eight-value group before
+packing FP32 probabilities to E4M3. FA3 instead reinterprets the QK
+accumulator fragment with the PV A-register layout and applies a vectorized
+numeric conversion. Mirroring that layout conversion could remove roughly
+6.3 million dynamic `PRMT` instructions at S3584.
+
+**Action**
+
+- reconstructed the QK accumulator fragment layout with CUTE;
+- applied the FA3-style accumulator-to-A-register layout reinterpretation;
+- converted four FP32 values at a time with CUTLASS
+  `NumericArrayConverter`;
+- kept the accepted synchronous P lifetime and all existing pipeline
+  barriers;
+- compiled and tested from isolated empty TileLang caches.
+
+**Gate result**
+
+- targeted S896 dequantized-reference correctness: `1 passed`;
+- S896 FP16: `0.035893 ms`, versus Round 042 `0.034937 ms`;
+- FA3 in the same process: `0.028981 ms`;
+- formal S1792 FP16 timed out after 180 seconds under
+  `warmup=5, repeat=20, trials=3`.
+
+**Decision**
+
+Rejected. The layout reinterpretation is numerically correct, but it regresses
+the short shape by 2.7% and violates the repeated-launch liveness gate at
+S1792. A source-level match to FA3's conversion utility is not sufficient
+inside TileOps' current synchronous P/PV schedule. The accepted implementation
+remains Round 042.
