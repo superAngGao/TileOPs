@@ -7,10 +7,7 @@ import tilelang.language as T
 import torch
 
 from tileops.kernels.kernel_base import Kernel
-from tileops.kernels.online_softmax import (
-    make_log2e_scale,
-    make_online_softmax_with_score_scale,
-)
+from tileops.kernels.online_softmax import make_log2e_scale
 
 __all__ = ["GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel"]
 NUM_SMS = int(os.environ.get("V2P_NUM_SMS", "132"))
@@ -85,6 +82,37 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
     fp8_dtype = "float8_e4m3fn"
     scale = make_log2e_scale(dim)
 
+    @T.macro
+    def online_softmax_with_partial_sum(
+        acc_s,
+        scores_max,
+        scores_max_prev,
+        scores_scale,
+        scores_sum,
+        logsum,
+        score_scale,
+    ):
+        score_scale_softmax = score_scale * scale
+        T.copy(scores_max, scores_max_prev)
+        T.fill(scores_max, -T.infinity(accum_dtype))
+        T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+        for i in T.Parallel(half_m):
+            scores_max[i] *= score_scale
+        for i in T.Parallel(half_m):
+            scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+        for i, j in T.Parallel(half_m, 224):
+            acc_s[i, j] = T.exp2(acc_s[i, j] * score_scale_softmax - scores_max[i] * scale)
+        # Accumulate lane-local row sums here; the quad reduction is deferred
+        # until finalization instead of running once per K/V tile.
+        T.call_extern(
+            "handle",
+            "tl::fp8_partial_row_sum_raw_acc_64x224",
+            acc_s.data,
+            scores_sum.data,
+        )
+        for i in T.Parallel(half_m):
+            logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+
     @tilelang.jit(
         out_idx=[6, 7],
         pass_configs={
@@ -105,8 +133,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
         q_shape = (batch, seq_len, heads, dim)
         kv_shape = (batch, seq_len, heads_kv, dim)
         descale_shape = (batch, heads_kv)
-        online_softmax_1 = make_online_softmax_with_score_scale(scale, accum_dtype, half_m, 224)
-        online_softmax_2 = make_online_softmax_with_score_scale(scale, accum_dtype, half_m, 224)
+        online_softmax_1 = online_softmax_with_partial_sum
+        online_softmax_2 = online_softmax_with_partial_sum
         pv_begin_accumulate_helper = (
             "tl::fp8_pv_ptx_unit_begin_accumulate_fa3_raw_64x128x224"
         )
@@ -434,6 +462,12 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                             )
                         T.barrier_arrive(v_full)
                         producer_warm_shared[tx // 32] = 1
+                        # The faster deferred-sum consumer needs an explicit
+                        # persistent work-item handoff for the 8-query-head
+                        # group path.  Four-group H32 workloads remain on the
+                        # lower-overhead mbarrier-only protocol.
+                        if groups == 8:
+                            T.sync_threads(barrier_id=5, arrive_count=384)
                 elif tx < 256:
                     T.inc_max_nreg(240)
                     for tile_b, tile_hkv, tile_m, tile_g in T.Persistent(
@@ -504,6 +538,11 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 qk_descale,
                             )
                             T.copy(ss_1, ss_shared_1)
+                            # The row-scale fragment is compacted through one
+                            # lane per quad before the full consumer warpgroup
+                            # reads it while rescaling the PV accumulator.
+                            if groups == 8:
+                                T.sync_threads(barrier_id=6, arrive_count=128)
                             T.call_extern(
                                 "handle",
                                 "tl::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
@@ -534,6 +573,11 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         else:
                             T.barrier_arrive(v_empty_1)
                         gi_vc1 = gi_vc1 + 1
+                        # Match FA3's reduction schedule: combine the four lane
+                        # partials once after all K/V tiles have been consumed.
+                        for i in T.Parallel(half_m):
+                            ls_1[i] = ls_1[i] + T.shfl_xor(ls_1[i], 1)
+                            ls_1[i] = ls_1[i] + T.shfl_xor(ls_1[i], 2)
                         T.copy(ls_1, ls_shared_1)
                         T.call_extern(
                             "handle",
@@ -556,6 +600,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         for i in T.Parallel(half_m):
                             ls_1[i] = T.log2(ls_1[i]) + sm_1[i] * scale
                         T.copy(ls_1, lse[tile_b, tile_h, row_base : row_base + half_m])
+                        if groups == 8:
+                            T.sync_threads(barrier_id=5, arrive_count=384)
                 else:
                     T.inc_max_nreg(240)
                     for tile_b, tile_hkv, tile_m, tile_g in T.Persistent(
@@ -626,6 +672,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 qk_descale,
                             )
                             T.copy(ss_2, ss_shared_2)
+                            if groups == 8:
+                                T.sync_threads(barrier_id=7, arrive_count=128)
                             T.call_extern(
                                 "handle",
                                 "tl::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
@@ -656,6 +704,11 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         else:
                             T.barrier_arrive(v_empty_1)
                         gi_vc2 = gi_vc2 + 1
+                        # Match FA3's reduction schedule: combine the four lane
+                        # partials once after all K/V tiles have been consumed.
+                        for i in T.Parallel(half_m):
+                            ls_2[i] = ls_2[i] + T.shfl_xor(ls_2[i], 1)
+                            ls_2[i] = ls_2[i] + T.shfl_xor(ls_2[i], 2)
                         T.copy(ls_2, ls_shared_2)
                         T.call_extern(
                             "handle",
@@ -678,6 +731,8 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         for i in T.Parallel(half_m):
                             ls_2[i] = T.log2(ls_2[i]) + sm_2[i] * scale
                         T.copy(ls_2, lse[tile_b, tile_h, row_base + half_m : row_base + block_m])
+                        if groups == 8:
+                            T.sync_threads(barrier_id=5, arrive_count=384)
 
         return main
 

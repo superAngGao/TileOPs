@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -200,6 +202,10 @@ def test_gqa_prefill_fp8_tensor_core_matches_dequantized_reference() -> None:
         k_scale=k_descale,
         v_scale=v_descale,
     )
+    direct_kernel = GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel(
+        batch, heads, heads_kv, seq_len, dim, torch.float16
+    )
+    direct_out, lse = direct_kernel(q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale)
 
     q_deq = q_fp8.float().reshape(batch, seq_len, heads_kv, group_size, dim)
     q_deq = (q_deq * q_descale[:, None, :, None, None]).reshape(batch, seq_len, heads, dim)
@@ -208,6 +214,7 @@ def test_gqa_prefill_fp8_tensor_core_matches_dequantized_reference() -> None:
 
     scale = dim**-0.5
     ref_heads = []
+    ref_lse_heads = []
     for head in range(heads):
         head_kv = head // group_size
         scores = (
@@ -219,7 +226,13 @@ def test_gqa_prefill_fp8_tensor_core_matches_dequantized_reference() -> None:
         )
         probs = torch.softmax(scores, dim=-1)
         ref_heads.append(torch.matmul(probs, v_deq[0, :, head_kv, :]))
+        # TileOps attention kernels keep LSE in the log2 domain so backward
+        # can reconstruct probabilities with exp2(score_log2 - lse_log2).
+        ref_lse_heads.append(torch.logsumexp(scores, dim=-1) * math.log2(math.e))
     ref = torch.stack(ref_heads, dim=1).unsqueeze(0)
+    ref_lse = torch.stack(ref_lse_heads, dim=0).unsqueeze(0)
 
     torch.testing.assert_close(
         out.reshape(batch, seq_len, heads, dim).float(), ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(direct_out.float(), ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse.float(), ref_lse, atol=5e-2, rtol=5e-2)

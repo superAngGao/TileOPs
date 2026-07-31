@@ -234,6 +234,18 @@ __device__ __forceinline__ void fp8_acc_to_fa3_p_regs_64x224_no_cute(
     p_regs[r] = fp8_pack4_fa3_p_bytes(acc_s, r * 4);
   }
 }
+__device__ __forceinline__ void fp8_partial_row_sum_raw_acc_64x224(
+    float* acc_s, float* row_sum) {
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int rv = 0; rv < 56; ++rv) {
+      sum += acc_s[((rv % 28) * 4) + (i * 2) + (rv / 28)];
+    }
+    row_sum[i] = sum;
+  }
+}
 __device__ __forceinline__ void fp8_producer_barrier_128() {
   asm volatile("bar.sync 15, 128;\n" ::: "memory");
 }
