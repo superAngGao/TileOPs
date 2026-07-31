@@ -1844,3 +1844,39 @@ Rejected. Explicit producer phase counters do not fix the H64 repeated-launch
 failure. The remaining issue is tied to cross-launch or repeated-work
 lifetime in the direct row-fragment rescale path, rather than Round 042's
 producer phase-state compression.
+
+## Round 058: Replace the Manual Output Copy With a Synchronous TMA Store
+
+**Hypothesis**
+
+The accepted epilogue uses consumer threads to copy every output element from
+shared memory to global memory. FA3 instead offloads the output tile to TMA.
+Annotating the existing 64x128 output buffers with their 128-byte swizzle and
+using a TileLang shared-to-global copy should remove ordinary global-store
+instructions and free consumer issue slots.
+
+**Action**
+
+- annotated both output shared buffers with TileLang swizzled layouts;
+- replaced the custom CUTE shared-to-global copy helper with
+  `T.copy(o_shared, output_slice)`;
+- preserved the accumulator-to-shared helper, proxy fence, warpgroup
+  convergence, mainloop, and producer protocol;
+- confirmed that lowering emitted two `tl::tma_store` operations followed by
+  `tma_store_arrive` and `tma_store_wait<0, true>` per output half.
+
+**Gate result**
+
+- targeted dequantized-reference correctness: `1 passed`;
+- S896 FP16: `0.034459 ms`, versus Round 042 `0.034937 ms`;
+- S1792 FP16: `0.110542 ms`, versus Round 042 `0.108229 ms`;
+- S3584 FP16: `0.672367 ms`, versus Round 042 `0.653060 ms`;
+- FA3 measured `0.028922 / 0.087947 / 0.534826 ms`, respectively.
+
+**Decision**
+
+Rejected. TMA output storage is valid and slightly helps the shortest shape,
+but synchronously draining every store group serializes the persistent
+epilogue and regresses the medium and long shapes by 2.1-3.0%. The useful
+direction is an explicitly pipelined TileLang TMA store with multiple output
+stages and delayed waits, not a synchronous `T.copy` substitution.
