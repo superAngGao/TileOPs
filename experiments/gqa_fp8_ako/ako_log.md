@@ -2039,3 +2039,79 @@ Rejected at the first performance gate. The equivalent representation reduces
 source-level arithmetic but lengthens the scalar softmax dependency chain
 enough to regress the short shape. The source was restored exactly to Round
 061; no medium or long benchmark was run.
+
+## Round 069: Defer the Row-Sum Quad Reduction
+
+**Hypothesis**
+
+The accepted online softmax performs a quad-wide shuffle reduction for every
+row after every K/V tile. FA3 keeps lane-local partial sums through the tile
+loop and combines them only at finalization. Matching that reduction schedule
+should remove repeated shuffle and add instructions without changing the QK,
+PV, or output contracts.
+
+**Action**
+
+- added a fragment-aware helper that computes lane-local row sums directly
+  from the raw 64x224 accumulator layout;
+- carried those partial sums through the online-softmax update and deferred
+  the quad reduction to finalization;
+- expressed the final reduction with TileLang `T.shfl_xor` primitives;
+- for the eight-query-head group path, published each compact shared row-scale
+  fragment before the 128-thread accumulator-rescale convergence point and
+  added a CTA-wide persistent work-item handoff;
+- retained the lower-overhead mbarrier-only protocol for four-query-head group
+  workloads;
+- extended correctness coverage to the direct kernel output and its log2-domain
+  LSE result.
+
+Two synchronization probes established the H64 placement requirement. The
+initial deferred-sum implementation exposed a repeated-launch liveness failure.
+Placing the 128-thread barriers after accumulator rescale still hung S7168 on
+an otherwise exclusive GPU. Moving each barrier immediately after publication
+of the shared row-scale fragment, before any consumer reads it during rescale,
+made repeated H64 launches stable. These probes are implementation diagnostics,
+not separate accepted performance rows.
+
+**Gate result**
+
+- official-runner correctness suite: `8 passed`;
+- every formal benchmark used CUPTI timing, warmup 5, repeat 20, three trials,
+  L2 flush, an isolated TileLang cache, and an exclusive H200 GPU at 1500 MHz;
+
+| Shape | Round 061 | Round 069 | Change | FA3 | R069 / FA3 throughput |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S896 FP16 | `0.033290 ms` | `0.031363 ms` | `-5.79%` | `0.028661 ms` | `91.38%` |
+| S896 BF16 | `0.033224 ms` | `0.031382 ms` | `-5.54%` | `0.028699 ms` | `91.45%` |
+| S1792 FP16 | `0.105113 ms` | `0.096519 ms` | `-8.18%` | `0.086423 ms` | `89.54%` |
+| S1792 BF16 | `0.104880 ms` | `0.096558 ms` | `-7.93%` | `0.086646 ms` | `89.73%` |
+| S3584 FP16 | `0.643138 ms` | `0.603528 ms` | `-6.16%` | `0.534039 ms` | `88.49%` |
+| S3584 BF16 | `0.643498 ms` | `0.602955 ms` | `-6.30%` | `0.534105 ms` | `88.58%` |
+| S7168 FP16 | `2.446207 ms` | `2.290201 ms` | `-6.38%` | `2.042253 ms` | `89.17%` |
+| S7168 BF16 | `2.447639 ms` | `2.291485 ms` | `-6.38%` | `2.035827 ms` | `88.84%` |
+
+The focused S3584 NCU comparison confirms the intended mechanism:
+
+| Metric | Round 061 | Round 069 | FA3 |
+| --- | ---: | ---: | ---: |
+| profiled duration | `644.704 us` | `602.208 us` | `537.89 us` |
+| executed instructions | `200.18 M` | `198.72 M` | `183.21 M` |
+| SHFL instructions | `2,425,952` | `1,565,792` | `1,481,056` |
+| FADD instructions | `26,607,616` | `25,747,456` | `25,718,784` |
+| PRMT instructions | `13,103,104` | `13,103,104` | `6,422,528` |
+| long-scoreboard samples | `9,996` | `6,589` | `6,354` |
+| MIO-throttle samples | `4,582` | `4,102` | `3,027` |
+| eligible warps / scheduler | `0.609` | `0.617` | `0.65` |
+
+Generated H32 kernels contain none of the H64 handoff or row-scale barriers.
+Generated H64 kernels contain the expected three CTA handoff sites and one
+128-thread row-scale publication site per consumer warpgroup. The repeated
+per-tile row-sum shuffles are absent; only the final TileLang reductions remain.
+
+**Decision**
+
+Accepted as the new baseline. Deferring the quad reduction closes most of the
+measured SHFL/FADD and long-scoreboard gap to FA3 while improving every owned
+shape and dtype. The remaining S3584 instruction gap is now dominated by PRMT
+packing work and smaller MIO/wait differences, which defines the next search
+direction.
