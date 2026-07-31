@@ -2007,3 +2007,35 @@ no new low-level helper and no synchronization change. It improves every
 manifest-owned shape and dtype, removes the measured redundant global-load
 traffic, and raises TileOps to about 83-87% of FA3 throughput on the current
 surface.
+
+## Round 062: Keep Online-Softmax State in the Log2 Domain
+
+**Hypothesis**
+
+The accepted online softmax stores each running maximum in the scaled-logit
+domain and repeatedly applies the fixed `log2(e) / sqrt(d)` factor. Storing
+the running maximum directly in the log2 domain should remove repeated
+multiplications while preserving the mathematical update.
+
+**Action**
+
+- specialized the FP8 online-softmax macro to consume
+  `q_descale * k_descale * log2(e) / sqrt(d)`;
+- stored the running maximum in the log2 domain;
+- removed the fixed-scale multiplications from the rescale and final-LSE
+  expressions;
+- preserved the accepted WGMMA, barrier, fragment, producer, and output
+  protocols.
+
+**Gate result**
+
+- targeted dequantized-reference correctness: `1 passed`;
+- S896 FP16: `0.036138 ms`, versus Round 061 `0.033290 ms` (`+8.55%`);
+- FA3 measured `0.028901 ms` in the same process.
+
+**Decision**
+
+Rejected at the first performance gate. The equivalent representation reduces
+source-level arithmetic but lengthens the scalar softmax dependency chain
+enough to regress the short shape. The source was restored exactly to Round
+061; no medium or long benchmark was run.
