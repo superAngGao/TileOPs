@@ -1880,3 +1880,41 @@ but synchronously draining every store group serializes the persistent
 epilogue and regresses the medium and long shapes by 2.1-3.0%. The useful
 direction is an explicitly pipelined TileLang TMA store with multiple output
 stages and delayed waits, not a synchronous `T.copy` substitution.
+
+## Round 059: Double-Buffer Asynchronous TMA Output Stores
+
+**Hypothesis**
+
+The synchronous Round 058 store drains every TMA group before the next
+persistent work item. Two output staging buffers per consumer warpgroup should
+allow the current output store to overlap the next work item's QK, softmax, and
+PV work, while waiting only before a shared stage is reused.
+
+**Action**
+
+- allocated two 64x128 output stages for each consumer warpgroup;
+- replaced synchronous `T.copy` output stores with TileLang `T.tma_copy`;
+- used `T.tma_store_wait(1)` before reusing a stage and
+  `T.tma_store_wait(0)` after the persistent loop;
+- retained the accepted accumulator-to-shared helper, QK/PV mainloop,
+  producer protocol, public ABI, and correctness contract;
+- verified lowering emits two output TMA stores per half, delayed
+  `wait_group 1`, and one final `wait_group 0`.
+
+**Gate result**
+
+- targeted dequantized-reference correctness: `1 passed`;
+- S896 FP16: `0.035221 ms`, versus Round 042 `0.034937 ms` (`+0.81%`);
+- S1792 FP16: `0.109770 ms`, versus Round 042 `0.108229 ms` (`+1.42%`);
+- S3584 FP16: `0.672657 ms`, versus Round 042 `0.653060 ms` (`+3.00%`);
+- FA3 measured `0.028880 / 0.087030 / 0.536724 ms`, respectively;
+- dynamic shared memory increased to about 198 KB.
+
+**Decision**
+
+Rejected. Delayed TMA waits remove Round 058's per-item drain, but the extra
+32 KB of output staging plus stage-selection and warpgroup synchronization
+costs more than the store overlap recovers. The regression grows with the
+longer H64 workload. Round 042 remains the accepted implementation; a useful
+epilogue improvement must avoid both manual global-store pressure and a second
+full output stage per consumer.
