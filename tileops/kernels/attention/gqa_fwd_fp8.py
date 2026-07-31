@@ -446,6 +446,13 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         head_kv = tile_hkv
                         row_base = tile_m * block_m
                         loop_range = T.ceildiv(seq_len, 224)
+                        qk_descale = T.alloc_var(
+                            accum_dtype,
+                            init=q_descale[tile_b, head_kv] * k_descale[tile_b, head_kv],
+                        )
+                        value_descale = T.alloc_var(
+                            accum_dtype, init=v_descale[tile_b, head_kv]
+                        )
                         T.tma_copy(
                             q[tile_b, row_base : row_base + half_m, tile_h, :],
                             q_shared_1,
@@ -494,8 +501,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 ss_1,
                                 ssum_1,
                                 ls_1,
-                                q_descale[tile_b, head_kv]
-                                * k_descale[tile_b, head_kv],
+                                qk_descale,
                             )
                             T.copy(ss_1, ss_shared_1)
                             T.call_extern(
@@ -535,7 +541,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                             acc_o_1.data,
                             ls_shared_1.access_ptr("r"),
                             4,
-                            v_descale[tile_b, head_kv],
+                            value_descale,
                             o_shared_1.access_ptr("w"),
                         )
                         T.fence_proxy_async()
@@ -562,6 +568,13 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                         head_kv = tile_hkv
                         row_base = tile_m * block_m
                         loop_range = T.ceildiv(seq_len, 224)
+                        qk_descale = T.alloc_var(
+                            accum_dtype,
+                            init=q_descale[tile_b, head_kv] * k_descale[tile_b, head_kv],
+                        )
+                        value_descale = T.alloc_var(
+                            accum_dtype, init=v_descale[tile_b, head_kv]
+                        )
                         T.tma_copy(
                             q[tile_b, row_base + half_m : row_base + block_m, tile_h, :],
                             q_shared_2,
@@ -610,8 +623,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                                 ss_2,
                                 ssum_2,
                                 ls_2,
-                                q_descale[tile_b, head_kv]
-                                * k_descale[tile_b, head_kv],
+                                qk_descale,
                             )
                             T.copy(ss_2, ss_shared_2)
                             T.call_extern(
@@ -651,7 +663,7 @@ def _gqa_fwd_fp8_bn224_tma_v_kernel(
                             acc_o_2.data,
                             ls_shared_2.access_ptr("r"),
                             4,
-                            v_descale[tile_b, head_kv],
+                            value_descale,
                             o_shared_2.access_ptr("w"),
                         )
                         T.fence_proxy_async()

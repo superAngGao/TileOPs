@@ -3,11 +3,10 @@
 ## Status
 
 - Maximum rounds: 300
-- Selected production candidate: Round 042 compressed producer phase state
-- Best validated candidate: Round 042 compressed producer phase state
-- Current structural question: whether the latest TileLang/lowering stack can
-  preserve FA3-style grouped QK/PV overlap without fragment-layout conversion,
-  register spilling, or conservative scoreboard serialization.
+- Selected production candidate: Round 061 work-item descale hoisting
+- Best validated candidate: Round 061 work-item descale hoisting
+- Current structural question: how to close the remaining consumer issue and
+  scoreboard gap to FA3 without destabilizing the persistent QK/PV protocol.
 - Compiler-artifact rule: every candidate is compiled with a unique empty
   TileLang cache. Shared-cache results are not accepted for helper-only edits.
 
@@ -1954,3 +1953,57 @@ does not recover the medium and long shapes. TMA launch/descriptor work and
 the shared-stage reuse synchronization remain more expensive than the overlap
 they expose. Rounds 058-060 close this local TMA-epilogue family in its current
 form; Round 042 remains the accepted implementation.
+
+## Round 061: Hoist Descales Out of the K/V-Tile Loop
+
+**Hypothesis**
+
+The Q/K descale product is invariant across every K/V tile in one persistent
+work item, while the V descale is invariant across its final epilogue. Loading
+these values into scalar registers once per work item should remove repeated
+ordinary global loads without changing the QK/PV schedule or synchronization
+protocol.
+
+**Action**
+
+- loaded `q_descale * k_descale` once per consumer work item;
+- loaded `v_descale` once per consumer work item;
+- passed the scalar Q/K scale into online softmax and the scalar V scale into
+  the accumulator finalizer;
+- preserved all fragment layouts, WGMMA ordering, barriers, producer state,
+  output epilogue, and public ABI.
+
+**Gate result**
+
+- official-runner correctness suite: `8 passed`;
+- every formal benchmark used an isolated empty TileLang cache and strict
+  benchmark timing;
+
+| Shape | Round 042 | Round 061 | Change | FA3 | R061 / FA3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| S896 FP16 | `0.034937 ms` | `0.033290 ms` | `-4.72%` | `0.028865 ms` | `1.153x` |
+| S896 BF16 | `0.035024 ms` | `0.033224 ms` | `-5.14%` | `0.028933 ms` | `1.148x` |
+| S1792 FP16 | `0.108229 ms` | `0.105113 ms` | `-2.88%` | `0.088078 ms` | `1.193x` |
+| S1792 BF16 | `0.108107 ms` | `0.104880 ms` | `-2.99%` | `0.087766 ms` | `1.195x` |
+| S3584 FP16 | `0.653060 ms` | `0.643138 ms` | `-1.52%` | `0.538445 ms` | `1.194x` |
+| S3584 BF16 | `0.654170 ms` | `0.643498 ms` | `-1.63%` | `0.537952 ms` | `1.196x` |
+| S7168 FP16 | `2.495464 ms` | `2.446207 ms` | `-1.97%` | `2.050419 ms` | `1.193x` |
+| S7168 BF16 | `2.498358 ms` | `2.447639 ms` | `-2.03%` | `2.041061 ms` | `1.199x` |
+
+The focused S3584 NCU comparison confirms the intended mechanism:
+
+| Metric | Round 042 | Round 061 | FA3 |
+| --- | ---: | ---: | ---: |
+| ordinary global-load requests | `487,424` | `57,344` | `57,344` |
+| executed instructions | `202.48 M` | `200.18 M` | `183.21 M` |
+| long-scoreboard samples | `10,338` | `9,996` | `6,354` |
+| eligible warps / scheduler | `0.60` | `0.61` | `0.65` |
+| profiled duration | `652.10 us` | `644.70 us` | `537.89 us` |
+
+**Decision**
+
+Accepted as the new baseline. This is a narrow invariant-hoisting change with
+no new low-level helper and no synchronization change. It improves every
+manifest-owned shape and dtype, removes the measured redundant global-load
+traffic, and raises TileOps to about 83-87% of FA3 throughput on the current
+surface.
