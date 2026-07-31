@@ -1691,3 +1691,36 @@ the short shape by 2.7% and violates the repeated-launch liveness gate at
 S1792. A source-level match to FA3's conversion utility is not sufficient
 inside TileOps' current synchronous P/PV schedule. The accepted implementation
 remains Round 042.
+
+## Round 053: Vectorize Only the Four-Value FP8 Pack
+
+**Hypothesis**
+
+Round 052 may have changed too much fragment metadata and register scheduling.
+Keeping the accepted source-index mapping while replacing only the pair of
+FP8x2 intrinsics plus integer merge with a four-element CUTLASS conversion
+should emit FA3's chained `F2FP ... MERGE_C` sequence without changing the
+P/PV lifetime.
+
+**Action**
+
+- retained the accepted compile-time source-index mapping;
+- formed one `cutlass::Array<float, 4>` per packed P register;
+- converted it with `NumericArrayConverter<float_e4m3_t, float, 4>`;
+- left all pipeline state, barriers, and WGMMA issue points unchanged;
+- compiled and timed from isolated empty TileLang caches.
+
+**Gate result**
+
+- S896 FP16: `0.035829 ms`, versus Round 042 `0.034937 ms`;
+- FA3 in the same process: `0.029323 ms`;
+- formal S1792 FP16 timed out after 180 seconds under
+  `warmup=5, repeat=20, trials=3`.
+
+**Decision**
+
+Rejected. Even the narrow pack-only change regresses S896 by 2.6% and violates
+the S1792 repeated-launch liveness gate. The current persistent schedule is
+sensitive to the conversion instruction schedule itself, not only to CUTE
+layout reconstruction. Further P-pack changes require a redesigned producer /
+consumer protocol rather than another local conversion substitution.
