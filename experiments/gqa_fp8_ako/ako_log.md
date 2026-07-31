@@ -1724,3 +1724,123 @@ the S1792 repeated-launch liveness gate. The current persistent schedule is
 sensitive to the conversion instruction schedule itself, not only to CUTE
 layout reconstruction. Further P-pack changes require a redesigned producer /
 consumer protocol rather than another local conversion substitution.
+
+## Round 054: Fence Persistent Work-Item Phases
+
+**Hypothesis**
+
+Multiple faster consumer-side experiments hang only under repeated launches,
+which suggests that a consumer can enter the next persistent work item while
+the producer or sibling consumer still uses the previous item's barrier
+phase. A single CTA-wide named barrier at each work-item boundary should make
+the phase transition explicit.
+
+**Action**
+
+- added one 384-thread named barrier at the end of the producer work item;
+- added the same barrier at the end of both 128-thread consumer work items;
+- otherwise retained the accepted Round 042 implementation.
+
+**Gate result**
+
+- S896 FP16: `0.035819 ms`, versus Round 042 `0.034937 ms`;
+- S1792 FP16 completed under the formal repeated timing contract at
+  `0.109736 ms`, versus Round 042 `0.108229 ms`;
+- FA3 measured `0.029131 ms` and `0.087464 ms`, respectively.
+
+**Decision**
+
+Rejected as a standalone performance candidate: the explicit phase fence costs
+2.5% at S896 and 1.4% at S1792. It remains a useful structural control because
+it provides a deterministic work-item handoff for faster consumer schedules.
+
+## Round 055: Combine the Phase Fence With Vectorized P Packing
+
+**Hypothesis**
+
+If Round 053 fails because faster consumers cross a work-item phase boundary,
+combining its chained four-value FP8 conversion with Round 054's explicit
+fence should preserve liveness while removing the P-pack `PRMT` instructions.
+
+**Action**
+
+- retained the Round 054 work-item fence;
+- re-enabled the four-element CUTLASS P conversion from Round 053;
+- compiled all probes from isolated empty TileLang caches.
+
+**Gate result**
+
+- S896 FP16: `0.036373 ms`;
+- S1792 FP16 completed under the formal repeated timing contract at
+  `0.112862 ms`;
+- FA3 measured `0.029269 ms` and `0.088210 ms`, respectively.
+
+**Decision**
+
+Rejected. The phase fence fixes the liveness failure, but the combined kernel
+is about 4% slower than Round 042. The chained `F2FP ... MERGE_C` conversion
+reduces instruction count while lengthening the dependency chain; Round 042's
+independent FP8x2 conversions and `PRMT` merge schedule better in this kernel.
+
+## Round 056: Rescale PV Accumulators Directly From the Row Fragment
+
+**Hypothesis**
+
+The softmax row scale is already available as a replicated register fragment.
+Reading its two row values with warp shuffles should remove the accepted
+fragment-to-shared copy and shared reload while preserving the PTX accumulator
+layout.
+
+**Action**
+
+- removed the two 64-element row-scale shared buffers;
+- reconstructed the fragment owner mapping from the archived Round 046
+  lowering;
+- broadcast the two row scales from lanes `(lane & 31) & ~3`;
+- rescaled the two 32-register accumulator halves directly;
+- retained Round 054's CTA-wide persistent work-item fence.
+
+**Gate result**
+
+- targeted S896 dequantized-reference correctness: `1 passed`;
+- S896 FP16: `0.033749 ms`, versus Round 042 `0.034937 ms`;
+- S1792 FP16: `0.103392 ms`, versus Round 042 `0.108229 ms`;
+- formal S3584 FP16 timed out after 180 seconds.
+
+**Decision**
+
+Rejected. The direct register path provides a repeatable 3.4-4.5% improvement
+for the H32 cases, but it violates the H64 repeated-launch liveness gate. It is
+not eligible to replace Round 042 until the H64 synchronization failure is
+understood and removed.
+
+## Round 057: Restore Explicit Producer Phase Counters
+
+**Hypothesis**
+
+Round 042 compresses the persistent producer's K/V phases because every valid
+work item has a fixed multiple-of-four loop count. Restoring the explicit
+pre-Round-042 producer counters can test whether that phase compression becomes
+unsafe when the direct accumulator rescale makes the consumers faster.
+
+**Action**
+
+- restored explicit persistent `gi_kp` and `gi_vp` producer counters;
+- retained the direct register rescale from Round 056;
+- retained the CTA-wide work-item fence;
+- compiled and launched the H64 lowering from an isolated empty cache.
+
+**Gate result**
+
+- S896 FP16: `0.033504 ms`;
+- one S3584 FP16 launch completed successfully;
+- formal repeated S3584 FP16 timing timed out after 180 seconds;
+- generated H64 code gives all three persistent branches the same `w < 14`
+  loop and the same break condition, with one barrier-5 arrival per work item.
+
+**Decision**
+
+Rejected. Explicit producer phase counters do not fix the H64 repeated-launch
+failure. The remaining issue is tied to cross-launch or repeated-work
+lifetime in the direct row-fragment rescale path, rather than Round 042's
+producer phase-state compression.
