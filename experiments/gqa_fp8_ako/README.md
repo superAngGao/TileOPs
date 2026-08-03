@@ -60,22 +60,24 @@ No package is installed or upgraded inside either image.
 
 ## Current Accepted Candidate
 
-Round 069 defers the online-softmax row-sum quad reduction until finalization.
-It keeps lane-local partial sums through the K/V-tile loop, then uses TileLang
-`T.shfl_xor` primitives to combine them once per output row. The H64 path also
-publishes its shared row-scale fragment before the accumulator rescale and
-uses an explicit persistent work-item handoff; the H32 path retains the
-lower-overhead mbarrier-only protocol.
+Round 069 defers the online-softmax row-sum quad reduction until finalization
+for schedules shorter than 32 K/V tiles. It keeps lane-local partial sums
+through the tile loop, then uses TileLang `T.shfl_xor` primitives to combine
+them once per output row. The 32-tile S7168 shape retains Round 061's per-tile
+reduction because the faster consumer exposed a repeated-launch liveness wall
+in the existing producer/V-buffer protocol.
 
-The official runner correctness suite passes all eight manifest-owned cases.
-On the fixed H200 surface, Round 069 reaches 88.5-91.5% of FA3 throughput and
-improves the accepted Round 061 implementation by 5.8-8.2% on FP16:
+The official runner test file passes all ten cases, including direct output and
+LSE checks plus explicit S3584/S7168 H64 liveness coverage. On the fixed H200
+surface, the hybrid dispatch reaches 83.6-91.5% of FA3 throughput. It improves
+Round 061 by 5.8-7.9% on the first three FP16 shapes and stays within noise at
+S7168:
 
 | Shape | Round 061 | Round 069 | Improvement | FA3 | R069 / FA3 throughput |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| S896 FP16 | `0.033290 ms` | `0.031363 ms` | `5.79%` | `0.028661 ms` | `91.38%` |
-| S1792 FP16 | `0.105113 ms` | `0.096519 ms` | `8.18%` | `0.086423 ms` | `89.54%` |
-| S3584 FP16 | `0.643138 ms` | `0.603528 ms` | `6.16%` | `0.534039 ms` | `88.49%` |
-| S7168 FP16 | `2.446207 ms` | `2.290201 ms` | `6.38%` | `2.042253 ms` | `89.17%` |
+| S896 FP16 | `0.033290 ms` | `0.031362 ms` | `5.79%` | `0.028694 ms` | `91.49%` |
+| S1792 FP16 | `0.105113 ms` | `0.096846 ms` | `7.86%` | `0.086032 ms` | `88.83%` |
+| S3584 FP16 | `0.643138 ms` | `0.602913 ms` | `6.25%` | `0.536506 ms` | `88.99%` |
+| S7168 FP16 | `2.446207 ms` | `2.437024 ms` | `0.38%` | `2.043584 ms` | `83.86%` |
 
 Raw latency and NCU evidence is archived in `results/round069/`.

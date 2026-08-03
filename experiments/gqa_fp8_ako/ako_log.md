@@ -2040,7 +2040,7 @@ source-level arithmetic but lengthens the scalar softmax dependency chain
 enough to regress the short shape. The source was restored exactly to Round
 061; no medium or long benchmark was run.
 
-## Round 069: Defer the Row-Sum Quad Reduction
+## Round 069: Defer the Row-Sum Quad Reduction With a 32-Tile Fallback
 
 **Hypothesis**
 
@@ -2057,38 +2057,41 @@ PV, or output contracts.
 - carried those partial sums through the online-softmax update and deferred
   the quad reduction to finalization;
 - expressed the final reduction with TileLang `T.shfl_xor` primitives;
-- for the eight-query-head group path, published each compact shared row-scale
-  fragment before the 128-thread accumulator-rescale convergence point and
-  added a CTA-wide persistent work-item handoff;
+- for the S3584 eight-query-head group path, published each compact shared
+  row-scale fragment before the 128-thread accumulator-rescale convergence
+  point and added a CTA-wide persistent work-item handoff;
+- retained Round 061's per-tile reduction when the schedule reaches 32 K/V
+  tiles, so S7168 does not enter the deferred-reduction protocol;
 - retained the lower-overhead mbarrier-only protocol for four-query-head group
   workloads;
 - extended correctness coverage to the direct kernel output and its log2-domain
-  LSE result.
+  LSE result, then added explicit S3584 and S7168 H64 liveness checks.
 
-Two synchronization probes established the H64 placement requirement. The
-initial deferred-sum implementation exposed a repeated-launch liveness failure.
-Placing the 128-thread barriers after accumulator rescale still hung S7168 on
-an otherwise exclusive GPU. Moving each barrier immediately after publication
-of the shared row-scale fragment, before any consumer reads it during rescale,
-made repeated H64 launches stable. These probes are implementation diagnostics,
-not separate accepted performance rows.
+The first all-shape candidate appeared to produce a complete surface, but a
+fresh-cache rerun showed that S7168 could hang on its first launch. Repeating
+the check on two exclusive H200 GPUs reproduced the failure. S3584 remained
+stable and retained the expected speedup, while the unchanged Round 061
+S7168 kernel completed normally. The accepted dispatch therefore treats 32
+K/V tiles as the current liveness wall and falls back before entering the
+deferred-reduction protocol. Earlier S7168 rows from the all-shape candidate
+were invalidated and replaced with the strict fallback measurements below.
 
 **Gate result**
 
-- official-runner correctness suite: `8 passed`;
+- official-runner correctness suite: `10 passed`;
 - every formal benchmark used CUPTI timing, warmup 5, repeat 20, three trials,
   L2 flush, an isolated TileLang cache, and an exclusive H200 GPU at 1500 MHz;
 
 | Shape | Round 061 | Round 069 | Change | FA3 | R069 / FA3 throughput |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| S896 FP16 | `0.033290 ms` | `0.031363 ms` | `-5.79%` | `0.028661 ms` | `91.38%` |
-| S896 BF16 | `0.033224 ms` | `0.031382 ms` | `-5.54%` | `0.028699 ms` | `91.45%` |
-| S1792 FP16 | `0.105113 ms` | `0.096519 ms` | `-8.18%` | `0.086423 ms` | `89.54%` |
-| S1792 BF16 | `0.104880 ms` | `0.096558 ms` | `-7.93%` | `0.086646 ms` | `89.73%` |
-| S3584 FP16 | `0.643138 ms` | `0.603528 ms` | `-6.16%` | `0.534039 ms` | `88.49%` |
-| S3584 BF16 | `0.643498 ms` | `0.602955 ms` | `-6.30%` | `0.534105 ms` | `88.58%` |
-| S7168 FP16 | `2.446207 ms` | `2.290201 ms` | `-6.38%` | `2.042253 ms` | `89.17%` |
-| S7168 BF16 | `2.447639 ms` | `2.291485 ms` | `-6.38%` | `2.035827 ms` | `88.84%` |
+| S896 FP16 | `0.033290 ms` | `0.031362 ms` | `-5.79%` | `0.028694 ms` | `91.49%` |
+| S896 BF16 | `0.033224 ms` | `0.031301 ms` | `-5.79%` | `0.028616 ms` | `91.42%` |
+| S1792 FP16 | `0.105113 ms` | `0.096846 ms` | `-7.86%` | `0.086032 ms` | `88.83%` |
+| S1792 BF16 | `0.104880 ms` | `0.096580 ms` | `-7.91%` | `0.086464 ms` | `89.53%` |
+| S3584 FP16 | `0.643138 ms` | `0.602913 ms` | `-6.25%` | `0.536506 ms` | `88.99%` |
+| S3584 BF16 | `0.643498 ms` | `0.603425 ms` | `-6.23%` | `0.532753 ms` | `88.29%` |
+| S7168 FP16 | `2.446207 ms` | `2.437024 ms` | `-0.38%` | `2.043584 ms` | `83.86%` |
+| S7168 BF16 | `2.447639 ms` | `2.435498 ms` | `-0.50%` | `2.036520 ms` | `83.62%` |
 
 The focused S3584 NCU comparison confirms the intended mechanism:
 
@@ -2104,14 +2107,16 @@ The focused S3584 NCU comparison confirms the intended mechanism:
 | eligible warps / scheduler | `0.609` | `0.617` | `0.65` |
 
 Generated H32 kernels contain none of the H64 handoff or row-scale barriers.
-Generated H64 kernels contain the expected three CTA handoff sites and one
-128-thread row-scale publication site per consumer warpgroup. The repeated
-per-tile row-sum shuffles are absent; only the final TileLang reductions remain.
+The S3584 H64 kernel contains the expected three CTA handoff sites and one
+128-thread row-scale publication site per consumer warpgroup; its repeated
+per-tile row-sum shuffles are absent. The S7168 lowering retains Round 061's
+per-tile reduction and contains none of the deferred-path synchronization.
 
 **Decision**
 
-Accepted as the new baseline. Deferring the quad reduction closes most of the
-measured SHFL/FADD and long-scoreboard gap to FA3 while improving every owned
-shape and dtype. The remaining S3584 instruction gap is now dominated by PRMT
-packing work and smaller MIO/wait differences, which defines the next search
-direction.
+Accepted as the new hybrid baseline. Deferring the quad reduction closes most
+of the measured S3584 SHFL/FADD and long-scoreboard gap to FA3 while improving
+the first three owned shapes and both dtypes. S7168 remains on the safe Round
+061 protocol until the 32-tile producer/V-buffer liveness wall is removed. The
+remaining S3584 instruction gap is dominated by PRMT packing work and smaller
+MIO/wait differences, which defines the next search direction.
