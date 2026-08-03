@@ -236,3 +236,29 @@ def test_gqa_prefill_fp8_tensor_core_matches_dequantized_reference() -> None:
         out.reshape(batch, seq_len, heads, dim).float(), ref, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(direct_out.float(), ref, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(lse.float(), ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="torch fp8 is unavailable")
+@pytest.mark.skipif(not _has_sm90(), reason="requires Hopper FP8 WGMMA")
+@pytest.mark.parametrize("seq_len", [3584, 7168])
+@pytest.mark.smoke
+def test_gqa_prefill_fp8_h64_manifest_paths_are_live(seq_len: int) -> None:
+    batch, heads, heads_kv, dim = 1, 64, 8, 128
+    fp8 = torch.float8_e4m3fn
+    q = torch.zeros((batch, seq_len, heads, dim), device="cuda", dtype=fp8)
+    k = torch.zeros((batch, seq_len, heads_kv, dim), device="cuda", dtype=fp8)
+    v = torch.zeros((batch, seq_len, heads_kv, dim), device="cuda", dtype=fp8)
+    descale = torch.ones((batch, heads_kv), device="cuda", dtype=torch.float32)
+
+    kernel = GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel(
+        batch, heads, heads_kv, seq_len, dim, torch.float16
+    )
+    out, lse = kernel(q, k, v, descale, descale, descale)
+
+    torch.testing.assert_close(out.float(), torch.zeros_like(out.float()), atol=0, rtol=0)
+    torch.testing.assert_close(
+        lse.float(),
+        torch.full_like(lse.float(), math.log2(seq_len)),
+        atol=5e-3,
+        rtol=5e-3,
+    )
