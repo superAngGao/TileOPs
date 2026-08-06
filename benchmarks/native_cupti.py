@@ -115,4 +115,6 @@ def _guard_next_repeat() -> None:
 
 
 def repeat_guard_us() -> float:
-    return float(os.environ.get("TILEOPS_CUPTI_REPEAT_GUARD_US", "16.0"))
+    # Stay strictly above the combined default begin/end tolerance so widened
+    # attribution windows cannot overlap adjacent logical calls.
+    return float(os.environ.get("TILEOPS_CUPTI_REPEAT_GUARD_US", "96.0"))

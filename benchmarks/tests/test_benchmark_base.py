@@ -7,6 +7,7 @@ any duck-typed workload rather than requiring ``WorkloadBase`` inheritance.
 import pytest
 import torch
 
+import benchmarks.native_cupti as native_cupti
 from benchmarks.benchmark_base import (
     BenchmarkReport,
     ManifestBenchmark,
@@ -14,12 +15,27 @@ from benchmarks.benchmark_base import (
     _ShiftingTensorPool,
     _attributed_mean_latency_ms,
     _bench_meta,
+    _cupti_window_begin_tolerance_ns,
+    _cupti_window_end_tolerance_ns,
     _kernel_span_us,
     _kernels_by_cpu_window,
     _select_expected_sequence,
     bench_kernel,
     workloads_to_params,
 )
+
+
+def test_cupti_boundary_defaults_are_symmetric_and_guarded(monkeypatch):
+    monkeypatch.delenv("TILEOPS_CUPTI_WINDOW_BEGIN_TOLERANCE_US", raising=False)
+    monkeypatch.delenv("TILEOPS_CUPTI_WINDOW_END_TOLERANCE_US", raising=False)
+    monkeypatch.delenv("TILEOPS_CUPTI_REPEAT_GUARD_US", raising=False)
+
+    begin_us = _cupti_window_begin_tolerance_ns() / 1000.0
+    end_us = _cupti_window_end_tolerance_ns() / 1000.0
+    guard_us = native_cupti.repeat_guard_us()
+
+    assert (begin_us, end_us, guard_us) == (32.0, 32.0, 96.0)
+    assert guard_us > begin_us + end_us
 
 # Duck-typed test workloads
 
