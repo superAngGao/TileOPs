@@ -401,6 +401,8 @@ class GQAPrefillFwdWsPersistentCausalKernel(PackedPrefillKernel):
                 cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor,
                 q_scale: Optional[torch.Tensor] = None,
                 k_scale: Optional[torch.Tensor] = None,
-                v_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+                v_scale: Optional[torch.Tensor] = None,
+                rope_cos: Optional[torch.Tensor] = None,
+                rope_sin: Optional[torch.Tensor] = None) -> torch.Tensor:
         q_bshd, k_bshd, v_bshd = self._bshd(q, k, v)
         return self.kernel(q_bshd, k_bshd, v_bshd).reshape(q.shape)
