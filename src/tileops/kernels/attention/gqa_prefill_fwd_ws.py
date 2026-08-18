@@ -26,7 +26,7 @@ from .call_spec import (
     causal_ws_prefill_region,
     square_ws_prefill_region,
 )
-from .packed_prefill import PackedPrefillKernel
+from .prefill import DensePrefillKernel
 
 __all__ = ["GQAPrefillFwdWsPersistentCausalKernel"]
 
@@ -355,7 +355,7 @@ def _gqa_prefill_fwd_fa3_kernel(B, H, Hkv, Sq, Skv, D, sm_scale, softcap, dtype,
     return main
 
 
-class GQAPrefillFwdWsPersistentCausalKernel(PackedPrefillKernel):
+class GQAPrefillFwdWsPersistentCausalKernel(DensePrefillKernel):
     """Faithful FlashInfer FA3 GQA-prefill kernel (causal, dim==128, sm90).
 
     Warp-specialized 2-warpgroup ping-pong port matching FlashInfer's
@@ -398,11 +398,9 @@ class GQAPrefillFwdWsPersistentCausalKernel(PackedPrefillKernel):
         return {}
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor,
                 q_scale: Optional[torch.Tensor] = None,
                 k_scale: Optional[torch.Tensor] = None,
                 v_scale: Optional[torch.Tensor] = None,
                 rope_cos: Optional[torch.Tensor] = None,
                 rope_sin: Optional[torch.Tensor] = None) -> torch.Tensor:
-        q_bshd, k_bshd, v_bshd = self._bshd(q, k, v)
-        return self.kernel(q_bshd, k_bshd, v_bshd).reshape(q.shape)
+        return self.kernel(q, k, v)
