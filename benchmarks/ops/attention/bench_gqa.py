@@ -20,7 +20,6 @@ from benchmarks.ops.attention.manifest_params import (
 from tileops.kernels.attention import (
     GQAFwdWsPersistentCausalKernel,
     GQAPrefillDenseFwdKernel,
-    GQAPrefillFwdKernel,
     GQAPrefillFwdWsPersistentCausalKernel,
     GQASlidingWindowFwdWgmmaPipelinedKernel,
 )
@@ -267,8 +266,6 @@ def _tileops_gqa_variant(
         return "prefill_ws_causal"
     if isinstance(kernel, GQASlidingWindowFwdWgmmaPipelinedKernel):
         return "dense_sliding"
-    if isinstance(kernel, GQAPrefillFwdKernel):
-        return "prefill"
     if isinstance(kernel, GQAFwdWsPersistentCausalKernel):
         return "ws_causal"
     return kernel.__class__.__name__
@@ -400,7 +397,7 @@ def test_gqa_bwd_bench(
 
 
 _GQA_PREFILL_FWD_BENCH_PARAMS = manifest_params(
-    [workload for workload in load_workloads(_GQA_PREFILL_FWD_OP) if workload.get("backend") != "fp8"],
+    load_workloads(_GQA_PREFILL_FWD_OP),
     gqa_prefill_args,
     tune=False,
 )
@@ -408,7 +405,7 @@ _GQA_PREFILL_FWD_BENCH_PARAMS = manifest_params(
 
 @pytest.mark.parametrize(
     "batch, seq_len_q, seq_len_kv, heads, heads_kv, dim, causal, backend, "
-    "validate_uniform_cu_seqlens, sm_scale, softcap, dtype, tune",
+    "sm_scale, softcap, dtype, tune",
     _GQA_PREFILL_FWD_BENCH_PARAMS,
 )
 def test_gqa_prefill_fwd_bench(
@@ -420,7 +417,6 @@ def test_gqa_prefill_fwd_bench(
     dim: int,
     causal: bool,
     backend: str,
-    validate_uniform_cu_seqlens: bool,
     sm_scale: Optional[float],
     softcap: Optional[float],
     dtype: torch.dtype,
@@ -443,7 +439,6 @@ def test_gqa_prefill_fwd_bench(
         dtype=dtype,
         tune=tune,
         backend=backend,
-        validate_uniform_cu_seqlens=validate_uniform_cu_seqlens,
         sm_scale=sm_scale,
         softcap=softcap,
     )
