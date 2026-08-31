@@ -156,16 +156,28 @@ GroupedQueryAttentionDenseFwdOp:
       - "o.shape == (B, S_q, H, D)"
       - "H % H_kv == 0"
 
-  workloads: []
+  workloads:
+    # Existing square and rectangular 16-bit Dense benchmark coverage.
+    - {q_shape: [4, 512, 32, 128], kv_shape: [4, 512, 8, 128], is_causal: true, dtypes: [float16, bfloat16], label: "llama-8b-short"}
+    - {q_shape: [2, 2048, 32, 128], kv_shape: [2, 2048, 8, 128], is_causal: true, dtypes: [float16, bfloat16], label: "llama-8b-long"}
+    - {q_shape: [2, 512, 64, 128], kv_shape: [2, 512, 8, 128], is_causal: true, dtypes: [float16, bfloat16], label: "llama-70b-short"}
+    - {q_shape: [1, 2048, 64, 128], kv_shape: [1, 2048, 8, 128], is_causal: true, dtypes: [float16, bfloat16], label: "llama-70b-long"}
+    - {q_shape: [4, 512, 32, 128], kv_shape: [4, 512, 8, 128], is_causal: true, sm_scale: 0.125, dtypes: [float16], label: "llama-8b-prefill-dense-sm-scale-0.125"}
+    - {q_shape: [4, 512, 32, 128], kv_shape: [4, 512, 8, 128], is_causal: true, softcap: 50.0, dtypes: [float16], label: "llama-8b-prefill-dense-softcap50"}
+    - {q_shape: [2, 512, 32, 128], kv_shape: [2, 4096, 8, 128], is_causal: true, dtypes: [float16, bfloat16], label: "llama-8b-prefill-dense-q-lt-kv"}
+    - {q_shape: [1, 512, 64, 128], kv_shape: [1, 4096, 8, 128], is_causal: true, dtypes: [float16, bfloat16], label: "llama-70b-prefill-dense-q-lt-kv"}
 
   roofline:
-    func: "tileops.perf.formulas.gqa_fwd_roofline"
+    func: "tileops.perf.formulas.gqa_dense_fwd_roofline"
 
   source:
-    kernel: []
+    kernel: tileops/kernels/attention/gqa_prefill_fwd_ws.py
+    kernel_map:
+      gqa_dense_causal_fwd_kernel: GQAPrefillFwdWsPersistentCausalKernel
     op: tileops/ops/attention/gqa.py
-    test: tests/ops/attention/test_gqa.py
+    test: tests/ops/attention/test_gqa_dense.py
     bench: benchmarks/ops/attention/bench_gqa.py
+    bench_manifest_driven: true
 
 GroupedQueryAttentionFwdOp:
   ref_api: "torch.nn.functional.scaled_dot_product_attention"

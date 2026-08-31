@@ -16,6 +16,26 @@ def gqa_qkv_args(workload: dict[str, Any]) -> tuple[int, int, int, int, int, boo
     return batch, seq_len, heads, heads_kv, dim, workload.get("is_causal", True)
 
 
+def gqa_dense_args(
+    workload: dict[str, Any],
+) -> tuple[int, int, int, int, int, int, bool, float | None, float | None]:
+    batch, seq_len_q, heads, dim = workload["q_shape"]
+    batch_kv, seq_len_kv, heads_kv, dim_kv = workload["kv_shape"]
+    if batch_kv != batch or dim_kv != dim:
+        raise ValueError("dense GQA requires q_shape and kv_shape to share batch and dim")
+    return (
+        batch,
+        seq_len_q,
+        seq_len_kv,
+        heads,
+        heads_kv,
+        dim,
+        workload.get("is_causal", True),
+        workload.get("sm_scale"),
+        workload.get("softcap"),
+    )
+
+
 def gqa_prefill_args(
     workload: dict[str, Any],
 ) -> tuple[int, int, int, int, int, int, bool, str, bool, float | None, float | None]:

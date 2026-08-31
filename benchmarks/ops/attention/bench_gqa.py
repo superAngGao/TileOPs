@@ -14,6 +14,7 @@ from benchmarks.benchmark_base import (
     workload_params,
 )
 from benchmarks.ops.attention.workload_args import (
+    gqa_dense_args,
     gqa_prefill_args,
     gqa_prefill_paged_args,
     gqa_qkv_args,
@@ -28,6 +29,7 @@ from tileops.kernels.attention import (
 from tileops.manifest import load_workloads
 from tileops.ops import (
     GroupedQueryAttentionBwdOp,
+    GroupedQueryAttentionDenseFwdOp,
     GroupedQueryAttentionFwdOp,
     GroupedQueryAttentionPrefillFwdOp,
     GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp,
@@ -52,6 +54,27 @@ def _fa3_gqa_fwd(test: GroupedQueryAttentionFwdWorkload):
 
     def baseline_fn(q, k, v):
         out = flash_attn_func(q, k, v, causal=test.is_causal)
+        return out[0] if isinstance(out, tuple) else out
+
+    return baseline_fn
+
+
+def _fa3_gqa_dense_fwd(test: GQAPrefillFwdWorkload):
+    """Return the FA3 baseline for the Dense Op's full score semantics."""
+    try:
+        from flash_attn_interface import flash_attn_func
+    except ImportError:
+        return None
+
+    def baseline_fn(q, k, v):
+        out = flash_attn_func(
+            q,
+            k,
+            v,
+            causal=test.is_causal,
+            softmax_scale=getattr(test, "sm_scale", None),
+            softcap=getattr(test, "softcap", None) or 0.0,
+        )
         return out[0] if isinstance(out, tuple) else out
 
     return baseline_fn
@@ -277,6 +300,53 @@ def test_gqa_fwd_bench(
 
     if fa3_fn is None and fi_fn is None:
         functors["torch-sdpa"] = _torch_gqa_fwd(test)
+
+    bm.compare(functors, *inputs)
+
+
+_GQA_DENSE_FWD_BENCH_PARAMS = workload_params(
+    load_workloads(GroupedQueryAttentionDenseFwdOp), then_dtype(gqa_dense_args, tune=False)
+)
+
+
+@pytest.mark.parametrize(
+    "batch, seq_len_q, seq_len_kv, heads, heads_kv, dim, causal, sm_scale, softcap, dtype, tune",
+    _GQA_DENSE_FWD_BENCH_PARAMS,
+)
+def test_gqa_dense_fwd_bench(
+    batch: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    heads: int,
+    heads_kv: int,
+    dim: int,
+    causal: bool,
+    sm_scale: Optional[float],
+    softcap: Optional[float],
+    dtype: torch.dtype,
+    tune: bool,
+) -> None:
+    test = GQAPrefillFwdWorkload(batch, heads, heads_kv, seq_len_q, seq_len_kv, dim, causal, dtype)
+    test.sm_scale = sm_scale
+    test.softcap = softcap
+    inputs = test.gen_inputs()
+
+    op = GroupedQueryAttentionDenseFwdOp(
+        is_causal=causal,
+        sm_scale=sm_scale,
+        softcap=softcap,
+        tune=tune,
+    )
+    bm = ManifestBenchmark(op, test)
+    functors = {"tileops": op, "torch-ref": _torch_gqa_prefill_ref(test)}
+
+    fa3_fn = _fa3_gqa_dense_fwd(test)
+    if fa3_fn is not None:
+        functors["fa3"] = fa3_fn
+
+    fi_fn = _flashinfer_gqa_fwd(test, *inputs)
+    if fi_fn is not None:
+        functors["flashinfer"] = fi_fn
 
     bm.compare(functors, *inputs)
 

@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 import torch
@@ -23,7 +24,9 @@ from tileops.kernels.attention import (
     GQASlidingWindowFwdWgmmaPipelinedKernel,
     GQASlidingWindowVarlenFwdWgmmaPipelinedKernel,
 )
+from tileops.kernels.attention.call_spec import causal_ws_prefill_region
 from tileops.kernels.kernel_base import Kernel
+from tileops.perf.formulas import gqa_dense_fwd_roofline
 from tileops.perf.profile import tensor_core_roof
 
 from ..op_base import Op, UnmanifestedOp
@@ -51,6 +54,26 @@ __all__ = [
     "GroupedQueryAttentionSlidingWindowFwdOp",
     "GroupedQueryAttentionSlidingWindowVarlenFwdOp",
 ]
+
+
+@dataclass(frozen=True)
+class _DensePrefillCall:
+    """Direct-BSHD callable backed by the existing packed-prefill kernel object."""
+
+    kernel: GQAPrefillFwdWsPersistentCausalKernel
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.kernel.forward_bshd(q, k, v)
 
 
 def _validate_attention_dtype(dtype: torch.dtype) -> None:
@@ -270,6 +293,8 @@ class GroupedQueryAttentionDenseFwdOp(Op):
         dtype: Optional[torch.dtype] = None,
         *,
         target: Target = None,
+        kernel_map: Optional[Dict[str, Kernel]] = None,
+        tune: bool = False,
     ) -> None:
         r"""Configure the op. Tensor shapes and input dtype come from each call.
 
@@ -331,12 +356,16 @@ class GroupedQueryAttentionDenseFwdOp(Op):
         self.rotary_dim = rotary_dim
         self.rope_layout = rope_layout
         self.dtype = dtype
+        self.tune = tune
         self.target = target
-        self.dispatch_kernel()
+        self._roofline_state: Optional[dict] = None
+        self.dispatch_kernel(kernel_map)
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {}
+        return {
+            "gqa_dense_causal_fwd_kernel": GQAPrefillFwdWsPersistentCausalKernel,
+        }
 
     def _infer_output_shapes(
         self,
@@ -385,8 +414,9 @@ class GroupedQueryAttentionDenseFwdOp(Op):
                 raise ValueError(f"{name} must have dtype {output_dtype}")
 
     def eval_roofline(self) -> tuple[int, int]:
-        """Keep this spec-only Op concrete until its roofline is implemented."""
-        raise NotImplementedError("Dense GQA has no in-tree implementation yet")
+        if self._roofline_state is None:
+            raise RuntimeError("Dense GQA roofline is available after the first forward call")
+        return gqa_dense_fwd_roofline(**self._roofline_state)
 
     def _validate_forward_inputs(
         self,
@@ -483,9 +513,60 @@ class GroupedQueryAttentionDenseFwdOp(Op):
         self, inputs: tuple[Optional[torch.Tensor], ...]
     ) -> Callable[..., torch.Tensor]:
         """Resolve the implementation stored in the Op's single cache layer."""
-        # BUILTIN follow-up: pass a shape/dtype ``key`` and a ``build`` closure
-        # that selects and constructs one concrete kernel on a cache miss.
-        return self.get_or_build_kernel("gqa_dense", inputs)
+        q, k = inputs[:2]
+        assert q is not None and k is not None
+        batch, seq_len_q, heads, dim = q.shape
+        _, seq_len_kv, heads_kv, _ = k.shape
+
+        call = AttentionCall(
+            dtype=q.dtype,
+            batch=batch,
+            heads=heads,
+            heads_kv=heads_kv,
+            dim=dim,
+            max_seqlen_q=seq_len_q,
+            max_seqlen_kv=seq_len_kv,
+            is_causal=self.is_causal,
+            sm_scale=self.sm_scale,
+            softcap=self.softcap,
+            window_size_left=self.window_size_left,
+            window_size_right=self.window_size_right,
+            backend="dense",
+            is_fp8=q.dtype == fp8_dtype(),
+            is_uniform=True,
+            fuse_rope=self.pos_encoding_mode == "rope",
+            rotary_dim=(
+                _rope_rotary_dim(dim, self.rotary_dim)
+                if self.pos_encoding_mode == "rope"
+                else None
+            ),
+            tune=self.tune,
+        )
+        role = "gqa_dense_causal_fwd_kernel"
+        if not call.h200 or not causal_ws_prefill_region(call) or call.fuse_rope:
+            raise ValueError(
+                "no implementation serves this call: the Dense builtin currently requires "
+                "H200, causal FP16/BF16 attention, dim == 128, no sliding window, and no RoPE"
+            )
+
+        def build() -> _DensePrefillCall:
+            kernel = self.kernel_map[role](
+                batch=batch,
+                heads=heads,
+                heads_kv=heads_kv,
+                max_seqlen_q=seq_len_q,
+                max_seqlen_kv=seq_len_kv,
+                dim=dim,
+                is_causal=self.is_causal,
+                dtype=q.dtype,
+                sm_scale=self.sm_scale,
+                softcap=self.softcap,
+                tune=self.tune,
+            )
+            return _DensePrefillCall(kernel)
+
+        key = (q.dtype, tuple(q.shape), tuple(k.shape))
+        return self.get_or_build_kernel(role, inputs, key=key, build=build)
 
     def forward(
         self,
@@ -539,7 +620,20 @@ class GroupedQueryAttentionDenseFwdOp(Op):
         self._validate_forward_inputs(q, k, v, q_scale, k_scale, v_scale, rope_cos, rope_sin)
         inputs = self._canonicalize_inputs(q, k, v, q_scale, k_scale, v_scale, rope_cos, rope_sin)
         kernel = self._get_kernel(inputs)
-        return kernel(*inputs)
+        output = kernel(*inputs)
+        self._roofline_state = {
+            "q_shape": tuple(q.shape),
+            "kv_shape": tuple(k.shape),
+            "input_dtype": q.dtype,
+            "output_dtype": output.dtype,
+            "is_causal": self.is_causal,
+            "window_size_left": self.window_size_left,
+            "window_size_right": self.window_size_right,
+            "fuse_rope": self.pos_encoding_mode == "rope",
+            "rotary_dim": self.rotary_dim or q.shape[-1],
+            "max_position": k.shape[1] if self.pos_encoding_mode == "rope" else None,
+        }
+        return output
 
 
 class GroupedQueryAttentionFwdOp(Op):

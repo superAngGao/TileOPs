@@ -50,6 +50,7 @@ __all__ = [
     "gqa_bwd_roofline",
     "gqa_decode_paged_roofline",
     "gqa_decode_roofline",
+    "gqa_dense_fwd_roofline",
     "gqa_fwd_roofline",
     "gqa_prefill_paged_with_kv_cache_fwd_roofline",
     "gqa_prefill_varlen_fwd_roofline",
@@ -174,6 +175,38 @@ def gqa_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
     return int(flops), int(2 * (q_elems + kv_elems) * elem_bytes)
 
 
+def gqa_dense_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Roofline for direct-BSHD Dense GQA forward."""
+    data = _shape_or_attrs(op, kwargs)
+    batch, seq_len_q, heads, dim = data["q_shape"]
+    _, seq_len_kv, heads_kv, _ = data["kv_shape"]
+    is_causal = bool(data.get("is_causal", True))
+    window_size_left = int(data.get("window_size_left", -1))
+    window_size_right = int(data.get("window_size_right", -1))
+    input_dtype = data.get("input_dtype") or data.get("dtype", data.get("dtypes", "float16"))
+    output_dtype = data.get("output_dtype") or data.get("dtype") or data.get("dtypes", input_dtype)
+    input_bytes = _dtype_itemsize(input_dtype)
+    output_bytes = _dtype_itemsize(output_dtype)
+
+    visible = _prefill_visible_scores(
+        seq_len_q,
+        seq_len_kv,
+        is_causal=is_causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+    )
+    flops = 4 * batch * heads * visible * dim
+    q_elems = batch * seq_len_q * heads * dim
+    kv_elems = batch * seq_len_kv * heads_kv * dim
+    nbytes = (q_elems + 2 * kv_elems) * input_bytes + q_elems * output_bytes
+    if bool(data.get("fuse_rope", False)):
+        rotary_dim = int(data.get("rotary_dim") or dim)
+        max_position = int(data.get("max_position") or seq_len_kv)
+        flops += 3 * batch * (seq_len_q * heads + seq_len_kv * heads_kv) * rotary_dim
+        nbytes += max_position * rotary_dim * output_bytes
+    return int(flops), int(nbytes)
+
+
 def _dtype_itemsize(dtype: Any) -> int:
     if isinstance(dtype, (list, tuple)):
         dtype = dtype[0] if dtype else "float16"
@@ -202,6 +235,31 @@ def _supplied(op: Any, name: str) -> bool:
     if getattr(op, name, None) is not None:
         return True
     return getattr(op, f"{name}_shape", None) is not None
+
+
+def _prefill_visible_scores(
+    seq_len_q: int,
+    seq_len_kv: int,
+    *,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+) -> int:
+    """Count bottom-right-aligned visible QK pairs exactly."""
+    offset = seq_len_kv - seq_len_q
+    visible = 0
+    for q_pos in range(seq_len_q):
+        center = q_pos + offset
+        lower = 0
+        upper = seq_len_kv - 1
+        if window_size_left >= 0:
+            lower = max(lower, center - window_size_left)
+        if is_causal:
+            upper = min(upper, center)
+        elif window_size_right >= 0:
+            upper = min(upper, center + window_size_right)
+        visible += max(upper - lower + 1, 0)
+    return visible
 
 
 def _causal_prefill_visible_scores(seq_len_q: int, seq_len_kv: int) -> int:

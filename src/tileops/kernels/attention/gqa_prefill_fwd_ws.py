@@ -495,3 +495,7 @@ class GQAPrefillFwdWsPersistentCausalKernel(PackedPrefillKernel):
     ) -> torch.Tensor:
         q_bshd, k_bshd, v_bshd = self._bshd(q, k, v)
         return self.kernel(q_bshd, k_bshd, v_bshd).reshape(q.shape)
+
+    def forward_bshd(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Run the same compiled program directly on Dense BSHD tensors."""
+        return self.kernel(q, k, v)
