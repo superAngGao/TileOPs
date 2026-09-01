@@ -4,8 +4,8 @@ import math
 from itertools import accumulate
 
 import torch
+import torch.nn.functional as F
 
-from tileops.ops import GroupedQueryAttentionFwdOp
 from workloads.workload_base import WorkloadBase
 
 
@@ -140,11 +140,14 @@ class GroupedQueryAttentionBwdWorkload(WorkloadBase):
             self.batch, self.seq_len, self.heads, self.dim, dtype=self.dtype, device="cuda"
         )
 
-        fwd_op = GroupedQueryAttentionFwdOp(
-            self.batch, self.heads, self.heads_kv, self.seq_len, self.dim, self.is_causal
-        )
         with torch.no_grad():
-            o = fwd_op(q, k, v)
+            o = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal=self.is_causal,
+                enable_gqa=True,
+            ).transpose(1, 2).contiguous()
             lse = _compute_gqa_square_lse(
                 q,
                 k,
@@ -155,38 +158,6 @@ class GroupedQueryAttentionBwdWorkload(WorkloadBase):
             )
 
         return q, k, v, o, grad_output, lse
-
-
-class GroupedQueryAttentionFwdWorkload(WorkloadBase):
-    def __init__(
-        self,
-        batch: int,
-        heads: int,
-        heads_kv: int,
-        seq_len: int,
-        dim: int,
-        is_causal: bool,
-        dtype: torch.dtype,
-    ) -> None:
-        self.batch = batch
-        self.heads = heads
-        self.heads_kv = heads_kv
-        self.seq_len = seq_len
-        self.dim = dim
-        self.is_causal = is_causal
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = torch.randn(
-            self.batch, self.seq_len, self.heads, self.dim, device="cuda", dtype=self.dtype
-        ).contiguous()
-        k = torch.randn(
-            self.batch, self.seq_len, self.heads_kv, self.dim, device="cuda", dtype=self.dtype
-        ).contiguous()
-        v = torch.randn(
-            self.batch, self.seq_len, self.heads_kv, self.dim, device="cuda", dtype=self.dtype
-        ).contiguous()
-        return q, k, v
 
 
 class GroupedQueryAttentionDecodeWorkload(WorkloadBase):

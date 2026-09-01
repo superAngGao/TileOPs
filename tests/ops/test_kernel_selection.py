@@ -14,13 +14,11 @@ from tileops.kernels.kernel_base import Kernel
 from tileops.ops import (
     GroupedQueryAttentionDecodePagedWithKVCacheFwdOp,
     GroupedQueryAttentionDecodeWithKVCacheFwdOp,
-    GroupedQueryAttentionFwdOp,
     GroupedQueryAttentionPrefillFwdOp,
     GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp,
 )
 from tileops.ops.attention.selection import (
     DECODE_KEYS,
-    DENSE_PREFILL_KEYS,
     PACKED_PREFILL_KEYS,
     PAGED_DECODE_KEYS,
     PAGED_PREFILL_KEYS,
@@ -115,16 +113,6 @@ def test_packed_prefill_dispatch_is_unchanged(ctor: dict, call: dict, expected: 
     if not is_h200():
         pytest.skip("the recorded dispatch table is the H200 one")
     assert _prefill_key(_prefill_op(**ctor), **call) == expected
-
-
-@pytest.mark.smoke
-def test_bshd_wrapper_dispatches_like_the_packed_op() -> None:
-    """The BSHD wrapper reaches the same dense candidate the packed op does."""
-    if not is_h200():
-        pytest.skip("the recorded dispatch table is the H200 one")
-    op = GroupedQueryAttentionFwdOp(4, 32, 8, 512, 128, True)
-    call = op.attention_call(torch.float16)
-    assert op.select_kernel_key(DENSE_PREFILL_KEYS, call) == "gqa_prefill_square_fwd_kernel"
 
 
 @pytest.mark.smoke

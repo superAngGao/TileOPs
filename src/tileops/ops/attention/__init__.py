@@ -10,7 +10,6 @@ from .gqa import (
     GroupedQueryAttentionDecodePagedWithKVCacheFwdOp,
     GroupedQueryAttentionDecodeWithKVCacheFwdOp,
     GroupedQueryAttentionDenseFwdOp,
-    GroupedQueryAttentionFwdOp,
     GroupedQueryAttentionPrefillFwdOp,
     GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp,
     GroupedQueryAttentionPrefillVarlenFwdOp,
@@ -21,7 +20,6 @@ from .mha import (
     MultiHeadAttentionBwdOp,
     MultiHeadAttentionDecodePagedWithKVCacheFwdOp,
     MultiHeadAttentionDecodeWithKVCacheFwdOp,
-    MultiHeadAttentionFwdOp,
 )
 
 __all__ = [
@@ -30,7 +28,6 @@ __all__ = [
     "GroupedQueryAttentionDecodePagedWithKVCacheFwdOp",
     "GroupedQueryAttentionDecodeWithKVCacheFwdOp",
     "GroupedQueryAttentionDenseFwdOp",
-    "GroupedQueryAttentionFwdOp",
     "GroupedQueryAttentionPrefillFwdOp",
     "GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp",
     "GroupedQueryAttentionPrefillVarlenFwdOp",
@@ -39,7 +36,6 @@ __all__ = [
     "MultiHeadAttentionBwdOp",
     "MultiHeadAttentionDecodePagedWithKVCacheFwdOp",
     "MultiHeadAttentionDecodeWithKVCacheFwdOp",
-    "MultiHeadAttentionFwdOp",
     "MultiHeadLatentAttentionDecodeWithKVCacheFwdOp",
     "NSACmpFwdVarlenOp",
     "NSAFwdVarlenOp",

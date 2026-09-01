@@ -33,7 +33,6 @@ from ..op_base import Op, UnmanifestedOp
 from ..rope import base_freqs
 from .selection import (
     DECODE_KEYS,
-    DENSE_PREFILL_KEYS,
     PACKED_PREFILL_KEYS,
     PAGED_DECODE_KEYS,
     PAGED_PREFILL_KEYS,
@@ -43,7 +42,6 @@ from .selection import (
 )
 
 __all__ = [
-    "GroupedQueryAttentionFwdOp",
     "GroupedQueryAttentionBwdOp",
     "GroupedQueryAttentionDenseFwdOp",
     "GroupedQueryAttentionPrefillFwdOp",
@@ -634,138 +632,6 @@ class GroupedQueryAttentionDenseFwdOp(Op):
             "max_position": k.shape[1] if self.pos_encoding_mode == "rope" else None,
         }
         return output
-
-
-class GroupedQueryAttentionFwdOp(Op):
-    """Compatibility square GQA forward wrapper. Public layout: BSHD."""
-
-    def __init__(
-        self,
-        batch: int,
-        heads: int,
-        heads_kv: int,
-        seq_len: int,
-        dim: int,
-        is_causal: bool = True,
-        sm_scale: Optional[float] = None,
-        softcap: Optional[float] = None,
-        kernel_map: Optional[Dict[str, Kernel]] = None,
-        tune: bool = False,
-    ) -> None:
-        # Nothing downstream validates these: this op builds its kernel itself,
-        # so a zero heads_kv would surface as ZeroDivisionError inside a region.
-        """Build the op. Shapes and dtype are taken from the first call.
-
-        Args:
-            is_causal: Manifest ``params.is_causal``, ``bool``, default ``True``.
-            kernel_map: Optional kernel override dict.
-            tune: Whether to autotune, applied when a kernel is first built.
-        """
-        _validate_gqa_dims(heads, heads_kv, dim)
-        _validate_positive(batch=batch, seq_len=seq_len)
-        self.batch = batch
-        self.heads = heads
-        self.heads_kv = heads_kv
-        self.seq_len = seq_len
-        self.dim = dim
-        self.is_causal = is_causal
-        self.sm_scale = _attention_scale(dim, sm_scale)
-        self.softcap = _score_softcap(softcap)
-        self.tune = tune
-        self.dispatch_kernel(kernel_map)
-        # Packed ranges for a batch of equal-length requests, per device. Not a
-        # kernel cache: the dense implementations take the same packed call as
-        # every other, and a fixed-shape request supplies its ranges.
-        self._cu_seqlens: Dict[torch.device, torch.Tensor] = {}
-
-    @property
-    def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {
-            "gqa_prefill_fwd_kernel": GQAPrefillFwdKernel,
-            "gqa_prefill_causal_fwd_kernel": GQAPrefillFwdWsPersistentCausalKernel,
-            "gqa_prefill_square_fwd_kernel": GQAFwdWsPersistentCausalKernel,
-        }
-
-    def attention_call(self, dtype: torch.dtype) -> AttentionCall:
-        """State what one fixed-shape call is: a uniform dense packed request."""
-        return AttentionCall(
-            dtype=dtype,
-            batch=self.batch,
-            heads=self.heads,
-            heads_kv=self.heads_kv,
-            dim=self.dim,
-            max_seqlen_q=self.seq_len,
-            max_seqlen_kv=self.seq_len,
-            is_causal=self.is_causal,
-            sm_scale=self.sm_scale,
-            softcap=self.softcap,
-            backend="dense",
-            is_fp8=False,
-            is_uniform=True,
-            tune=self.tune,
-        )
-
-    def _get_kernel(self, inputs: "tuple[torch.Tensor | None, ...]", dtype: torch.dtype) -> Kernel:
-        """The dense prefill implementation this wrapper's calls land on."""
-        _validate_attention_dtype(dtype)
-        call = self.attention_call(dtype)
-        key = self.select_kernel_key(DENSE_PREFILL_KEYS, call)
-
-        def build() -> Kernel:
-            return _build_packed_prefill_kernel(self.kernel_map, key, call)
-
-        return self.get_or_build_kernel(key, inputs, key=dtype, build=build)
-
-    def _uniform_cu_seqlens(self, device: torch.device) -> torch.Tensor:
-        cu_seqlens = self._cu_seqlens.get(device)
-        if cu_seqlens is None:
-            cu_seqlens = (
-                torch.arange(self.batch + 1, device=device, dtype=torch.int32) * self.seq_len
-            )
-            self._cu_seqlens[device] = cu_seqlens
-        return cu_seqlens
-
-    def _infer_output_shapes(
-        self,
-        q_shape: tuple[int, ...],
-        k_shape: tuple[int, ...],
-        v_shape: tuple[int, ...],
-    ) -> Dict[str, tuple[int, ...]]:
-        return {"o": tuple(q_shape)}
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Run square GQA forward."""
-        expected_q = (self.batch, self.seq_len, self.heads, self.dim)
-        expected_kv = (self.batch, self.seq_len, self.heads_kv, self.dim)
-        if tuple(q.shape) != expected_q:
-            raise ValueError(f"q must have shape {expected_q}, got {tuple(q.shape)}")
-        if tuple(k.shape) != expected_kv:
-            raise ValueError(f"k must have shape {expected_kv}, got {tuple(k.shape)}")
-        if tuple(v.shape) != expected_kv:
-            raise ValueError(f"v must have shape {expected_kv}, got {tuple(v.shape)}")
-        self._validate_dtypes(q, k, v)
-
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        self.dtype = q.dtype
-
-        # A fixed-shape request is a uniform packed one; packing is a view, so
-        # the wrapper reaches the packed prefill call rather than handing BSHD
-        # tensors to a kernel whose signature is packed.
-        cu_seqlens = self._uniform_cu_seqlens(q.device)
-        output = self._get_kernel((q, k, v), q.dtype)(
-            q.view(-1, self.heads, self.dim),
-            k.view(-1, self.heads_kv, self.dim),
-            v.view(-1, self.heads_kv, self.dim),
-            cu_seqlens,
-            cu_seqlens,
-        )
-        return output.view(q.shape)
-
-    def compute_roof(self) -> str:
-        """FLOPs are matmul contractions; priced on tensor cores."""
-        return tensor_core_roof(self.dtype)
 
 
 class GroupedQueryAttentionPrefillFwdOp(Op):

@@ -5,10 +5,7 @@ tuple of ints, matching the ``Op.eval_roofline(self) -> tuple[int, int]``
 shape that codegen emits for ``func`` mode (see ``docs/design/roofline.md`` §4.4.2).
 
 These are referenced from ``src/tileops/manifest/`` via the ``roofline.func``
-field, e.g.::
-
-    roofline:
-      func: "tileops.perf.formulas.mha_fwd_roofline"
+field.
 """
 
 from __future__ import annotations
@@ -51,7 +48,6 @@ __all__ = [
     "gqa_decode_paged_roofline",
     "gqa_decode_roofline",
     "gqa_dense_fwd_roofline",
-    "gqa_fwd_roofline",
     "gqa_prefill_paged_with_kv_cache_fwd_roofline",
     "gqa_prefill_varlen_fwd_roofline",
     "gqa_sliding_window_fwd_roofline",
@@ -70,7 +66,6 @@ __all__ = [
     "mha_bwd_roofline",
     "mha_decode_paged_roofline",
     "mha_decode_roofline",
-    "mha_fwd_roofline",
     "mhc_post_roofline",
     "mhc_pre_roofline",
     "minimum_fwd_roofline",
@@ -102,29 +97,6 @@ def _shape_or_attrs(op: Any | None, kwargs: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
-def mha_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
-    """Roofline for multi-head attention forward (prefill)."""
-    data = _shape_or_attrs(op, kwargs)
-    if "q_shape" in data:
-        batch, seq_len, heads, dim = data["q_shape"]
-    else:
-        batch, seq_len, heads, dim = (
-            data["batch"],
-            data["seq_len"],
-            data["heads"],
-            data["dim"],
-        )
-    is_causal = bool(data.get("is_causal", True))
-    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
-
-    flops = 4 * batch * heads * seq_len * seq_len * dim
-    if is_causal:
-        flops //= 2
-    q_elems = batch * seq_len * heads * dim
-    kv_elems = q_elems
-    return int(flops), int(2 * (q_elems + kv_elems) * elem_bytes)
-
-
 def mha_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
     """Roofline for multi-head attention backward."""
     data = _shape_or_attrs(op, kwargs)
@@ -148,31 +120,6 @@ def mha_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
 
 
 # GQA prefill
-
-
-def gqa_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
-    """Roofline for grouped-query attention forward (prefill)."""
-    data = _shape_or_attrs(op, kwargs)
-    if "q_shape" in data:
-        batch, seq_len, heads, dim = data["q_shape"]
-        _, _, heads_kv, _ = data["kv_shape"]
-    else:
-        batch, seq_len, heads, heads_kv, dim = (
-            data["batch"],
-            data["seq_len"],
-            data["heads"],
-            data["heads_kv"],
-            data["dim"],
-        )
-    is_causal = bool(data.get("is_causal", True))
-    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
-
-    flops = 4 * batch * heads * seq_len * seq_len * dim
-    if is_causal:
-        flops //= 2
-    q_elems = batch * seq_len * heads * dim
-    kv_elems = batch * seq_len * heads_kv * dim
-    return int(flops), int(2 * (q_elems + kv_elems) * elem_bytes)
 
 
 def gqa_dense_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:

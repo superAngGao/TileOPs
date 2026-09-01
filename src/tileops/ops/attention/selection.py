@@ -27,13 +27,6 @@ PACKED_PREFILL_KEYS = (
     "gqa_prefill_varlen_fwd_kernel",
 )
 
-# The subset serving a uniform dense request, for the fixed-shape wrapper.
-DENSE_PREFILL_KEYS = (
-    "gqa_prefill_square_fwd_kernel",
-    "gqa_prefill_causal_fwd_kernel",
-    "gqa_prefill_fwd_kernel",
-)
-
 # Implementations of paged GQA prefill.
 PAGED_PREFILL_KEYS = (
     "gqa_prefill_paged_with_kv_cache_rope_fwd_kernel",
