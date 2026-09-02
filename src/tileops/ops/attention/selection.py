@@ -8,6 +8,7 @@ contradict the user-visible ``backend`` parameter. Choosing among the keys is
 from tileops.kernels.attention.call_spec import AttentionCall, fp8_dtype, uses_sliding_window
 
 __all__ = [
+    "DENSE_FWD_KEYS",
     "PACKED_PREFILL_KEYS",
     "PAGED_DECODE_KEYS",
     "PAGED_PREFILL_KEYS",
@@ -15,6 +16,9 @@ __all__ = [
     "check_packed_prefill_request",
     "fp8_dtype",
 ]
+
+# Native BSHD implementations of GroupedQueryAttentionDenseFwdOp.
+DENSE_FWD_KEYS = ("gqa_dense_causal_fwd_kernel",)
 
 # Implementations of packed GQA prefill, as ``kernel_map`` keys.
 PACKED_PREFILL_KEYS = (

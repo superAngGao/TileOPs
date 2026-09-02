@@ -29,9 +29,13 @@ from .call_spec import (
     causal_ws_prefill_region,
     square_ws_prefill_region,
 )
+from .dense_prefill import DensePrefillKernel
 from .packed_prefill import PackedPrefillKernel
 
-__all__ = ["GQAPrefillFwdWsPersistentCausalKernel"]
+__all__ = [
+    "GQADenseFwdWsPersistentCausalKernel",
+    "GQAPrefillFwdWsPersistentCausalKernel",
+]
 
 BLOCK_M = 128
 BLOCK_N = 128
@@ -495,3 +499,60 @@ class GQAPrefillFwdWsPersistentCausalKernel(PackedPrefillKernel):
     ) -> torch.Tensor:
         q_bshd, k_bshd, v_bshd = self._bshd(q, k, v)
         return self.kernel(q_bshd, k_bshd, v_bshd).reshape(q.shape)
+
+
+class GQADenseFwdWsPersistentCausalKernel(DensePrefillKernel):
+    """H200 causal Dense prefill using the FA3 two-consumer pipeline."""
+
+    supported_archs: list[int] = [WS_ARCH]
+
+    @classmethod
+    def applies(cls, call) -> bool:
+        return call.h200 and causal_ws_prefill_region(call) and not call.fuse_rope
+
+    def _validate_spec(self) -> None:
+        if not self.is_causal:
+            raise ValueError("H200 Dense prefill currently supports causal attention only")
+        if self.dim != 128:
+            raise ValueError("H200 Dense prefill currently requires dim == 128")
+        if self.dtype not in ATTENTION_DTYPES:
+            raise ValueError("H200 Dense prefill currently supports float16 and bfloat16 only")
+        if self.window_size_left != -1 or self.window_size_right != -1:
+            raise ValueError("H200 Dense prefill does not yet support sliding windows")
+        if self.fuse_rope:
+            raise ValueError("H200 Dense prefill does not yet support fused RoPE")
+
+    def _build_program(self) -> None:
+        self.kernel = _gqa_prefill_fwd_fa3_kernel(
+            self.batch,
+            self.heads,
+            self.heads_kv,
+            self.max_seqlen_q,
+            self.max_seqlen_kv,
+            self.dim,
+            self.sm_scale,
+            self.softcap,
+            self.dtype_str,
+        )
+
+    @property
+    def default_config(self) -> dict:
+        return {}
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        self._require_cuda(q=q, k=k, v=v)
+        if any(scale is not None for scale in (q_scale, k_scale, v_scale)):
+            raise ValueError("16-bit H200 Dense prefill does not accept FP8 scales")
+        if rope_cos is not None or rope_sin is not None:
+            raise ValueError("H200 Dense prefill does not yet accept RoPE tables")
+        return self.kernel(q, k, v)

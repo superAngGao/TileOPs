@@ -9,6 +9,7 @@ from tileops.kernels.attention import (
     GQABwdWgmmaPipelinedKernel,
     GQADecodePagedBs1Kernel,
     GQADecodePagedKernel,
+    GQADenseFwdWsPersistentCausalKernel,
     GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel,
     GQAFwdWsPersistentCausalKernel,
     GQAPrefillFwdKernel,
@@ -25,6 +26,7 @@ from tileops.perf.profile import tensor_core_roof
 from ..op_base import Op
 from ..rope import base_freqs
 from .selection import (
+    DENSE_FWD_KEYS,
     PACKED_PREFILL_KEYS,
     PAGED_DECODE_KEYS,
     PAGED_PREFILL_KEYS,
@@ -327,7 +329,7 @@ class GroupedQueryAttentionDenseFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {}
+        return {"gqa_dense_causal_fwd_kernel": GQADenseFwdWsPersistentCausalKernel}
 
     def _infer_output_shapes(
         self,
@@ -474,9 +476,55 @@ class GroupedQueryAttentionDenseFwdOp(Op):
         self, inputs: tuple[Optional[torch.Tensor], ...]
     ) -> Callable[..., torch.Tensor]:
         """Resolve the implementation stored in the Op's single cache layer."""
-        # BUILTIN follow-up: pass a shape/dtype ``key`` and a ``build`` closure
-        # that selects and constructs one concrete kernel on a cache miss.
-        return self.get_or_build_kernel("gqa_dense", inputs)
+        q, k = inputs[:2]
+        assert q is not None and k is not None
+        batch, seq_len_q, heads, dim = q.shape
+        _, seq_len_kv, heads_kv, _ = k.shape
+        fuse_rope = self.pos_encoding_mode == "rope"
+
+        call = AttentionCall(
+            dtype=q.dtype,
+            batch=batch,
+            heads=heads,
+            heads_kv=heads_kv,
+            dim=dim,
+            max_seqlen_q=seq_len_q,
+            max_seqlen_kv=seq_len_kv,
+            is_causal=self.is_causal,
+            sm_scale=self.sm_scale,
+            softcap=self.softcap,
+            window_size_left=self.window_size_left,
+            window_size_right=self.window_size_right,
+            backend="dense",
+            is_fp8=q.dtype == fp8_dtype(),
+            is_uniform=True,
+            fuse_rope=fuse_rope,
+            rotary_dim=_rope_rotary_dim(dim, self.rotary_dim) if fuse_rope else None,
+        )
+        role = self.select_kernel_key(DENSE_FWD_KEYS, call)
+
+        def build() -> Kernel:
+            return self.kernel_map[role](
+                batch=batch,
+                heads=heads,
+                heads_kv=heads_kv,
+                max_seqlen_q=seq_len_q,
+                max_seqlen_kv=seq_len_kv,
+                dim=dim,
+                is_causal=self.is_causal,
+                dtype=q.dtype,
+                sm_scale=self.sm_scale,
+                softcap=self.softcap,
+                window_size_left=self.window_size_left,
+                window_size_right=self.window_size_right,
+                fuse_rope=fuse_rope,
+                rotary_dim=_rope_rotary_dim(dim, self.rotary_dim) if fuse_rope else None,
+                rope_layout=self.rope_layout,
+                device_index=q.device.index,
+            )
+
+        key = (q.dtype, tuple(q.shape), tuple(k.shape))
+        return self.get_or_build_kernel(role, inputs, key=key, build=build)
 
     def forward(
         self,
