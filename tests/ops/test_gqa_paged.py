@@ -41,6 +41,128 @@ def _check(op, workload, inputs) -> None:
     TestBase.check(workload, op, *inputs)
 
 
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "dtype,q_lens,cache_lens,page_size,dim,semantics",
+    [
+        pytest.param(torch.float16, [1, 3], [129, 63], 64, 128, {}, id="fp16-split"),
+        pytest.param(torch.bfloat16, [1, 3], [129, 63], 64, 128, {}, id="bf16-split"),
+        pytest.param(
+            torch.float16,
+            [160, 129],
+            [256, 193],
+            256,
+            64,
+            {"rope_layout": "interleaved"},
+            id="interleaved-unsplit",
+        ),
+        pytest.param(
+            torch.float16,
+            [7, 0, 130],
+            [99, 0, 145],
+            48,
+            128,
+            {"rotary_dim": 48, "sm_scale": 0.25},
+            id="partial-odd-pages",
+        ),
+        pytest.param(
+            torch.float16,
+            [2, 1],
+            [65, 97],
+            16,
+            256,
+            {"rotary_dim": 64, "rope_layout": "interleaved", "softcap": 2.0},
+            id="partial-interleaved-softcap",
+        ),
+        pytest.param(
+            torch.float16,
+            [65, 3],
+            [129, 33],
+            64,
+            128,
+            {"is_causal": False, "window_size_left": 17, "window_size_right": 3},
+            id="two-sided-window",
+        ),
+        pytest.param(
+            torch.float16,
+            [3, 1],
+            [65, 33],
+            64,
+            128,
+            {"is_causal": False, "sm_scale": 0.0},
+            id="noncausal-zero-scale",
+        ),
+    ],
+)
+def test_gqa_paged_rope_reads_logical_positions(
+    dtype: torch.dtype,
+    q_lens: list[int],
+    cache_lens: list[int],
+    page_size: int,
+    dim: int,
+    semantics: dict,
+) -> None:
+    """Rotate logical positions through fragmented pages without modifying the cache.
+
+    Poisoned cache tails must not enter either the rotary table lookup or the value sum.
+    """
+    semantics = {"pos_encoding_mode": "rope", **semantics}
+    width = -(-max(cache_lens) // page_size)
+    workload = GQAPagedFwdWorkload(
+        16,
+        4,
+        dim,
+        q_lens,
+        cache_lens,
+        page_size,
+        width,
+        len(q_lens) * width,
+        dtype,
+        **semantics,
+    )
+    inputs = workload.gen_inputs()
+    for request, length in enumerate(cache_lens):
+        slots = torch.arange(length, width * page_size, device=inputs[0].device)
+        stale = (inputs[3][request, slots // page_size], slots % page_size)
+        inputs[1][stale] = float("nan")
+        inputs[2][stale] = float("inf")
+    _check(GQAPagedFwdOp(**semantics), workload, inputs)
+
+
+@pytest.mark.smoke
+@pytest.mark.cuda_only
+def test_gqa_paged_rope_replays_positions_from_device_lengths() -> None:
+    """Replay must rotate at the current cache positions and current packed Q boundaries."""
+    workload = GQAPagedFwdWorkload(
+        16,
+        4,
+        128,
+        [1, 3],
+        [129, 65],
+        64,
+        3,
+        6,
+        torch.float16,
+        pos_encoding_mode="rope",
+        rotary_dim=64,
+    )
+    inputs = workload.gen_inputs()
+    op = GQAPagedFwdOp(pos_encoding_mode="rope", rotary_dim=64)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(*inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = op(*inputs)
+    inputs[4].copy_(torch.tensor([33, 63], device=inputs[0].device, dtype=torch.int32))
+    inputs[5][1] = 2
+    workload.q_lens, workload.cache_lens = [2, 2], [33, 63]
+    graph.replay()
+    TestBase.check(workload, op, *inputs, runs=lambda *args: output)
+
+
 class GQAPagedDecodeFixture(FixtureBase):
     PARAMS = [
         (

@@ -708,6 +708,8 @@ class GQADecodePagedKernel(Kernel, GQAPagedFwdInterface, MHAPagedDecodeFwdInterf
         real_seqlen_kv: torch.Tensor,
         block_table: torch.Tensor,
         cu_seqlens_q: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
     ):
         """Attend ``Q``, ``[batch, seqlen_q, heads, dim]`` or packed, over the paged cache.
 
