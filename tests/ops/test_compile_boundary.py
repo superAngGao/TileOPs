@@ -162,6 +162,25 @@ def _attention_cases():
         case = GQAPagedFwdWorkload(_HEADS, _HEADS_KV, _DIM, [1, 1], [256, 200], 64, 4, 8, _DTYPE)
         return GQAPagedFwdOp(), case.gen_inputs()
 
+    def gqa_paged_fp8_rope():
+        case = GQAPagedFwdWorkload(
+            _HEADS,
+            _HEADS_KV,
+            _DIM,
+            [1, 3],
+            [129, 63],
+            64,
+            3,
+            6,
+            torch.float8_e4m3fn,
+            out_dtype=torch.bfloat16,
+            pos_encoding_mode="rope",
+            rotary_dim=32,
+        )
+        return GQAPagedFwdOp(
+            out_dtype=torch.bfloat16, pos_encoding_mode="rope", rotary_dim=32
+        ), case.gen_inputs()
+
     def gqa_bwd_mha_heads():
         # One KV head per query head: the call the warp-specialized kernel serves.
         case = GQABwdWorkload(1, _HEADS, _HEADS, 256, _DIM, True, _DTYPE)
@@ -216,6 +235,7 @@ def _attention_cases():
         ("gqa-sliding-window-varlen", gqa_sliding_window_varlen),
         ("gqa-prefill-paged", gqa_prefill_paged),
         ("gqa-paged-decode", gqa_paged_decode),
+        ("gqa-paged-fp8-rope", gqa_paged_fp8_rope),
         ("gqa-bwd-mha-heads", gqa_bwd_mha_heads),
         ("mha-decode-paged", mha_decode_paged),
         ("mla-decode", mla_decode),

@@ -6,6 +6,7 @@ from tileops.backend import Target
 from tileops.kernels.attention import (
     GQADecodePagedBs1Kernel,
     GQADecodePagedKernel,
+    GQAPagedFP8Kernel,
     GQAPagedFwdKernel,
 )
 from tileops.kernels.attention.call_spec import (
@@ -26,12 +27,14 @@ class GQAPagedFwdOp(Op):
     Packed Q and its cumulative sequence lengths cover both prefill and decode.
     ``page_table`` maps logical pages to physical entries in ``k_pages`` and
     ``v_pages``. This Op reads the cache only: allocation, append, and mutation
-    remain runtime responsibilities. The in-tree kernels serve a call in which Q
-    and the cache share a float16 or bfloat16 dtype, over any positive page size
-    and any mix of per-request query lengths, a request with no query token
-    included. RoPE rotates Q and cached K as they are read, in NeoX or interleaved
+    remain runtime responsibilities. The in-tree kernels serve float16/bfloat16
+    Q and cache, or an FP8 E4M3 cache with 16-bit or FP8 Q, over positive page
+    sizes and mixed query lengths including empty requests. FP8 storage is read
+    into 16-bit tensor-core tiles, with descales applied to FP32 scores/outputs;
+    the output is 16-bit. RoPE rotates Q and cached K as they are read, in NeoX or interleaved
     layout, including a partial rotary width. The table must cover every request's
-    cache length. FP8 calls still require an external target implementation.
+    cache length. FP8 Q scales are per request and KV head; cache scales can also
+    be per tensor.
     """
 
     compile_boundary = True
@@ -39,6 +42,7 @@ class GQAPagedFwdOp(Op):
         "gqa_decode_paged_kernel": GQADecodePagedKernel,
         "gqa_decode_paged_bs1_kernel": GQADecodePagedBs1Kernel,
         "gqa_paged_varlen_kernel": GQAPagedFwdKernel,
+        "gqa_paged_fp8_kernel": GQAPagedFP8Kernel,
     }
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {"gqa_paged": GQAPagedFwdInterface}
 
@@ -100,7 +104,7 @@ class GQAPagedFwdOp(Op):
 
     def compute_roof(self) -> str:
         """Paged attention's contractions are priced on tensor cores."""
-        return tensor_core_roof(self.last_call.tensors["q"][1])
+        return tensor_core_roof(self.out_dtype or self.last_call.tensors["q"][1])
 
     def paged_call(
         self,
@@ -135,6 +139,7 @@ class GQAPagedFwdOp(Op):
             is_fp8=torch.float8_e4m3fn in (q.dtype, k_pages.dtype),
             is_uniform=batch == 1,
             cache_dtype=k_pages.dtype,
+            out_dtype=self.out_dtype,
             fuse_rope=self.pos_encoding_mode == "rope",
             max_position=rope_cos.shape[0] if rope_cos is not None else None,
             rotary_dim=self.rotary_dim or dim,
@@ -220,5 +225,8 @@ class GQAPagedFwdOp(Op):
             cu_seqlens_q,
             rope_cos.contiguous() if rope_cos is not None else None,
             rope_sin.contiguous() if rope_sin is not None else None,
+            q_scale.contiguous() if q_scale is not None else None,
+            k_scale.contiguous() if k_scale is not None else None,
+            v_scale.contiguous() if v_scale is not None else None,
         )
         return self.kernel_for("gqa_paged", call)(*inputs)

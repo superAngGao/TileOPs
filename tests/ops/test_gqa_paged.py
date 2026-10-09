@@ -5,7 +5,7 @@ import torch
 
 from tests.workload_test_base import FixtureBase, TestBase
 from tileops.ops import GQAPagedFwdOp
-from workloads.attention.gqa.paged import GQAPagedFwdWorkload
+from workloads.attention.gqa.paged import GQAPagedFP8CancellationWorkload, GQAPagedFwdWorkload
 
 
 def _decode(
@@ -390,3 +390,178 @@ def test_gqa_paged_graph_replays_device_metadata(batch: int) -> None:
         v_pages[page_table[slots // page_size], slots % page_size] = float("nan")
         graph.replay()
         TestBase.check(workload, op, *inputs, runs=lambda *args: output)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "dtype,out_dtype,per_tensor,q_lens,cache_lens,page_size,semantics",
+    [
+        pytest.param(torch.float16, None, True, [1, 3], [129, 63], 64, {}, id="fp16-tensor-scale"),
+        pytest.param(torch.bfloat16, None, False, [1, 3], [129, 63], 64, {}, id="bf16-head-scale"),
+        pytest.param(
+            torch.float8_e4m3fn,
+            torch.float16,
+            False,
+            [2, 1],
+            [129, 63],
+            64,
+            {},
+            id="fp8-q-fp16-out",
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            torch.bfloat16,
+            True,
+            [2, 1],
+            [129, 63],
+            64,
+            {},
+            id="fp8-q-bf16-out",
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            torch.float16,
+            False,
+            [1, 3],
+            [129, 63],
+            64,
+            {"pos_encoding_mode": "rope"},
+            id="fp8-q-rope",
+        ),
+        pytest.param(
+            torch.float16,
+            None,
+            False,
+            [160, 0, 31],
+            [257, 0, 63],
+            48,
+            {
+                "pos_encoding_mode": "rope",
+                "rotary_dim": 48,
+                "rope_layout": "interleaved",
+                "softcap": 2.0,
+            },
+            id="partial-rope-unsplit",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            None,
+            False,
+            [65, 3],
+            [129, 33],
+            16,
+            {"is_causal": False, "window_size_left": 17, "window_size_right": 3},
+            id="two-sided-window",
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            torch.float16,
+            True,
+            [3, 1],
+            [65, 33],
+            64,
+            {"is_causal": False, "sm_scale": 0.0},
+            id="zero-scale",
+        ),
+    ],
+)
+def test_gqa_paged_fp8_storage(
+    dtype, out_dtype, per_tensor, q_lens, cache_lens, page_size, semantics
+) -> None:
+    """Independent descales and stale FP8 tail NaNs over fragmented cache pages."""
+    width = -(-max(cache_lens) // page_size)
+    workload = GQAPagedFwdWorkload(
+        16,
+        4,
+        128,
+        q_lens,
+        cache_lens,
+        page_size,
+        width,
+        len(q_lens) * width,
+        dtype,
+        cache_dtype=torch.float8_e4m3fn,
+        per_tensor_scale=per_tensor,
+        out_dtype=out_dtype,
+        **semantics,
+    )
+    inputs = workload.gen_inputs()
+    if dtype == torch.float8_e4m3fn and out_dtype == torch.float16 and not semantics:
+        # Reciprocal descales leave scores moderate even when dequantized Q exceeds FP16.
+        inputs[6].mul_(1e5)
+        inputs[7].mul_(1e-5)
+    if dtype == torch.bfloat16 and not semantics:
+        # The op also honors signed scale tensors, beyond positive quantization descales.
+        inputs[7][0].neg_()
+        inputs[8][1].neg_()
+    for request, length in enumerate(cache_lens):
+        slots = torch.arange(length, width * page_size, device=inputs[0].device)
+        stale = (inputs[3][request, slots // page_size], slots % page_size)
+        for pages in inputs[1:3]:
+            pages.view(torch.uint8)[stale] = 0x7F  # FP8 E4M3 NaN.
+    _check(GQAPagedFwdOp(out_dtype=out_dtype, **semantics), workload, inputs)
+
+
+@pytest.mark.smoke
+@pytest.mark.cuda_only
+def test_gqa_paged_fp8_graph_shared_pages() -> None:
+    """Shared physical pages use each request's current descales during graph replay."""
+    workload = GQAPagedFwdWorkload(
+        16,
+        4,
+        128,
+        [1, 3],
+        [129, 65],
+        64,
+        3,
+        3,
+        torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+        pos_encoding_mode="rope",
+        rotary_dim=64,
+    )
+    inputs = workload.gen_inputs()
+    op = GQAPagedFwdOp(out_dtype=torch.bfloat16, pos_encoding_mode="rope", rotary_dim=64)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(*inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = op(*inputs)
+    inputs[4].copy_(torch.tensor([33, 63], dtype=torch.int32, device=inputs[0].device))
+    inputs[5][1] = 2
+    for scale in inputs[6:9]:
+        scale.mul_(0.75)
+    workload.q_lens, workload.cache_lens = [2, 2], [33, 63]
+    graph.replay()
+    TestBase.check(workload, op, *inputs, runs=lambda *args: output)
+
+
+@pytest.mark.smoke
+def test_gqa_paged_fp8_rejects_flat_head_scales() -> None:
+    """A flattened per-head scale is neither the scalar nor the declared [B, H_kv] shape."""
+    workload = GQAPagedFwdWorkload(
+        16,
+        4,
+        128,
+        [1, 1],
+        [65, 33],
+        64,
+        2,
+        4,
+        torch.float16,
+        cache_dtype=torch.float8_e4m3fn,
+    )
+    inputs = list(workload.gen_inputs())
+    inputs[7], inputs[8] = inputs[7].flatten(), inputs[8].flatten()
+    with pytest.raises(ValueError, match="SK"):
+        GQAPagedFwdOp()(*inputs)
+
+
+@pytest.mark.smoke
+def test_gqa_paged_fp8_scales_values_after_split_reduction() -> None:
+    """Finite output must survive partial chunks whose scaled values exceed FP16."""
+    workload = GQAPagedFP8CancellationWorkload()
+    _check(GQAPagedFwdOp(sm_scale=0.0), workload, workload.gen_inputs())

@@ -66,6 +66,7 @@ class AttentionCall(CallSpec):
     # Every packed KV range is empty, so a TMA descriptor over K/V has no extent.
     empty_kv: bool = False
     cache_dtype: Optional[torch.dtype] = None
+    out_dtype: Optional[torch.dtype] = None
     fuse_rope: bool = False
     max_position: Optional[int] = None
     rotary_dim: Optional[int] = None
@@ -301,6 +302,9 @@ class GQAPagedFwdInterface(KernelInterface):
         cu_seqlens_q: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Attend each request's queries, aligned to the end of its cache.
 
@@ -316,13 +320,16 @@ class GQAPagedFwdInterface(KernelInterface):
             cu_seqlens_q: ``int32`` ``(batch + 1,)`` request boundaries in *q*. An
                 implementation serving ``call.is_uniform`` only reads the lengths from
                 ``call.max_seqlen_q`` instead.
-            rope_cos: ``(max_position, rotary_dim / 2)`` in ``call.dtype``, present
+            rope_cos: ``(max_position, rotary_dim / 2)`` in the output dtype, present
                 exactly when ``call.fuse_rope``. Query positions are cache length minus
                 query length plus the query index; key positions are logical cache indices.
             rope_sin: The same layout as *rope_cos*. Cached keys are never rewritten.
+            q_scale: FP32 ``(batch, heads_kv)`` descales, exactly when Q is FP8.
+            k_scale: FP32 ``(1,)`` or ``(batch, heads_kv)`` descales for an FP8 cache.
+            v_scale: Value descales, with the same shape as *k_scale*.
 
         Returns:
-            A new output shaped like *q*, in ``call.dtype``.
+            A new output shaped like *q*, in ``call.out_dtype or call.dtype``.
         """
 
 

@@ -572,18 +572,23 @@ def _fa3_gqa_paged(workload):
     return baseline_fn
 
 
-def _fa3_gqa_paged_rope(workload, inputs):
-    """Gather read-only pages, rotate with FlashInfer, then run FA3 packed attention.
+def _fa3_gqa_paged_materialized(workload, inputs):
+    """Gather/dequantize read-only pages, optionally rotate, then run FA3 attention.
 
     FA3's cache entry rotates newly appended keys, not historical read-only keys. This
     adapter materializes each request's keys, so even a physical page shared at different
-    logical positions is rotated correctly. Gathering and rotation are inside timing.
+    logical positions is rotated correctly. Gathering, dequantization and rotation are inside timing.
     """
     from flash_attn_interface import flash_attn_varlen_func
     from flashinfer.rope import apply_rope_with_cos_sin_cache
 
     q, _, _, table = inputs[:4]
     device, dim = q.device, workload.dim
+    dtype = workload.out_dtype or q.dtype
+    query_requests = torch.repeat_interleave(
+        torch.arange(workload.batch, device=device),
+        torch.tensor(workload.q_lens, device=device),
+    )
     key_positions = torch.cat([torch.arange(n, device=device) for n in workload.cache_lens])
     requests = torch.repeat_interleave(
         torch.arange(workload.batch, device=device),
@@ -599,29 +604,66 @@ def _fa3_gqa_paged_rope(workload, inputs):
     ).int()
     key_positions = key_positions.int()
     cu_k = torch.tensor([0, *accumulate(workload.cache_lens)], device=device, dtype=torch.int32)
-    scratch_q = torch.empty(key_positions.numel(), dim, device=device, dtype=q.dtype)
-    scratch_k = torch.empty(q.shape[0], dim, device=device, dtype=q.dtype)
+    scratch_q = torch.empty(key_positions.numel(), dim, device=device, dtype=dtype)
+    scratch_k = torch.empty(q.shape[0], dim, device=device, dtype=dtype)
 
-    def run(q, k_pages, v_pages, _table, _lengths, cu_q, _qs, _ks, _vs, cos, sin):
+    def run(q, k_pages, v_pages, _table, _lengths, cu_q, qs, ks, vs, cos, sin):
         k = k_pages[key_pages, key_offsets]
         v = v_pages[key_pages, key_offsets]
-        rotary_cache = torch.cat((cos, sin), -1).float()
-        q_rot, _ = apply_rope_with_cos_sin_cache(
-            query_positions,
-            q.flatten(1),
-            scratch_k,
-            dim,
-            rotary_cache,
-            workload.rope_layout == "neox",
-        )
-        _, k_rot = apply_rope_with_cos_sin_cache(
-            key_positions,
-            scratch_q,
-            k.flatten(1),
-            dim,
-            rotary_cache,
-            workload.rope_layout == "neox",
-        )
+        if (
+            q.dtype == torch.float8_e4m3fn
+            and dtype == torch.bfloat16
+            and workload.pos_encoding_mode == "none"
+        ):
+            # FA3 accepts native FP8 Q/K/V with per-request, per-KV-head descales.
+            k_descale = ks.expand(workload.batch, workload.heads_kv).contiguous()
+            v_descale = vs.expand(workload.batch, workload.heads_kv).contiguous()
+            out = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                max(workload.q_lens),
+                max(workload.cache_lens),
+                q_descale=qs,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                causal=workload.is_causal,
+                softmax_scale=workload.sm_scale,
+                window_size=(workload.window_size_left, workload.window_size_right),
+                softcap=float(workload.softcap or 0.0),
+            )
+            return out[0] if isinstance(out, tuple) else out
+        if ks is not None:
+            k_factors = ks.reshape(1, 1, 1) if ks.numel() == 1 else ks[requests, :, None]
+            v_factors = vs.reshape(1, 1, 1) if vs.numel() == 1 else vs[requests, :, None]
+            k = (k.float() * k_factors).to(dtype)
+            v = (v.float() * v_factors).to(dtype)
+        if qs is not None:
+            q_factors = qs[query_requests].repeat_interleave(
+                workload.heads // workload.heads_kv, dim=1
+            )
+            q = (q.float() * q_factors[:, :, None]).to(dtype)
+        q_rot, k_rot = q, k
+        if workload.pos_encoding_mode == "rope":
+            rotary_cache = torch.cat((cos, sin), -1).float()
+            q_rot, _ = apply_rope_with_cos_sin_cache(
+                query_positions,
+                q.flatten(1),
+                scratch_k,
+                dim,
+                rotary_cache,
+                workload.rope_layout == "neox",
+            )
+            _, k_rot = apply_rope_with_cos_sin_cache(
+                key_positions,
+                scratch_q,
+                k.flatten(1),
+                dim,
+                rotary_cache,
+                workload.rope_layout == "neox",
+            )
         out = flash_attn_varlen_func(
             q_rot.view_as(q),
             k_rot.view_as(k),
@@ -728,8 +770,8 @@ def test_gqa_paged_fwd_bench(case) -> None:
     inputs = case.inputs
     op = GQAPagedFwdOp(**case.arguments)
     implementations = {"torch-ref": case.reference}
-    if workload.pos_encoding_mode == "rope":
-        implementations["fa3"] = _fa3_gqa_paged_rope(workload, inputs)
+    if workload.pos_encoding_mode == "rope" or workload.cache_dtype == torch.float8_e4m3fn:
+        implementations["fa3"] = _fa3_gqa_paged_materialized(workload, inputs)
         bench.Runner(op, case).compare(implementations)
         return
     fa3_fn = _fa3_gqa_paged(workload)

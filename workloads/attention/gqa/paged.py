@@ -7,7 +7,7 @@ from workloads.device import run_device
 from workloads.sequence_metadata import make_cu_seqlens
 from workloads.workload_base import CallWorkload, WorkloadBase
 
-__all__ = ["GQAPagedCall", "GQAPagedFwdWorkload"]
+__all__ = ["GQAPagedCall", "GQAPagedFP8CancellationWorkload", "GQAPagedFwdWorkload"]
 
 
 def _cache_scale(scale: torch.Tensor, request: int) -> torch.Tensor:
@@ -43,6 +43,8 @@ class GQAPagedFwdWorkload(WorkloadBase):
         pos_encoding_mode: str = "none",
         rotary_dim: int | None = None,
         rope_layout: str = "neox",
+        cache_dtype: torch.dtype | None = None,
+        per_tensor_scale: bool = False,
     ) -> None:
         self.heads = heads
         self.heads_kv = heads_kv
@@ -53,6 +55,8 @@ class GQAPagedFwdWorkload(WorkloadBase):
         self.max_pages_per_req = max_pages_per_req
         self.num_pages = num_pages
         self.dtype = dtype
+        self.cache_dtype = cache_dtype or dtype
+        self.per_tensor_scale = per_tensor_scale
         self.is_causal = is_causal
         self.window_size_left = window_size_left
         self.window_size_right = window_size_right
@@ -68,20 +72,29 @@ class GQAPagedFwdWorkload(WorkloadBase):
         return len(self.q_lens)
 
     def gen_inputs(self) -> tuple[torch.Tensor | None, ...]:
-        """A 16-bit call over a fragmented page pool."""
+        """A call over a fragmented page pool, with independent non-unit descales."""
         device = run_device()
         pages_shape = (self.num_pages, self.page_size, self.heads_kv, self.dim)
-        q = torch.randn(sum(self.q_lens), self.heads, self.dim, dtype=self.dtype, device=device)
-        k_pages = torch.randn(pages_shape, dtype=self.dtype, device=device)
-        v_pages = torch.randn(pages_shape, dtype=self.dtype, device=device)
+        compute_dtype = self.out_dtype or self.dtype
+        q = torch.randn(
+            sum(self.q_lens), self.heads, self.dim, dtype=compute_dtype, device=device
+        ).to(self.dtype)
+        k_pages = torch.randn(pages_shape, dtype=compute_dtype, device=device).to(self.cache_dtype)
+        v_pages = torch.randn(pages_shape, dtype=compute_dtype, device=device).to(self.cache_dtype)
         page_table = make_fragmented_block_table(self.batch, self.max_pages_per_req, self.num_pages)
         cache_seqlens = torch.tensor(self.cache_lens, dtype=torch.int32, device=device)
+        qs, ks, vs = None, None, None
+        if self.dtype == torch.float8_e4m3fn:
+            qs = 0.5 + torch.rand(self.batch, self.heads_kv, device=device)
+        if self.cache_dtype == torch.float8_e4m3fn:
+            scale_shape = (1,) if self.per_tensor_scale else (self.batch, self.heads_kv)
+            ks, vs = (0.5 + torch.rand(scale_shape, device=device) for _ in range(2))
         cos, sin = None, None
         if self.pos_encoding_mode == "rope":
             half = (self.rotary_dim or self.dim) // 2
             frequency = 10000.0 ** (-torch.arange(half, device=device).float() / half)
             angles = torch.arange(max(self.cache_lens), device=device)[:, None] * frequency
-            cos, sin = angles.cos().to(self.dtype), angles.sin().to(self.dtype)
+            cos, sin = angles.cos().to(compute_dtype), angles.sin().to(compute_dtype)
         return (
             q,
             k_pages,
@@ -89,9 +102,9 @@ class GQAPagedFwdWorkload(WorkloadBase):
             page_table,
             cache_seqlens,
             make_cu_seqlens(self.q_lens),
-            None,
-            None,
-            None,
+            qs,
+            ks,
+            vs,
             cos,
             sin,
         )
@@ -169,6 +182,35 @@ class GQAPagedFwdWorkload(WorkloadBase):
         return Exact()
 
 
+class GQAPagedFP8CancellationWorkload(GQAPagedFwdWorkload):
+    """Uniform attention whose two large, opposite value chunks cancel in the output."""
+
+    def __init__(self):
+        super().__init__(
+            16,
+            4,
+            128,
+            [1],
+            [128],
+            64,
+            2,
+            2,
+            torch.float16,
+            cache_dtype=torch.float8_e4m3fn,
+            per_tensor_scale=True,
+            sm_scale=0.0,
+        )
+
+    def gen_inputs(self):
+        inputs = super().gen_inputs()
+        values = torch.empty_like(inputs[2], dtype=torch.float32)
+        values[inputs[3][0, 0]].fill_(1.0)
+        values[inputs[3][0, 1]].fill_(-1.0)
+        inputs[2].copy_(values.to(inputs[2].dtype))
+        inputs[8].fill_(1e5)
+        return inputs
+
+
 class GQAPagedCall(CallWorkload, GQAPagedFwdWorkload):
     """A manifest call of GQAPagedFwdOp."""
 
@@ -195,6 +237,7 @@ class GQAPagedCall(CallWorkload, GQAPagedFwdWorkload):
             pos_encoding_mode=params["pos_encoding_mode"],
             rotary_dim=params["rotary_dim"],
             rope_layout=params["rope_layout"],
+            cache_dtype=_dtype(call, "k_pages"),
         )
 
     def gen_inputs(self) -> tuple[torch.Tensor | None, ...]:
@@ -204,6 +247,14 @@ class GQAPagedCall(CallWorkload, GQAPagedFwdWorkload):
         them, sharpening the softmax instead of representing the declared RoPE workload.
         """
         inputs = list(CallWorkload.gen_inputs(self))
+        # Quantization descales are positive and non-unit. The generic floating-point
+        # generator uses a normal distribution, which does not model these workloads.
+        for i, name in ((6, "q_scale"), (7, "k_scale"), (8, "v_scale")):
+            scale = inputs[i]
+            if scale is not None:
+                inputs[i] = 0.5 + torch.rand(
+                    scale.shape, device=scale.device, generator=self.rng(name, device=scale.device)
+                )
         if self.pos_encoding_mode == "rope":
             table = inputs[9]
             angles = torch.rand(
